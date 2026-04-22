@@ -2,7 +2,7 @@
 
 **Status**: Draft
 **Depends on**: Phase 1 (MemoryStore + Embedder traits, embedding_model registry, domain columns)
-**Related**: docs/adr/0001-pluggable-storage-and-network-access.md (Phase 2), docs/prd/001-getting-centralized-vestige.md
+**Related**: docs/adr/0001-pluggable-storage-and-network-access.md (Phase 2), docs/prd/001-getting-centralized-vestige.md, docs/plans/local-dev-postgres-setup.md (local cluster provisioning)
 
 ---
 
@@ -85,6 +85,7 @@ postgres-backend = ["dep:sqlx", "dep:pgvector", "dep:tokio-stream", "dep:futures
 - The `pgvector` extension installed in the target database (our migration issues `CREATE EXTENSION IF NOT EXISTS vector`).
 - `sqlx-cli@0.8` installed on the developer machine for `cargo sqlx prepare --workspace` and `cargo sqlx migrate add` (not a build-time requirement once `.sqlx/` is committed).
 - Docker or Podman reachable by the test harness for `testcontainers-modules::postgres` to spin up `pgvector/pgvector:pg16`.
+- A local Postgres cluster for `sqlx prepare`, manual migration work, and `vestige migrate --to postgres` smoke runs. The recipe for standing one up on Arch/CachyOS (install, initdb, role + db, pgvector, connection string at `~/.vestige_pg_pw`) lives in `docs/plans/local-dev-postgres-setup.md`. Postgres 18 from the Arch repo satisfies the "16 or newer" requirement above. Phase 2 work assumes `DATABASE_URL` points at that cluster once migrations are applied.
 
 ### Assumed Rust toolchain
 
