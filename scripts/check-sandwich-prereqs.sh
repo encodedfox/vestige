@@ -7,6 +7,51 @@ warn() { printf '  \033[1;33m[WARN]\033[0m %s\n' "$*"; FAIL=1; }
 miss() { printf '  \033[1;31m[MISS]\033[0m %s\n' "$*"; FAIL=1; }
 info() { printf '  \033[1;36m[INFO]\033[0m %s\n' "$*"; }
 
+load_vestige_sanhedrin_env() {
+  [ -f "$1" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  while IFS="$(printf '\t')" read -r key value; do
+    case "$key" in
+      VESTIGE_SANHEDRIN_ENABLED|VESTIGE_SANHEDRIN_MODEL|VESTIGE_SANHEDRIN_ENDPOINT|VESTIGE_SANHEDRIN_CLAIM_MODE|VESTIGE_SANHEDRIN_OUTPUT|VESTIGE_SANHEDRIN_PYTHON|VESTIGE_DASHBOARD_PORT)
+        export "$key=$value"
+        ;;
+    esac
+  done < <(python3 - "$1" <<'PY'
+import shlex
+import sys
+
+allowed = {
+    "VESTIGE_SANHEDRIN_ENABLED",
+    "VESTIGE_SANHEDRIN_MODEL",
+    "VESTIGE_SANHEDRIN_ENDPOINT",
+    "VESTIGE_SANHEDRIN_CLAIM_MODE",
+    "VESTIGE_SANHEDRIN_OUTPUT",
+    "VESTIGE_SANHEDRIN_PYTHON",
+    "VESTIGE_DASHBOARD_PORT",
+}
+
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    sys.exit(0)
+
+for raw in lines:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    try:
+        parts = shlex.split(line, posix=True)
+    except ValueError:
+        continue
+    if len(parts) != 1 or "=" not in parts[0]:
+        continue
+    key, value = parts[0].split("=", 1)
+    if key in allowed and "\t" not in value and "\0" not in value:
+        print(f"{key}\t{value}")
+PY
+  )
+}
+
 FAIL=0
 CHECK_PREFLIGHT=0
 CHECK_SANHEDRIN=0
@@ -31,17 +76,14 @@ EOF
 done
 
 if [ -f "$SANHEDRIN_ENV" ]; then
-  set +u
-  set -a
-  # shellcheck disable=SC1090
-  . "$SANHEDRIN_ENV" 2>/dev/null || true
-  set +a
-  set -u
+  load_vestige_sanhedrin_env "$SANHEDRIN_ENV" || true
 fi
 
 SANHEDRIN_ENDPOINT="${VESTIGE_SANHEDRIN_ENDPOINT:-${MLX_ENDPOINT:-http://127.0.0.1:8080/v1/chat/completions}}"
 SANHEDRIN_ENDPOINT="${SANHEDRIN_ENDPOINT%/}"
 SANHEDRIN_MODELS_URL="${SANHEDRIN_ENDPOINT%/chat/completions}/models"
+SANHEDRIN_CLAIM_MODE="${VESTIGE_SANHEDRIN_CLAIM_MODE:-0}"
+SANHEDRIN_OUTPUT="${VESTIGE_SANHEDRIN_OUTPUT:-text}"
 
 echo "Vestige Cognitive Sandwich — Prereq Check"
 echo
@@ -58,8 +100,8 @@ fi
 if command -v python3 >/dev/null; then
   PY="$(python3 -c 'import sys;print(".".join(map(str,sys.version_info[:2])))' 2>/dev/null)"
   case "$PY" in
-    3.1[0-9]|3.[2-9]*) ok "Python $PY" ;;
-    *) warn "Python $PY (need 3.10+)" ;;
+    3.9|3.1[0-9]|3.[2-9]*) ok "Python $PY" ;;
+    *) warn "Python $PY (need 3.9+)" ;;
   esac
 else
   miss "python3 not found"
@@ -112,6 +154,7 @@ if [ "$CHECK_SANHEDRIN" -eq 1 ]; then
   else
     warn "Sanhedrin env file missing — run: install-sandwich.sh --enable-sanhedrin"
   fi
+  info "Sanhedrin claim mode: $SANHEDRIN_CLAIM_MODE; output: $SANHEDRIN_OUTPUT"
 
   if [ "$OS_NAME" = "Darwin" ] && [ "$ARCH_NAME" = "arm64" ]; then
     command -v uv            >/dev/null && ok "uv"            || warn "uv missing — brew install uv"

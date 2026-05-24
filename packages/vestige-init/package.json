@@ -1,7 +1,7 @@
 {
   "name": "@vestige/init",
-  "version": "2.1.2",
-  "description": "Give your AI a brain in 10 seconds — zero-config Vestige installer with 3D dashboard",
+  "version": "2.1.21",
+  "description": "Configure Vestige local memory for MCP-compatible AI agents",
   "bin": {
     "vestige-init": "bin/init.js"
   },

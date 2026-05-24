@@ -113,6 +113,8 @@ pub struct CallToolRequest {
 pub struct CallToolResult {
     pub content: Vec<ToolResultContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
 

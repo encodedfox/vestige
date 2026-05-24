@@ -25,22 +25,58 @@
 
 set -u
 
+load_vestige_sanhedrin_env() {
+  [ -f "$1" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  while IFS="$(printf '\t')" read -r key value; do
+    case "$key" in
+      VESTIGE_SANHEDRIN_ENABLED|VESTIGE_SANHEDRIN_MODEL|VESTIGE_SANHEDRIN_ENDPOINT|VESTIGE_SANHEDRIN_CLAIM_MODE|VESTIGE_SANHEDRIN_OUTPUT|VESTIGE_SANHEDRIN_PYTHON|VESTIGE_DASHBOARD_PORT)
+        export "$key=$value"
+        ;;
+    esac
+  done < <(python3 - "$1" <<'PY'
+import shlex
+import sys
+
+allowed = {
+    "VESTIGE_SANHEDRIN_ENABLED",
+    "VESTIGE_SANHEDRIN_MODEL",
+    "VESTIGE_SANHEDRIN_ENDPOINT",
+    "VESTIGE_SANHEDRIN_CLAIM_MODE",
+    "VESTIGE_SANHEDRIN_OUTPUT",
+    "VESTIGE_SANHEDRIN_PYTHON",
+    "VESTIGE_DASHBOARD_PORT",
+}
+
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    sys.exit(0)
+
+for raw in lines:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    try:
+        parts = shlex.split(line, posix=True)
+    except ValueError:
+        continue
+    if len(parts) != 1 or "=" not in parts[0]:
+        continue
+    key, value = parts[0].split("=", 1)
+    if key in allowed and "\t" not in value and "\0" not in value:
+        print(f"{key}\t{value}")
+PY
+  )
+}
+
 # === OPT-IN GATE ===
 # Sanhedrin is heavyweight: the default local backend is a ~19 GB model and
 # needs roughly 20+ GB of free RAM. Keep it disabled unless the user explicitly
 # opts in. The installer writes this env file only for --enable-sanhedrin.
 SANHEDRIN_ENV="${VESTIGE_SANHEDRIN_ENV:-$HOME/.claude/hooks/vestige-sanhedrin.env}"
 if [ -f "$SANHEDRIN_ENV" ]; then
-  set +u
-  set -a
-  # shellcheck disable=SC1090
-  . "$SANHEDRIN_ENV" 2>/dev/null || {
-    set +a
-    set -u
-    exit 0
-  }
-  set +a
-  set -u
+  load_vestige_sanhedrin_env "$SANHEDRIN_ENV" || exit 0
 fi
 
 case "${VESTIGE_SANHEDRIN_ENABLED:-0}" in
@@ -55,9 +91,20 @@ if [ "${VESTIGE_EXECUTIONER_ACTIVE:-0}" = "1" ]; then
   exit 0
 fi
 
+PYTHON_BIN="${VESTIGE_SANHEDRIN_PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3 2>/dev/null || printf '')"
+fi
+if [ -z "$PYTHON_BIN" ]; then
+  PYTHON_BIN="/usr/bin/python3"
+fi
+if ! "$PYTHON_BIN" -c 'import sys' >/dev/null 2>&1; then
+  exit 0
+fi
+
 # === READ STOP HOOK INPUT ===
 INPUT="$(cat)"
-TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | /usr/bin/python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
+TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c 'import sys,json;d=json.load(sys.stdin);print(d.get("transcript_path",""))' 2>/dev/null || printf '')"
 
 if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
@@ -104,13 +151,17 @@ stripped = last_assistant.strip()
 if not stripped or len(stripped) < 100:
     sys.exit(0)
 
-# Gate: only check drafts that contain technical indicators
-has_code = "`" in stripped or "```" in stripped
-has_cmd = any(kw in stripped.lower() for kw in ["install", "run ", "use ", "call ", "invoke", "execute"])
-has_path = "/" in stripped and any(ext in stripped for ext in [".rs", ".ts", ".py", ".sh", ".md", ".json"])
+# Legacy gate: only check drafts that contain technical indicators. Claim mode
+# deliberately broadens this to any substantive assistant draft while keeping
+# Sanhedrin opt-in through VESTIGE_SANHEDRIN_ENABLED.
+claim_mode = os.environ.get("VESTIGE_SANHEDRIN_CLAIM_MODE", "") == "1"
+if not claim_mode:
+    has_code = "`" in stripped or "```" in stripped
+    has_cmd = any(kw in stripped.lower() for kw in ["install", "run ", "use ", "call ", "invoke", "execute"])
+    has_path = "/" in stripped and any(ext in stripped for ext in [".rs", ".ts", ".py", ".sh", ".md", ".json"])
 
-if not (has_code or has_cmd or has_path):
-    sys.exit(0)
+    if not (has_code or has_cmd or has_path):
+        sys.exit(0)
 
 # Truncate to 4000 chars to keep Haiku prompt bounded
 if len(stripped) > 4000:
@@ -119,7 +170,7 @@ if len(stripped) > 4000:
 print(stripped)
 DRAFT_PYEOF
 
-DRAFT="$(/usr/bin/python3 "$DRAFT_SCRIPT" 2>/dev/null || printf '')"
+DRAFT="$("$PYTHON_BIN" "$DRAFT_SCRIPT" 2>/dev/null || printf '')"
 
 if [ -z "$DRAFT" ]; then
   exit 0
@@ -141,7 +192,7 @@ OUTPUT_FILE="$(mktemp -t vestige-sanhedrin-out.XXXXXX)"
 trap 'rm -f "$DRAFT_SCRIPT" "$OUTPUT_FILE"' EXIT
 
 (
-  printf '%s\n' "$DRAFT" | /usr/bin/python3 "$BRIDGE" > "$OUTPUT_FILE" 2>/dev/null
+  printf '%s\n' "$DRAFT" | "$PYTHON_BIN" "$BRIDGE" > "$OUTPUT_FILE" 2>/dev/null
 ) &
 
 EXEC_PID=$!
@@ -170,6 +221,94 @@ wait "$EXEC_PID" 2>/dev/null
 EXECUTIONER_OUTPUT="$(cat "$OUTPUT_FILE" 2>/dev/null || printf '')"
 
 # === PARSE VERDICT ===
+sanhedrin_veto() {
+  REASON="$1"
+  REASON="$(printf '%s' "$REASON" | "$PYTHON_BIN" -c 'import sys; print(sys.stdin.read().strip())' 2>/dev/null || printf '%s' "$REASON")"
+
+  cat >&2 <<SANHEDRIN_MSG
+[SANHEDRIN VETO - Post-Cognitive Executioner (LOCAL) rejected draft]
+
+$REASON
+
+The Executioner (Sanhedrin endpoint, fresh context, fed Vestige
+deep_reference evidence over HTTP) judged your draft and
+found a contradiction against a high-trust memory.
+
+You may NOT stop. Rewrite WITHOUT the contradicted claim. Use
+mcp__vestige__deep_reference to inspect the cited memory and cite the
+correct replacement pattern from its \`recommended\` field.
+
+Bridge script:
+~/.claude/hooks/sanhedrin-local.py
+SANHEDRIN_MSG
+  exit 2
+}
+
+if [ "${VESTIGE_SANHEDRIN_OUTPUT:-}" = "json" ]; then
+  JSON_PARSED="$(printf '%s' "$EXECUTIONER_OUTPUT" | "$PYTHON_BIN" -c '
+import json
+import sys
+
+raw = sys.stdin.read()
+
+def loads_candidate(text):
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+obj = loads_candidate(raw)
+if obj is None:
+    for line in reversed([ln for ln in raw.splitlines() if ln.strip()]):
+        obj = loads_candidate(line)
+        if obj is not None:
+            break
+if obj is None:
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end > start:
+        obj = loads_candidate(raw[start:end + 1])
+
+if obj is None:
+    sys.exit(1)
+
+decision = obj.get("decision", obj.get("verdict", obj.get("answer", "")))
+reason = obj.get("reason", obj.get("message", obj.get("explanation", "")))
+if isinstance(decision, bool):
+    decision = "yes" if decision else "no"
+elif decision is None:
+    decision = ""
+else:
+    decision = str(decision)
+
+if reason is None:
+    reason = ""
+elif not isinstance(reason, str):
+    reason = json.dumps(reason, ensure_ascii=False)
+
+print(decision.strip())
+print(reason.strip())
+' 2>/dev/null || printf '')"
+
+  if [ -n "$JSON_PARSED" ]; then
+    JSON_DECISION="$(printf '%s\n' "$JSON_PARSED" | /usr/bin/sed -n '1p' | "$PYTHON_BIN" -c 'import sys; print(sys.stdin.read().strip().lower())' 2>/dev/null || printf '')"
+    JSON_REASON="$(printf '%s\n' "$JSON_PARSED" | /usr/bin/sed '1d')"
+
+    case "$JSON_DECISION" in
+      yes|pass|allow|allowed|clean|true)
+        exit 0
+        ;;
+      no|fail|block|blocked|veto|false)
+        sanhedrin_veto "$JSON_REASON"
+        ;;
+    esac
+  fi
+fi
+
 TRIMMED="$(printf '%s' "$EXECUTIONER_OUTPUT" | /usr/bin/awk 'NF {print; exit}' | /usr/bin/awk '{$1=$1;print}')"
 
 if [ -z "$TRIMMED" ]; then
@@ -196,25 +335,7 @@ case "$TRIMMED" in
         REASON="${TRIMMED#*:}"
         ;;
     esac
-    REASON="$(printf '%s' "$REASON" | /usr/bin/awk '{$1=$1;print}')"
-
-    cat >&2 <<SANHEDRIN_MSG
-[SANHEDRIN VETO - Post-Cognitive Executioner (LOCAL) rejected draft]
-
-$REASON
-
-The Executioner (Sanhedrin endpoint, fresh context, fed Vestige
-deep_reference evidence over HTTP) judged your draft and
-found a contradiction against a high-trust memory.
-
-You may NOT stop. Rewrite WITHOUT the contradicted claim. Use
-mcp__vestige__deep_reference to inspect the cited memory and cite the
-correct replacement pattern from its \`recommended\` field.
-
-Bridge script:
-~/.claude/hooks/sanhedrin-local.py
-SANHEDRIN_MSG
-    exit 2
+    sanhedrin_veto "$REASON"
     ;;
 esac
 

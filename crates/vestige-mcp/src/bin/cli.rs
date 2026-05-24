@@ -2,6 +2,7 @@
 //!
 //! Command-line interface for managing cognitive memory system.
 
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -109,7 +110,7 @@ enum Commands {
 
     /// Update Vestige binaries from the latest GitHub release
     Update {
-        /// Install a specific release tag instead of latest (example: v2.1.1)
+        /// Install a specific release tag instead of latest (example: v2.1.21)
         #[arg(long)]
         version: Option<String>,
 
@@ -121,9 +122,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Skip Cognitive Sandwich companion file update and legacy hook cleanup.
+        /// Deprecated: companion updates are skipped by default.
         #[arg(long)]
         no_sandwich: bool,
+
+        /// Also refresh optional Claude Code Cognitive Sandwich companion files.
+        #[arg(long)]
+        sandwich_companion: bool,
 
         #[command(flatten)]
         sandwich: SandwichInstallOptions,
@@ -257,8 +262,16 @@ fn main() -> anyhow::Result<()> {
             install_dir,
             dry_run,
             no_sandwich,
+            sandwich_companion,
             sandwich,
-        } => run_update(version, install_dir, dry_run, no_sandwich, sandwich),
+        } => run_update(
+            version,
+            install_dir,
+            dry_run,
+            no_sandwich,
+            sandwich_companion,
+            sandwich,
+        ),
         Commands::Sandwich { command } => match command {
             SandwichCommands::Install { version, options } => {
                 run_sandwich_install(version.as_deref(), &options)
@@ -405,6 +418,76 @@ fn download_file(url: &str, output: &Path, action: &str) -> anyhow::Result<()> {
     )
 }
 
+fn parse_sha256(text: &str) -> anyhow::Result<String> {
+    let hash = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("checksum file is empty"))?
+        .to_ascii_lowercase();
+    if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("checksum file does not contain a valid SHA-256 hash");
+    }
+    Ok(hash)
+}
+
+fn sha256_from_command(command: &mut Command) -> anyhow::Result<Option<String>> {
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(Some(parse_sha256(&text)?))
+        }
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).context("failed to run checksum command"),
+    }
+}
+
+fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    {
+        if let Some(hash) = sha256_from_command(
+            Command::new("powershell")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("(Get-FileHash -Algorithm SHA256 -LiteralPath $args[0]).Hash.ToLowerInvariant()")
+                .arg(path),
+        )? {
+            return Ok(hash);
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(hash) =
+            sha256_from_command(Command::new("shasum").arg("-a").arg("256").arg(path))?
+        {
+            return Ok(hash);
+        }
+        if let Some(hash) = sha256_from_command(Command::new("sha256sum").arg(path))? {
+            return Ok(hash);
+        }
+    }
+
+    anyhow::bail!("no SHA-256 command available to verify release archive");
+}
+
+fn verify_release_checksum(archive_path: &Path, checksum_path: &Path) -> anyhow::Result<()> {
+    let expected = parse_sha256(&fs::read_to_string(checksum_path).with_context(|| {
+        format!(
+            "failed to read release checksum file {}",
+            checksum_path.display()
+        )
+    })?)?;
+    let actual = compute_sha256(archive_path)?;
+    if actual != expected {
+        anyhow::bail!(
+            "release archive checksum mismatch for {}",
+            archive_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn latest_release_tag() -> anyhow::Result<String> {
     let temp_dir = UpdateTempDir::create()?;
     let metadata_path = temp_dir.path.join("latest-release.json");
@@ -453,7 +536,7 @@ fn download_sandwich_source(version: Option<&str>, output_dir: &Path) -> anyhow:
 
     println!("{}: {}", "Sandwich source".white().bold(), tag);
     download_file(&url, &archive_path, "downloading Vestige source archive")?;
-    extract_archive(&archive_path, output_dir, "tar.gz")?;
+    extract_source_archive(&archive_path, output_dir)?;
     find_sandwich_source_root(output_dir).ok_or_else(|| {
         anyhow::anyhow!("Vestige source archive did not contain hooks/ and agents/ directories")
     })
@@ -635,7 +718,7 @@ fn write_sanhedrin_env(
 ) -> anyhow::Result<()> {
     let env_path = hooks_dir.join("vestige-sanhedrin.env");
     let contents = format!(
-        "VESTIGE_SANHEDRIN_ENABLED=1\nVESTIGE_SANHEDRIN_ENDPOINT={}\nVESTIGE_SANHEDRIN_MODEL={}\nVESTIGE_DASHBOARD_PORT={}\n",
+        "VESTIGE_SANHEDRIN_ENABLED=1\nVESTIGE_SANHEDRIN_ENDPOINT={}\nVESTIGE_SANHEDRIN_MODEL={}\nVESTIGE_DASHBOARD_PORT={}\nVESTIGE_SANHEDRIN_CLAIM_MODE=1\nVESTIGE_SANHEDRIN_OUTPUT=json\n",
         quote_shell_env(endpoint),
         quote_shell_env(model),
         quote_shell_env(dashboard_port)
@@ -794,6 +877,13 @@ fn install_sandwich_from_source(
     let backup_path = claude_dir.join("settings.json.bak.pre-sandwich");
     if !backup_path.exists() {
         fs::copy(&settings_path, &backup_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&backup_path)?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&backup_path, perms)?;
+        }
     }
 
     let settings_file = fs::File::open(&settings_path)?;
@@ -887,11 +977,123 @@ fn run_command(command: &mut Command, action: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path)
+    }
+}
+
+fn command_output(command: &mut Command, action: &str) -> anyhow::Result<String> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to start {}", action))?;
+    if !output.status.success() {
+        anyhow::bail!("{} failed with status {}", action, output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn powershell_quote(value: &Path) -> String {
+    format!("'{}'", value.display().to_string().replace('\'', "''"))
+}
+
+fn normalize_archive_entry(entry: &str) -> anyhow::Result<String> {
+    let normalized = entry.trim().replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.get(1..2) == Some(":")
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "..")
+    {
+        anyhow::bail!("archive contains unsafe entry: {}", entry);
+    }
+    Ok(normalized.to_string())
+}
+
+fn archive_listing(archive_path: &Path, archive_ext: &str) -> anyhow::Result<String> {
+    let listing = match archive_ext {
+        "tar.gz" => command_output(
+            Command::new("tar").arg("-tzf").arg(archive_path),
+            "listing Vestige archive with tar",
+        )?,
+        "zip" => {
+            let script = format!(
+                "Add-Type -AssemblyName System.IO.Compression.FileSystem; \
+                 $zip = [System.IO.Compression.ZipFile]::OpenRead({}); \
+                 try {{ $zip.Entries | ForEach-Object {{ $_.FullName }} }} finally {{ $zip.Dispose() }}",
+                powershell_quote(archive_path)
+            );
+            command_output(
+                Command::new("powershell")
+                    .arg("-NoProfile")
+                    .arg("-Command")
+                    .arg(script),
+                "listing Vestige archive with PowerShell",
+            )?
+        }
+        other => anyhow::bail!("unsupported release archive extension: {}", other),
+    };
+    Ok(listing)
+}
+
+fn validate_archive_safety(archive_path: &Path, archive_ext: &str) -> anyhow::Result<()> {
+    let listing = archive_listing(archive_path, archive_ext)?;
+    for entry in listing.lines().filter(|line| !line.trim().is_empty()) {
+        normalize_archive_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_archive_entries(
+    archive_path: &Path,
+    archive_ext: &str,
+    expected_members: &[String],
+) -> anyhow::Result<()> {
+    let listing = archive_listing(archive_path, archive_ext)?;
+
+    let expected: HashSet<&str> = expected_members.iter().map(String::as_str).collect();
+    for entry in listing.lines().filter(|line| !line.trim().is_empty()) {
+        let normalized = normalize_archive_entry(entry)?;
+        if !expected.contains(normalized.as_str()) {
+            anyhow::bail!("release archive contains unexpected entry: {}", entry);
+        }
+    }
+    Ok(())
+}
+
+fn extract_source_archive(archive_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
+    validate_archive_safety(archive_path, "tar.gz")?;
+    run_command(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(output_dir),
+        "extracting Vestige source archive with tar",
+    )
+}
+
 fn extract_archive(
     archive_path: &Path,
     output_dir: &Path,
     archive_ext: &str,
+    expected_members: &[String],
 ) -> anyhow::Result<()> {
+    validate_archive_entries(archive_path, archive_ext, expected_members)?;
     match archive_ext {
         "tar.gz" => run_command(
             Command::new("tar")
@@ -906,9 +1108,9 @@ fn extract_archive(
                 .arg("-NoProfile")
                 .arg("-Command")
                 .arg(format!(
-                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-                    archive_path.display(),
-                    output_dir.display()
+                    "Expand-Archive -LiteralPath {} -DestinationPath {} -Force",
+                    powershell_quote(archive_path),
+                    powershell_quote(output_dir)
                 )),
             "extracting Vestige release archive with PowerShell",
         ),
@@ -969,6 +1171,7 @@ fn run_update(
     install_dir: Option<PathBuf>,
     dry_run: bool,
     no_sandwich: bool,
+    sandwich_companion: bool,
     sandwich: SandwichInstallOptions,
 ) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Update ===".cyan().bold());
@@ -1020,15 +1223,35 @@ fn run_update(
 
     let temp_dir = UpdateTempDir::create()?;
     let archive_path = temp_dir.path.join(&archive_name);
+    let checksum_path = temp_dir.path.join(format!("{}.sha256", archive_name));
 
     println!();
     println!("{}", "Downloading release archive...".cyan());
     download_file(&url, &archive_path, "downloading Vestige release archive")?;
-
-    println!("{}", "Extracting release archive...".cyan());
-    extract_archive(&archive_path, &temp_dir.path, asset.archive_ext)?;
+    download_file(
+        &format!("{}.sha256", url),
+        &checksum_path,
+        "downloading Vestige release checksum",
+    )?;
+    verify_release_checksum(&archive_path, &checksum_path)?;
 
     let binaries = ["vestige", "vestige-mcp", "vestige-restore"];
+    let mut expected_members = binaries
+        .iter()
+        .map(|binary| format!("{}{}", binary, asset.binary_suffix))
+        .collect::<Vec<_>>();
+    if asset.target == "x86_64-apple-darwin" {
+        expected_members.push("INSTALL-INTEL-MAC.md".to_string());
+    }
+
+    println!("{}", "Extracting release archive...".cyan());
+    extract_archive(
+        &archive_path,
+        &temp_dir.path,
+        asset.archive_ext,
+        &expected_members,
+    )?;
+
     for binary in binaries {
         let filename = format!("{}{}", binary, asset.binary_suffix);
         let source = temp_dir.path.join(&filename);
@@ -1059,18 +1282,24 @@ fn run_update(
             .bold()
     );
 
-    if no_sandwich {
-        println!(
-            "{}",
-            "Skipped Cognitive Sandwich companion update (--no-sandwich).".yellow()
-        );
-    } else {
+    if sandwich_companion && !no_sandwich {
         println!();
         println!(
             "{}",
             "Updating Cognitive Sandwich companion files...".cyan()
         );
         run_sandwich_install(version.as_deref(), &sandwich)?;
+    } else if no_sandwich {
+        println!(
+            "{}",
+            "Skipped Cognitive Sandwich companion update (--no-sandwich).".yellow()
+        );
+    } else {
+        println!(
+            "{}",
+            "Skipped Cognitive Sandwich companion update (default). Pass --sandwich-companion to refresh Claude Code companion files."
+                .yellow()
+        );
     }
 
     Ok(())
@@ -1680,6 +1909,13 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     println!("  {}   {}", "To:".dimmed(), output.display());
 
     std::fs::copy(&db_path, &output)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&output)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&output, perms)?;
+    }
 
     let file_size = std::fs::metadata(&output)?.len();
     let size_display = if file_size >= 1024 * 1024 {
@@ -1790,7 +2026,7 @@ fn run_export(
         std::fs::create_dir_all(parent)?;
     }
 
-    let file = std::fs::File::create(&output)?;
+    let file = create_private_file(&output)?;
     let mut writer = BufWriter::new(file);
 
     match format.as_str() {
@@ -2305,7 +2541,9 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
             bind,
             port
         );
-        println!("  {} Auth token: {}...", ">".cyan(), &token[..8]);
+        if let Ok(path) = vestige_mcp::protocol::auth::token_path() {
+            println!("  {} Auth token file: {}", ">".cyan(), path.display());
+        }
         println!();
         println!("{}", "Press Ctrl+C to stop.".dimmed());
 

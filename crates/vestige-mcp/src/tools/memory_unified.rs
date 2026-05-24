@@ -44,7 +44,7 @@ pub fn schema() -> Value {
             "action": {
                 "type": "string",
                 "enum": ["get", "get_batch", "delete", "purge", "state", "promote", "demote", "edit"],
-                "description": "Action to perform: 'get' retrieves full memory node, 'get_batch' retrieves multiple memories by IDs (use 'ids' array), 'purge' permanently removes memory content and embeddings after confirm=true, 'delete' is a backwards-compatible alias for purge, 'state' returns accessibility state, 'promote' increases retrieval strength (thumbs up), 'demote' decreases retrieval strength (thumbs down), 'edit' updates content in-place (preserves FSRS state)"
+                "description": "Action to perform: 'get' retrieves full memory node, 'get_batch' retrieves multiple memories by IDs (use 'ids' array), 'purge' permanently removes memory content and embeddings after confirm=true, 'delete' is a backwards-compatible alias for purge and also requires confirm=true, 'state' returns accessibility state, 'promote' increases retrieval strength (thumbs up), 'demote' decreases retrieval strength (thumbs down), 'edit' updates content in-place (preserves FSRS state)"
             },
             "id": {
                 "type": "string",
@@ -61,7 +61,7 @@ pub fn schema() -> Value {
             },
             "confirm": {
                 "type": "boolean",
-                "description": "Required for action='purge'. Purge permanently removes memory content and embeddings; only a non-content tombstone remains.",
+                "description": "Required for action='purge' and action='delete'. Purge/delete permanently removes memory content and embeddings; only a non-content tombstone remains.",
                 "default": false
             },
             "content": {
@@ -116,7 +116,16 @@ pub async fn execute(
 
     match args.action.as_str() {
         "get" => execute_get(storage, &id).await,
-        "delete" => execute_purge(storage, &id, args.reason, true, "delete").await,
+        "delete" => {
+            execute_purge(
+                storage,
+                &id,
+                args.reason,
+                args.confirm.unwrap_or(false),
+                "delete",
+            )
+            .await
+        }
         "purge" => {
             execute_purge(
                 storage,
@@ -604,10 +613,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_existing_memory() {
+    async fn test_delete_requires_confirm() {
         let (storage, _dir) = test_storage().await;
         let id = ingest_memory(&storage).await;
-        let args = serde_json::json!({ "action": "delete", "id": id });
+        let args = serde_json::json!({ "action": "delete", "id": id.clone() });
+        let result = execute(&storage, &test_cognitive(), Some(args)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("confirm=true"));
+        assert!(storage.get_node(&id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_delete_existing_memory_with_confirm() {
+        let (storage, _dir) = test_storage().await;
+        let id = ingest_memory(&storage).await;
+        let args = serde_json::json!({ "action": "delete", "id": id, "confirm": true });
         let result = execute(&storage, &test_cognitive(), Some(args)).await;
         assert!(result.is_ok());
         let value = result.unwrap();
@@ -628,8 +648,11 @@ mod tests {
             .unwrap()
             .id;
         let _ = storage.delete_node(&warmup_id);
-        let args =
-            serde_json::json!({ "action": "delete", "id": "00000000-0000-0000-0000-000000000000" });
+        let args = serde_json::json!({
+            "action": "delete",
+            "id": "00000000-0000-0000-0000-000000000000",
+            "confirm": true
+        });
         let result = execute(&storage, &test_cognitive(), Some(args)).await;
         assert!(result.is_ok());
         let value = result.unwrap();
@@ -641,7 +664,7 @@ mod tests {
     async fn test_delete_then_get_returns_not_found() {
         let (storage, _dir) = test_storage().await;
         let id = ingest_memory(&storage).await;
-        let del_args = serde_json::json!({ "action": "delete", "id": id });
+        let del_args = serde_json::json!({ "action": "delete", "id": id, "confirm": true });
         execute(&storage, &test_cognitive(), Some(del_args))
             .await
             .unwrap();

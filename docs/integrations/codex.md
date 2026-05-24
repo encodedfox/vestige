@@ -89,6 +89,27 @@ args = ["--data-dir", "/Users/you/projects/my-app/.vestige"]
 
 ---
 
+## Intelligent Memory Protocol
+
+MCP registration makes Vestige tools available to Codex. It does not, by itself,
+force Codex to call those tools before answering.
+
+For workspaces where Codex should behave like it has persistent cognitive
+memory, add an `AGENTS.md` file at the workspace or repo root:
+
+```markdown
+Before answering substantive prompts, consult Vestige using the current prompt
+plus project and user context. Use `session_context` for broad context, `search`
+for quick memory checks, and `deep_reference` for decisions, contradictions, or
+accuracy-sensitive questions. Compose memories into actions; do not summarize
+retrievals.
+```
+
+Then use the full protocol in
+[`codex-intelligent-memory.md`](./codex-intelligent-memory.md).
+
+---
+
 ## Troubleshooting
 
 <details>

@@ -4,7 +4,8 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const packageJson = require('../package.json');
 const VERSION = packageJson.version;
@@ -28,11 +29,26 @@ const archStr = ARCH_MAP[ARCH];
 
 if (!platformStr || !archStr) {
   console.error(`Unsupported platform: ${PLATFORM}-${ARCH}`);
-  console.error('Supported: darwin/linux/win32 on x64/arm64');
+  console.error('Supported release assets: macOS x64/arm64, Linux x64, Windows x64');
   process.exit(1);
 }
 
 const target = `${archStr}-${platformStr}`;
+const SUPPORTED_TARGETS = new Set([
+  'aarch64-apple-darwin',
+  'x86_64-apple-darwin',
+  'x86_64-unknown-linux-gnu',
+  'x86_64-pc-windows-msvc',
+]);
+if (!SUPPORTED_TARGETS.has(target)) {
+  console.error(`Unsupported Vestige release target: ${target}`);
+  console.error('Supported release assets:');
+  for (const supported of SUPPORTED_TARGETS) {
+    console.error(`  - ${supported}`);
+  }
+  process.exit(1);
+}
+
 const isWindows = PLATFORM === 'win32';
 const archiveExt = isWindows ? 'zip' : 'tar.gz';
 const archiveName = `vestige-mcp-${target}.${archiveExt}`;
@@ -40,6 +56,10 @@ const downloadUrl = `https://github.com/samvallad33/vestige/releases/download/v$
 
 const targetDir = path.join(__dirname, '..', 'bin');
 const archivePath = path.join(targetDir, archiveName);
+const checksumPath = path.join(targetDir, `${archiveName}.sha256`);
+const expectedArchiveMembers = new Set(
+  ['vestige-mcp', 'vestige', 'vestige-restore'].map((name) => (isWindows ? `${name}.exe` : name))
+);
 
 function isWorkspaceCheckout() {
   const packageRoot = path.resolve(__dirname, '..');
@@ -107,15 +127,65 @@ function download(url, dest) {
  * Extract archive based on platform
  */
 function extract(archivePath, destDir) {
+  validateArchiveEntries(archivePath);
   if (isWindows) {
     // Use PowerShell to extract zip on Windows
-    execSync(
-      `powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force"`,
+    execFileSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-Command',
+        `Expand-Archive -LiteralPath ${powershellQuote(archivePath)} -DestinationPath ${powershellQuote(destDir)} -Force`,
+      ],
       { stdio: 'inherit' }
     );
   } else {
     // Use tar on Unix
-    execSync(`tar -xzf "${archivePath}" -C "${destDir}"`, { stdio: 'inherit' });
+    execFileSync('tar', ['-xzf', archivePath, '-C', destDir], { stdio: 'inherit' });
+  }
+}
+
+function powershellQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function listArchiveEntries(archivePath) {
+  if (!isWindows) {
+    return execFileSync('tar', ['-tzf', archivePath], { encoding: 'utf8' });
+  }
+
+  const script = [
+    'Add-Type -AssemblyName System.IO.Compression.FileSystem;',
+    `$zip = [System.IO.Compression.ZipFile]::OpenRead(${powershellQuote(archivePath)});`,
+    'try { $zip.Entries | ForEach-Object { $_.FullName } } finally { $zip.Dispose() }',
+  ].join(' ');
+  return execFileSync('powershell', ['-NoProfile', '-Command', script], { encoding: 'utf8' });
+}
+
+function normalizeArchiveEntry(entry) {
+  let normalized = entry.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (
+    !normalized ||
+    normalized.startsWith('/') ||
+    /^[A-Za-z]:/.test(normalized) ||
+    normalized.split('/').some((part) => part === '' || part === '..')
+  ) {
+    throw new Error(`Unsafe archive entry: ${entry}`);
+  }
+  return normalized;
+}
+
+function validateArchiveEntries(archivePath) {
+  const entries = listArchiveEntries(archivePath)
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const entry of entries) {
+    const normalized = normalizeArchiveEntry(entry);
+    if (!expectedArchiveMembers.has(normalized)) {
+      throw new Error(`Unexpected archive entry: ${entry}`);
+    }
   }
 }
 
@@ -134,11 +204,26 @@ function makeExecutable(binDir) {
   }
 }
 
+function verifyChecksum(archivePath, checksumPath) {
+  const checksumText = fs.readFileSync(checksumPath, 'utf8').trim();
+  const expected = checksumText.split(/\s+/)[0]?.toLowerCase();
+  if (!expected || !/^[a-f0-9]{64}$/.test(expected)) {
+    throw new Error(`Invalid checksum file for ${archiveName}`);
+  }
+
+  const actual = crypto.createHash('sha256').update(fs.readFileSync(archivePath)).digest('hex');
+  if (actual !== expected) {
+    throw new Error(`Checksum mismatch for ${archiveName}`);
+  }
+}
+
 async function main() {
   try {
     // Download
     console.log(`Downloading from ${downloadUrl}...`);
     await download(downloadUrl, archivePath);
+    await download(`${downloadUrl}.sha256`, checksumPath);
+    verifyChecksum(archivePath, checksumPath);
     console.log('Download complete.');
 
     // Extract
@@ -147,6 +232,7 @@ async function main() {
 
     // Cleanup archive
     fs.unlinkSync(archivePath);
+    fs.unlinkSync(checksumPath);
 
     // Make executable
     makeExecutable(targetDir);
@@ -169,9 +255,11 @@ async function main() {
     }
     console.log('');
     console.log('Next steps:');
-    console.log('  1. Add to Claude: claude mcp add vestige vestige-mcp -s user');
-    console.log('  2. Restart Claude');
-    console.log('  3. Test with: "remember that my favorite color is blue"');
+    console.log('  1. Add vestige-mcp to any MCP-compatible agent.');
+    console.log('     Claude Code: claude mcp add vestige vestige-mcp -s user');
+    console.log('     Codex:       codex mcp add vestige -- vestige-mcp');
+    console.log('  2. Restart your MCP client.');
+    console.log('  3. Test with: "remember that my preferred editor is VS Code"');
     console.log('');
 
   } catch (err) {

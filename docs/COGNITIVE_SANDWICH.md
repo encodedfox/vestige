@@ -37,7 +37,7 @@ Sanhedrin, preflight, and all Vestige Claude Code hooks are optional. The defaul
 3. **Claude reads the assembled context and generates a draft.**
 4. **By default, no Vestige Stop hooks are installed.** If explicitly enabled, Stop hooks fire serially (any can VETO with `exit 2`, forcing a rewrite):
    - `veto-detector.sh` — fast regex against `veto`-tagged Vestige memories (~50ms)
-   - `sanhedrin.sh` → `sanhedrin-local.py` — optional single-shot semantic verdict
+   - `sanhedrin.sh` → `sanhedrin-local.py` — optional Sanhedrin verifier
    - `synthesis-stop-validator.sh` — regex against forbidden patterns (hedging, summary-instead-of-composition)
 5. **If all enabled Stop hooks return `exit 0`, the response is delivered.**
 
@@ -45,18 +45,43 @@ Sanhedrin, preflight, and all Vestige Claude Code hooks are optional. The defaul
 
 ## The Sanhedrin Executioner protocol
 
-The Executioner extracts atomic claims from Claude's draft across 10 classes:
+Sanhedrin has two execution modes:
+
+- **Legacy mode** (`VESTIGE_SANHEDRIN_CLAIM_MODE=0`) keeps the original broad draft-level semantic check for technical-looking responses.
+- **Claim mode** (`VESTIGE_SANHEDRIN_CLAIM_MODE=1`) extracts check-worthy claims, retrieves Vestige evidence per claim, and aggregates structured verdicts before the Stop hook allows delivery.
+
+The claim-mode Executioner extracts atomic claims from Claude's draft across these classes:
 
 `TECHNICAL` · `BIOGRAPHICAL` · `FINANCIAL` · `ACHIEVEMENT` · `TIMELINE` · `QUANTITATIVE` · `ATTRIBUTION` · `CAUSAL` · `COMPARATIVE` · `EXISTENTIAL` · plus v2.1.0 additions: `VAGUE-QUANTIFIER` · `UNVERIFIED-POSITIVE`
 
-For each claim, it checks Vestige's `deep_reference` for high-trust contradicting memories. Decision rules:
+For each check-worthy claim, claim mode calls Vestige's `/api/deep_reference` and judges the claim against high-trust durable evidence plus any optional staged evidence overlay. Decision rules:
 
 | Class | Rule |
 |---|---|
-| TECHNICAL / EXISTENTIAL / TIMELINE | VETO if memory trust > 0.55 directly contradicts |
-| BIOGRAPHICAL / FINANCIAL / ACHIEVEMENT / ATTRIBUTION | VETO if contradicted OR if factual-shaped with zero supporting evidence (fail-closed) |
-| **VAGUE-QUANTIFIER** | VETO on vague achievement or financial claims without enumeration |
+| TECHNICAL / EXISTENTIAL / CAUSAL / COMPARATIVE | VETO only on same-subject durable contradiction; missing memory is `NEI` |
+| BIOGRAPHICAL / FINANCIAL / ACHIEVEMENT / TIMELINE / QUANTITATIVE / ATTRIBUTION / VAGUE-QUANTIFIER about the user | zero high-trust durable evidence is `REFUTED_BY_ABSENCE` and blocks |
+| **VAGUE-QUANTIFIER** | VETO on vague achievement or financial claims without durable enumeration |
 | **UNVERIFIED-POSITIVE** | VETO on specific named institutions/dates/employers not in evidence |
+
+Structured verdicts:
+
+| Verdict | Meaning |
+|---|---|
+| `SUPPORTED` | High-trust evidence supports or does not contradict the claim |
+| `REFUTED` | High-trust durable evidence directly contradicts the same-subject claim |
+| `REFUTED_BY_ABSENCE` | User-critical claim has no high-trust durable Vestige evidence |
+| `NEI` | Not enough information; allow unless another claim blocks |
+
+The bridge still prints legacy one-line `yes` / `no - ...` by default for Stop-hook compatibility. With `VESTIGE_SANHEDRIN_OUTPUT=json`, it emits structured JSON containing `decision`, `reason`, and per-claim verdicts. `sanhedrin.sh` can parse either format.
+
+### Staged evidence overlay
+
+`VESTIGE_SANHEDRIN_STAGE_FILE` may point to a JSON array of current-turn evidence candidates. Sanhedrin can read this staged evidence as context, but staged evidence is deliberately non-durable:
+
+- it never calls `smart_ingest`
+- it cannot promote, demote, merge, suppress, or supersede durable memories
+- it does not satisfy the durable-evidence requirement for `REFUTED_BY_ABSENCE`
+- durable memory writes remain a separate commit-after-pass step
 
 False-positive guards (added v2.1.0 after dogfood):
 - Subject-equality gate (memory about Vestige codebase ≠ contradiction with external tools)
@@ -75,10 +100,12 @@ False-positive guards (added v2.1.0 after dogfood):
 vestige sandwich install
 ```
 
-`vestige update` also refreshes these companion files by default after it updates
-the binaries. The default command does not activate any Claude Code hook. It
-removes old v2.1.0 Vestige hook wiring from `~/.claude/settings.json` while
-preserving unrelated user hooks.
+`vestige update` updates binaries only by default. To refresh these optional
+Claude Code companion files during an update, run
+`vestige update --sandwich-companion`. The companion installer does not activate
+any Claude Code hook unless you pass an explicit opt-in flag. It removes old
+v2.1.0 Vestige hook wiring from `~/.claude/settings.json` while preserving
+unrelated user hooks.
 
 ### From a checkout
 
@@ -122,7 +149,7 @@ vestige sandwich install \
 |---|---|
 | Python 3.10+ | typically preinstalled |
 | `jq` | `brew install jq` |
-| `vestige-mcp` | `cargo install vestige-mcp` |
+| `vestige-mcp` | `npm install -g vestige-mcp-server` |
 | Claude Code | https://claude.ai/code |
 
 Optional Apple Silicon local Sanhedrin backend:
@@ -158,7 +185,8 @@ cp ~/.claude/settings.json.bak.pre-sandwich ~/.claude/settings.json
 ## Performance notes
 
 Optional local MLX backend on M3 Max 16-core (400 GB/s memory bandwidth):
-- Sanhedrin verdict: 5–15 seconds end-to-end (single deep_reference + single Qwen call)
+- Legacy Sanhedrin verdict: 5–15 seconds end-to-end (single deep_reference + single Qwen call)
+- Claim mode: one `/api/deep_reference` call per extracted check-worthy claim, capped by `VESTIGE_SANHEDRIN_MAX_CLAIMS`
 - mlx_lm.server token generation: ~82 tok/s
 - mlx_lm.server peak resident memory: ~19.7 GB
 - Cold model load: ~5 seconds
@@ -176,6 +204,11 @@ On M3 Max 14-core or M2/M1 Max: closer to 3–7s prompt processing, ~50–60 tok
 | `VESTIGE_DASHBOARD_PORT` | `3927` | Vestige MCP HTTP API port used by hooks |
 | `VESTIGE_SANHEDRIN_ENDPOINT` | `http://127.0.0.1:8080/v1/chat/completions` | OpenAI-compatible chat completions endpoint for Sanhedrin |
 | `VESTIGE_SANHEDRIN_MODEL` | `mlx-community/Qwen3.6-35B-A3B-4bit` | Model name sent to the Sanhedrin endpoint |
+| `VESTIGE_SANHEDRIN_CLAIM_MODE` | `1` when installed with `--enable-sanhedrin` | Enables per-claim retrieval and fail-closed user-critical lanes |
+| `VESTIGE_SANHEDRIN_OUTPUT` | `json` when installed with `--enable-sanhedrin` | Emits structured JSON from the bridge; shell hook also accepts legacy text |
+| `VESTIGE_SANHEDRIN_STAGE_FILE` | unset | Optional JSON-array staged evidence overlay, read-only and non-durable |
+| `VESTIGE_SANHEDRIN_MAX_CLAIMS` | `8` | Max check-worthy claims adjudicated per draft |
+| `VESTIGE_SANHEDRIN_PYTHON` | `python3` from `PATH` | Optional Python interpreter override for the Stop hook bridge |
 | `MLX_ENDPOINT` / `VESTIGE_SANDWICH_MODEL` | legacy aliases | Backward-compatible names still read by the bridge |
 | `VESTIGE_MEMORY_DIR` | (auto) | Override per-user Claude memory dir |
 

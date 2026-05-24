@@ -173,14 +173,14 @@ describe('buildTransferMatrix', () => {
 	it('aggregates transfer counts directionally', () => {
 		const m = buildTransferMatrix(PROJECTS, PATTERNS);
 		// vestige → api-gateway: Result<T,E> + proptest = 2
-		expect(m.vestige.api-gateway.count).toBe(2);
+		expect(m.vestige['api-gateway'].count).toBe(2);
 		// vestige → desktop-app: Result<T,E> only = 1
-		expect(m.vestige.desktop-app.count).toBe(1);
+		expect(m.vestige['desktop-app'].count).toBe(1);
 		// api-gateway → vestige: Axum middleware = 1
-		expect(m.api-gateway.vestige.count).toBe(1);
+		expect(m['api-gateway'].vestige.count).toBe(1);
 		// desktop-app → anywhere: zero (no origin in desktop-app in fixtures)
-		expect(m.desktop-app.vestige.count).toBe(0);
-		expect(m.desktop-app.api-gateway.count).toBe(0);
+		expect(m['desktop-app'].vestige.count).toBe(0);
+		expect(m['desktop-app']['api-gateway'].count).toBe(0);
 	});
 
 	it('treats (A, B) and (B, A) as distinct directions (asymmetry confirmed)', () => {
@@ -189,7 +189,7 @@ describe('buildTransferMatrix', () => {
 		// bug that aggregates both directions into the same cell would pass
 		// the "count" test above but fail this symmetry check.
 		const m = buildTransferMatrix(PROJECTS, PATTERNS);
-		expect(m.vestige.api-gateway.count).not.toBe(m.api-gateway.vestige.count);
+		expect(m.vestige['api-gateway'].count).not.toBe(m['api-gateway'].vestige.count);
 	});
 
 	it('records self-transfer on the diagonal', () => {
@@ -207,9 +207,9 @@ describe('buildTransferMatrix', () => {
 			transfer_count: 1,
 		}));
 		const m = buildTransferMatrix(['vestige', 'api-gateway'], manyPatterns);
-		expect(m.vestige.api-gateway.count).toBe(5);
-		expect(m.vestige.api-gateway.topNames).toHaveLength(3);
-		expect(m.vestige.api-gateway.topNames).toEqual(['pattern-0', 'pattern-1', 'pattern-2']);
+		expect(m.vestige['api-gateway'].count).toBe(5);
+		expect(m.vestige['api-gateway'].topNames).toHaveLength(3);
+		expect(m.vestige['api-gateway'].topNames).toEqual(['pattern-0', 'pattern-1', 'pattern-2']);
 	});
 
 	it('silently drops patterns whose origin is not in the projects axis', () => {
@@ -238,7 +238,7 @@ describe('buildTransferMatrix', () => {
 		};
 		const m = buildTransferMatrix(PROJECTS, [strayDest]);
 		// The known destination counts; the ghost doesn't.
-		expect(m.vestige.api-gateway.count).toBe(1);
+		expect(m.vestige['api-gateway'].count).toBe(1);
 		expect((m.vestige as Record<string, unknown>)['ghost-project']).toBeUndefined();
 	});
 
@@ -260,7 +260,7 @@ describe('buildTransferMatrix', () => {
 			},
 		];
 		const m = buildTransferMatrix(['vestige', 'api-gateway'], pats, 1);
-		expect(m.vestige.api-gateway.topNames).toEqual(['a']);
+		expect(m.vestige['api-gateway'].topNames).toEqual(['a']);
 	});
 });
 

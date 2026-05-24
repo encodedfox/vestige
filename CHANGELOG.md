@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.21] - 2026-05-24 — "Agent-Neutral Hardening"
+
+v2.1.21 is a release-hardening pass for normal MCP usage across agents. It keeps
+Claude Code Cognitive Sandwich companion files optional while making the MCP
+server, package installer, release workflow, and portable sync path safer.
+
+### Added
+
+- **Agent-neutral memory protocol** — new `docs/AGENT-MEMORY-PROTOCOL.md` gives
+  any MCP-compatible client the same practical memory loop: initialize context,
+  search/deep-reference when needed, save durable facts with `smart_ingest`, and
+  promote/demote/purge with `memory`.
+- **HTTP transport opt-in** — `vestige-mcp` now requires `--http`,
+  `--http-port`, or `VESTIGE_HTTP_ENABLED=1` before starting MCP-over-HTTP.
+- **Release checksums** — release assets now publish `.sha256` files beside each
+  archive.
+
+### Changed
+
+- **`vestige update` is binary-only by default** — Claude Code Cognitive
+  Sandwich companion files refresh only with `vestige update --sandwich-companion`
+  or `vestige sandwich install`.
+- **MCP tool results include structured content** while keeping text content for
+  clients that only consume the classic MCP response shape.
+- **NPM install messaging is agent-neutral** and unsupported release targets
+  fail fast instead of trying to download assets that do not exist.
+- **Portable merge uses UPSERT instead of `INSERT OR REPLACE`** for keyed tables,
+  preserving related rows instead of causing delete-and-insert side effects.
+
+### Fixed
+
+- **Destructive delete confirmation** — `memory(action="delete")` now requires
+  `confirm=true`, matching `purge`; the deprecated `delete_knowledge` shim no
+  longer bypasses confirmation.
+- **Portable purge tombstone sync** — merge imports now carry
+  `deletion_tombstones` and apply purges without retaining deleted memory text.
+  Hard purge tombstones win over newer local edits during portable sync, while
+  tombstone merges keep the newest deletion timestamp.
+- **Vector index reload staleness** — loading persisted embeddings rebuilds the
+  in-memory index from an empty index before adding current embeddings.
+- **HTTP transport hardening** — origin, Accept, session, and protocol-version
+  validation now reject incompatible or cross-origin browser requests earlier.
+- **Init config safety** — `@vestige/init` backs up existing config files, writes
+  atomically, accepts JSONC-style comments/trailing commas, and no longer writes
+  Xcode trust-accepted flags.
+- **Release tag checkout** — manual release builds now checkout the requested tag
+  or ref before packaging.
+
+### Verified
+
+- `cargo test -p vestige-mcp --lib --no-fail-fast`
+- `cargo test -p vestige-mcp --bin vestige-mcp --no-fail-fast`
+- `cargo test -p vestige-core portable_merge_import --no-fail-fast`
+- `cargo test -p vestige-mcp --bin vestige --no-fail-fast`
+- `cargo test -p vestige-e2e-tests --test mcp_protocol --no-fail-fast`
+- `cargo check --workspace`
+- `cargo metadata --format-version 1 --locked --no-deps`
+- `pnpm --filter @vestige/dashboard check`
+- `pnpm --filter @vestige/dashboard test`
+- `pnpm --filter @vestige/dashboard build`
+- `node --check packages/vestige-init/bin/init.js`
+- `node --check packages/vestige-mcp-npm/scripts/postinstall.js`
+- `node --check packages/vestige-mcp-npm/bin/vestige-restore.js`
+
 ## [2.1.2] - 2026-05-01 — "Honest Memory"
 
 v2.1.2 focuses on operational trust: exact search stays exact, purge really removes content, contradictions are directly inspectable, and the update flow no longer depends on copied curl commands.

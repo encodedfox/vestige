@@ -8,7 +8,7 @@ use directories::{BaseDirs, ProjectDirs};
 use lru::LruCache;
 use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use std::num::NonZeroUsize;
@@ -156,6 +156,16 @@ impl PortableSyncBackend for FilePortableSyncBackend {
             .unwrap_or("vestige-sync.json");
         let temp_path = parent.join(format!(".{}.tmp-{}", filename, Uuid::new_v4()));
 
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::File::create(&temp_path)?;
         if let Err(e) = serde_json::to_writer_pretty(&mut file, archive) {
             let _ = std::fs::remove_file(&temp_path);
@@ -260,6 +270,11 @@ const PORTABLE_USER_DATA_TABLES: &[&str] = &[
     "sync_tombstones",
     "deletion_tombstones",
 ];
+
+#[derive(Default)]
+struct PortableMergeState {
+    locally_newer_nodes: HashSet<String>,
+}
 
 const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
 const DATABASE_FILE: &str = "vestige.db";
@@ -454,6 +469,10 @@ impl Storage {
     /// Load existing embeddings into vector index
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn load_embeddings_into_index(&self) -> Result<()> {
+        let mut index = self
+            .vector_index
+            .lock()
+            .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
         let reader = self
             .reader
             .lock()
@@ -469,10 +488,9 @@ impl Storage {
         drop(stmt);
         drop(reader);
 
-        let mut index = self
-            .vector_index
-            .lock()
-            .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
+        *index = VectorIndex::new().map_err(|e| {
+            StorageError::Init(format!("Failed to rebuild vector index before load: {}", e))
+        })?;
 
         let mut load_failures = 0u32;
         let mut skipped_model_mismatches = 0u32;
@@ -1817,14 +1835,16 @@ impl Storage {
 
     /// Delete a node
     pub fn delete_node(&self, id: &str) -> Result<bool> {
-        let writer = self
+        let mut writer = self
             .writer
             .lock()
             .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
-        if Self::node_exists(&writer, id)? {
-            Self::record_sync_tombstone(&writer, "knowledge_nodes", id, "delete_node")?;
+        let tx = writer.transaction()?;
+        if Self::node_exists(&tx, id)? {
+            Self::record_sync_tombstone(&tx, "knowledge_nodes", id, "delete_node")?;
         }
-        let rows = writer.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![id])?;
+        let rows = tx.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![id])?;
+        tx.commit()?;
 
         // Clean up vector index to prevent stale search results
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
@@ -4740,6 +4760,16 @@ impl Storage {
             .unwrap_or("vestige-portable.json");
         let temp_path = parent.join(format!(".{}.tmp-{}", filename, Uuid::new_v4()));
 
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::File::create(&temp_path)?;
         if let Err(e) = serde_json::to_writer_pretty(&mut file, &archive) {
             let _ = std::fs::remove_file(&temp_path);
@@ -4839,6 +4869,7 @@ impl Storage {
             }
 
             let tx = writer.transaction()?;
+            let mut merge_state = PortableMergeState::default();
 
             for table_name in PORTABLE_TABLES {
                 let Some(table) = tables_by_name.get(table_name) else {
@@ -4851,7 +4882,13 @@ impl Storage {
                 }
 
                 if mode == PortableImportMode::Merge {
-                    Self::merge_portable_table(&tx, table_name, table, &mut report)?;
+                    Self::merge_portable_table(
+                        &tx,
+                        table_name,
+                        table,
+                        &mut report,
+                        &mut merge_state,
+                    )?;
                     report.tables_imported += 1;
                     continue;
                 }
@@ -4991,28 +5028,37 @@ impl Storage {
         table_name: &str,
         table: &PortableTable,
         report: &mut PortableImportReport,
+        state: &mut PortableMergeState,
     ) -> Result<()> {
         match table_name {
             "sync_tombstones" => Self::merge_sync_tombstones(tx, table, report),
-            "knowledge_nodes" => Self::merge_knowledge_nodes(tx, table, report),
+            "knowledge_nodes" => Self::merge_knowledge_nodes(tx, table, report, state),
             "memory_access_log"
             | "state_transitions"
             | "consolidation_history"
             | "dream_history"
             | "retention_snapshots" => Self::merge_append_only_table(tx, table_name, table, report),
             "node_embeddings" => {
-                Self::merge_keyed_table(tx, table_name, table, &["node_id"], report)
+                Self::merge_keyed_table(tx, table_name, table, &["node_id"], report, state)
             }
             "fsrs_cards" | "memory_states" => {
-                Self::merge_keyed_table(tx, table_name, table, &["memory_id"], report)
+                Self::merge_keyed_table(tx, table_name, table, &["memory_id"], report, state)
             }
-            "memory_connections" => {
-                Self::merge_keyed_table(tx, table_name, table, &["source_id", "target_id"], report)
-            }
+            "deletion_tombstones" => Self::merge_deletion_tombstones(tx, table, report),
+            "memory_connections" => Self::merge_keyed_table(
+                tx,
+                table_name,
+                table,
+                &["source_id", "target_id"],
+                report,
+                state,
+            ),
             "intentions" | "insights" | "sessions" => {
-                Self::merge_keyed_table(tx, table_name, table, &["id"], report)
+                Self::merge_keyed_table(tx, table_name, table, &["id"], report, state)
             }
-            "fsrs_config" => Self::merge_keyed_table(tx, table_name, table, &["key"], report),
+            "fsrs_config" => {
+                Self::merge_keyed_table(tx, table_name, table, &["key"], report, state)
+            }
             _ => {
                 report.tables_skipped += 1;
                 Ok(())
@@ -5024,6 +5070,7 @@ impl Storage {
         tx: &rusqlite::Transaction<'_>,
         table: &PortableTable,
         report: &mut PortableImportReport,
+        state: &mut PortableMergeState,
     ) -> Result<()> {
         for row in &table.rows {
             let Some(id) = Self::portable_text(table, row, "id") else {
@@ -5055,6 +5102,7 @@ impl Storage {
                 incoming_updated,
             ) && existing > incoming
             {
+                state.locally_newer_nodes.insert(id.to_string());
                 report.conflicts_kept_local += 1;
                 report.rows_skipped += 1;
                 continue;
@@ -5085,15 +5133,41 @@ impl Storage {
                 report.rows_skipped += 1;
                 continue;
             };
-            let deleted_at = Self::portable_timestamp(table, row, "deleted_at");
+            let incoming_deleted_at = Self::portable_timestamp(table, row, "deleted_at");
+            let incoming_reason = Self::portable_text(table, row, "reason").map(ToOwned::to_owned);
 
-            let affected = Self::insert_or_replace_row(tx, "sync_tombstones", table, row)?;
-            report.rows_imported += 1;
-            if affected == MergeWrite::Inserted {
-                report.rows_inserted += 1;
+            let existing_tombstone: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT deleted_at, reason FROM sync_tombstones WHERE table_name = ?1 AND row_id = ?2",
+                    params![table_name, row_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let existing_deleted_at = existing_tombstone
+                .as_ref()
+                .and_then(|(deleted_at, _)| Self::parse_rfc3339_opt(deleted_at));
+            let incoming_wins = match (existing_deleted_at, incoming_deleted_at) {
+                (Some(existing), Some(incoming)) => incoming >= existing,
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+
+            let (effective_deleted_at, effective_reason) = if incoming_wins {
+                let affected = Self::insert_or_replace_row(tx, "sync_tombstones", table, row)?;
+                report.rows_imported += 1;
+                if affected == MergeWrite::Inserted {
+                    report.rows_inserted += 1;
+                } else {
+                    report.rows_updated += 1;
+                }
+                (incoming_deleted_at, incoming_reason)
             } else {
-                report.rows_updated += 1;
-            }
+                report.rows_skipped += 1;
+                (
+                    existing_deleted_at,
+                    existing_tombstone.and_then(|(_, reason)| reason),
+                )
+            };
 
             if table_name == "knowledge_nodes" {
                 let local_updated: Option<String> = tx
@@ -5105,9 +5179,11 @@ impl Storage {
                     .optional()?;
                 let should_delete = match (
                     local_updated.as_deref().and_then(Self::parse_rfc3339_opt),
-                    deleted_at,
+                    effective_deleted_at,
                 ) {
-                    (Some(local), Some(deleted)) => deleted >= local,
+                    (Some(local), Some(deleted)) => {
+                        effective_reason.as_deref() == Some("purge_node") || deleted >= local
+                    }
                     (Some(_), None) => true,
                     (None, _) => false,
                 };
@@ -5121,12 +5197,54 @@ impl Storage {
         Ok(())
     }
 
+    fn merge_deletion_tombstones(
+        tx: &rusqlite::Transaction<'_>,
+        table: &PortableTable,
+        report: &mut PortableImportReport,
+    ) -> Result<()> {
+        for row in &table.rows {
+            let Some(memory_id) = Self::portable_text(table, row, "memory_id") else {
+                report.rows_skipped += 1;
+                continue;
+            };
+            let incoming_deleted_at = Self::portable_timestamp(table, row, "deleted_at");
+            let existing_deleted_at: Option<String> = tx
+                .query_row(
+                    "SELECT deleted_at FROM deletion_tombstones WHERE memory_id = ?1",
+                    params![memory_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let (Some(existing), Some(incoming)) = (
+                existing_deleted_at
+                    .as_deref()
+                    .and_then(Self::parse_rfc3339_opt),
+                incoming_deleted_at,
+            ) && existing > incoming
+            {
+                report.rows_skipped += 1;
+                continue;
+            }
+
+            let affected = Self::insert_or_replace_row(tx, "deletion_tombstones", table, row)?;
+            report.rows_imported += 1;
+            if affected == MergeWrite::Inserted {
+                report.rows_inserted += 1;
+            } else {
+                report.rows_updated += 1;
+            }
+        }
+        Ok(())
+    }
+
     fn merge_keyed_table(
         tx: &rusqlite::Transaction<'_>,
         table_name: &str,
         table: &PortableTable,
         key_columns: &[&str],
         report: &mut PortableImportReport,
+        state: &PortableMergeState,
     ) -> Result<()> {
         for row in &table.rows {
             if !Self::parent_rows_exist(tx, table_name, table, row)? {
@@ -5140,6 +5258,11 @@ impl Storage {
                 report.rows_skipped += 1;
                 continue;
             }
+            if Self::row_references_locally_newer_node(table_name, table, row, state) {
+                report.conflicts_kept_local += 1;
+                report.rows_skipped += 1;
+                continue;
+            }
             let affected = Self::insert_or_replace_row(tx, table_name, table, row)?;
             report.rows_imported += 1;
             if affected == MergeWrite::Inserted {
@@ -5149,6 +5272,27 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    fn row_references_locally_newer_node(
+        table_name: &str,
+        table: &PortableTable,
+        row: &[PortableValue],
+        state: &PortableMergeState,
+    ) -> bool {
+        match table_name {
+            "node_embeddings" => Self::portable_text(table, row, "node_id")
+                .is_some_and(|id| state.locally_newer_nodes.contains(id)),
+            "fsrs_cards" | "memory_states" => Self::portable_text(table, row, "memory_id")
+                .is_some_and(|id| state.locally_newer_nodes.contains(id)),
+            "memory_connections" => {
+                Self::portable_text(table, row, "source_id")
+                    .is_some_and(|id| state.locally_newer_nodes.contains(id))
+                    || Self::portable_text(table, row, "target_id")
+                        .is_some_and(|id| state.locally_newer_nodes.contains(id))
+            }
+            _ => false,
+        }
     }
 
     fn merge_append_only_table(
@@ -5227,12 +5371,72 @@ impl Storage {
     ) -> Result<MergeWrite> {
         let key_exists = Self::merge_row_exists(tx, table_name, table, row)?;
         let values = Self::row_values_for_columns(table, row, &table.columns)?;
-        Self::insert_row_with_columns(tx, table_name, &table.columns, values)?;
+        Self::upsert_row_with_columns(tx, table_name, &table.columns, values)?;
         Ok(if key_exists {
             MergeWrite::Updated
         } else {
             MergeWrite::Inserted
         })
+    }
+
+    fn merge_key_columns(table_name: &str) -> &'static [&'static str] {
+        match table_name {
+            "knowledge_nodes" | "intentions" | "insights" | "sessions" => &["id"],
+            "node_embeddings" => &["node_id"],
+            "fsrs_cards" | "memory_states" | "deletion_tombstones" => &["memory_id"],
+            "memory_connections" => &["source_id", "target_id"],
+            "fsrs_config" => &["key"],
+            "sync_tombstones" => &["table_name", "row_id"],
+            _ => &[],
+        }
+    }
+
+    fn upsert_row_with_columns(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        columns: &[String],
+        values: Vec<Value>,
+    ) -> Result<()> {
+        let key_columns = Self::merge_key_columns(table_name);
+        if key_columns.is_empty() {
+            return Self::insert_row_with_columns(tx, table_name, columns, values);
+        }
+
+        let quoted_table = Self::quote_ident(table_name);
+        let quoted_columns = columns
+            .iter()
+            .map(|column| Self::quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = std::iter::repeat_n("?", columns.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conflict_target = key_columns
+            .iter()
+            .map(|column| Self::quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_columns = columns
+            .iter()
+            .filter(|column| !key_columns.iter().any(|key| key == &column.as_str()))
+            .map(|column| {
+                let quoted = Self::quote_ident(column);
+                format!("{quoted} = excluded.{quoted}")
+            })
+            .collect::<Vec<_>>();
+
+        let conflict_action = if update_columns.is_empty() {
+            "DO NOTHING".to_string()
+        } else {
+            format!("DO UPDATE SET {}", update_columns.join(", "))
+        };
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) {}",
+            quoted_table, quoted_columns, placeholders, conflict_target, conflict_action
+        );
+        tx.execute(&sql, params_from_iter(values))?;
+        Ok(())
     }
 
     fn insert_row_with_columns(
@@ -5264,15 +5468,7 @@ impl Storage {
         table: &PortableTable,
         row: &[PortableValue],
     ) -> Result<bool> {
-        let key_columns: &[&str] = match table_name {
-            "knowledge_nodes" | "intentions" | "insights" | "sessions" => &["id"],
-            "node_embeddings" => &["node_id"],
-            "fsrs_cards" | "memory_states" => &["memory_id"],
-            "memory_connections" => &["source_id", "target_id"],
-            "fsrs_config" => &["key"],
-            "sync_tombstones" => &["table_name", "row_id"],
-            _ => &[],
-        };
+        let key_columns = Self::merge_key_columns(table_name);
         if key_columns.is_empty() {
             return Ok(false);
         }
@@ -5561,6 +5757,13 @@ impl Storage {
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
         // VACUUM INTO doesn't support parameterized queries; escape single quotes
         reader.execute_batch(&format!("VACUUM INTO '{}'", path_str.replace('\'', "''")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
         Ok(())
     }
 
@@ -6415,6 +6618,128 @@ mod tests {
     }
 
     #[test]
+    fn test_portable_merge_import_keeps_children_for_newer_local_memory() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Shared parent with child rows".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let source_time = Utc::now().to_rfc3339();
+        {
+            let writer = source.writer.lock().unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO node_embeddings
+                     (node_id, embedding, dimensions, model, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, vec![1_u8, 2, 3, 4], 4, "test-model", &source_time],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO fsrs_cards
+                     (memory_id, difficulty, stability, state, reps, lapses)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![&node.id, 3.0_f64, 2.0_f64, "review", 2_i64, 0_i64],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO memory_states
+                     (memory_id, state, last_access, access_count, state_entered_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, "active", &source_time, 1_i64, &source_time],
+                )
+                .unwrap();
+        }
+
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+
+        let local_time = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        {
+            let writer = target.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params!["Newer local parent edit", &local_time, &node.id],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO node_embeddings
+                     (node_id, embedding, dimensions, model, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, vec![9_u8, 8, 7, 6], 4, "test-model", &local_time],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO fsrs_cards
+                     (memory_id, difficulty, stability, state, reps, lapses)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![&node.id, 9.0_f64, 8.0_f64, "review", 9_i64, 1_i64],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO memory_states
+                     (memory_id, state, last_access, access_count, state_entered_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, "silent", &local_time, 42_i64, &local_time],
+                )
+                .unwrap();
+        }
+
+        let report = target
+            .import_portable_archive(&archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.conflicts_kept_local >= 4);
+        let restored = target.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(restored.content, "Newer local parent edit");
+
+        let reader = target.reader.lock().unwrap();
+        let embedding: Vec<u8> = reader
+            .query_row(
+                "SELECT embedding FROM node_embeddings WHERE node_id = ?1",
+                params![&node.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedding, vec![9_u8, 8, 7, 6]);
+
+        let difficulty: f64 = reader
+            .query_row(
+                "SELECT difficulty FROM fsrs_cards WHERE memory_id = ?1",
+                params![&node.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(difficulty, 9.0);
+
+        let (state, access_count): (String, i64) = reader
+            .query_row(
+                "SELECT state, access_count FROM memory_states WHERE memory_id = ?1",
+                params![&node.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "silent");
+        assert_eq!(access_count, 42);
+    }
+
+    #[test]
     fn test_portable_merge_import_applies_delete_tombstones() {
         let source_dir = tempdir().unwrap();
         let target_dir = tempdir().unwrap();
@@ -6438,6 +6763,92 @@ mod tests {
         let delete_archive = source.export_portable_archive().unwrap();
         let report = target
             .import_portable_archive(&delete_archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.rows_deleted >= 1);
+        assert!(target.get_node(&node.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_portable_merge_import_preserves_purge_tombstones() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Memory purged on source".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sync".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+        assert!(target.get_node(&node.id).unwrap().is_some());
+
+        source
+            .purge_node(&node.id, Some("sync purge test"))
+            .unwrap();
+        let purge_archive = source.export_portable_archive().unwrap();
+        let report = target
+            .import_portable_archive(&purge_archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.rows_deleted >= 1);
+        assert!(target.get_node(&node.id).unwrap().is_none());
+
+        let writer = target.writer.lock().unwrap();
+        let tombstone_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_tombstones WHERE memory_id = ?1 AND reason = ?2",
+                params![node.id, "sync purge test"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstone_count, 1);
+    }
+
+    #[test]
+    fn test_portable_merge_import_purge_wins_over_newer_local_edit() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Memory that will be purged on source".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sync".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+
+        let newer = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        {
+            let writer = target.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params!["Newer local edit before purge arrives", newer, &node.id],
+                )
+                .unwrap();
+        }
+
+        source
+            .purge_node(&node.id, Some("hard purge wins sync conflict"))
+            .unwrap();
+        let purge_archive = source.export_portable_archive().unwrap();
+        let report = target
+            .import_portable_archive(&purge_archive, PortableImportMode::Merge)
             .unwrap();
 
         assert!(report.rows_deleted >= 1);

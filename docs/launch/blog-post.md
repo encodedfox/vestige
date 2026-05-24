@@ -318,7 +318,7 @@ SQLite is the most deployed database in the world for a reason. WAL mode gives u
 
 ### fastembed (Nomic Embed v1.5)
 
-All embeddings run locally. The Nomic Embed v1.5 model produces 768-dimensional vectors, runs via ONNX Runtime, and is competitive with OpenAI's ada-002. The model is cached at `~/.cache/huggingface/` after first download (~130MB). No API keys. No network calls during operation. Your memories never leave your machine.
+All embeddings run locally. The Nomic Embed v1.5 model produces 768-dimensional vectors, runs via ONNX Runtime, and is competitive with OpenAI's ada-002. The model is cached in the platform user cache directory after first download (~130MB), with `./.fastembed_cache` as a fallback. No API keys. No network calls during operation. Your memories never leave your machine.
 
 ### Performance
 

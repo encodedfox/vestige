@@ -16,7 +16,7 @@ The embedding model is cached in platform-specific directories:
 
 | Platform | Cache Location |
 |----------|----------------|
-| macOS | `~/Library/Caches/com.vestige.core/fastembed` |
+| macOS | `~/Library/Caches/vestige/fastembed` |
 | Linux | `~/.cache/vestige/fastembed` |
 | Windows | `%LOCALAPPDATA%\vestige\cache\fastembed` |
 
@@ -36,10 +36,12 @@ Qwen3 currently uses Hugging Face Hub's Candle loader directly, so use the stand
 | `VESTIGE_DATA_DIR` | OS per-user data directory | Storage directory fallback; overridden by `--data-dir`; database lives at `<dir>/vestige.db` |
 | `VESTIGE_EMBEDDING_MODEL` | `nomic-v1.5` | Embedding backend selector. Use `qwen3-0.6b` with a build that enables `qwen3-embeddings` |
 | `RUST_LOG` | `info` (via tracing-subscriber) | Log verbosity + per-module filtering |
-| `FASTEMBED_CACHE_PATH` | `./.fastembed_cache` | Embedding model cache location |
+| `FASTEMBED_CACHE_PATH` | Platform cache directory; `./.fastembed_cache` fallback | Embedding model cache location |
 | `VESTIGE_DASHBOARD_PORT` | `3927` | Dashboard HTTP + WebSocket port |
-| `VESTIGE_HTTP_PORT` | `3928` | Optional MCP-over-HTTP port |
+| `VESTIGE_HTTP_ENABLED` | `false` | Set `true` or `1` to enable optional MCP-over-HTTP |
+| `VESTIGE_HTTP_PORT` | `3928` | Optional MCP-over-HTTP port; `--http-port` also enables HTTP |
 | `VESTIGE_HTTP_BIND` | `127.0.0.1` | HTTP bind address |
+| `VESTIGE_HTTP_ALLOWED_ORIGINS` | localhost origins for the HTTP port | Comma-separated browser origins allowed to call MCP-over-HTTP |
 | `VESTIGE_AUTH_TOKEN` | auto-generated | Dashboard + MCP HTTP bearer auth |
 | `VESTIGE_DASHBOARD_ENABLED` | `false` | Set `true` or `1` to enable the web dashboard |
 | `VESTIGE_CONSOLIDATION_INTERVAL_HOURS` | `6` | FSRS-6 decay cycle cadence |
@@ -175,18 +177,17 @@ See [Storage Modes](STORAGE.md) for more options.
 vestige update
 ```
 
-This updates `vestige`, `vestige-mcp`, `vestige-restore`, and the Cognitive
-Sandwich companion files. The companion refresh keeps hooks disabled by default
-and cleans up old mandatory v2.1.0 hook wiring.
+This updates `vestige`, `vestige-mcp`, and `vestige-restore`. It does not mutate
+Claude Code Cognitive Sandwich companion files unless you explicitly request it.
 
-**Binaries only:**
+**Also refresh optional Claude Code companion files:**
 ```bash
-vestige update --no-sandwich
+vestige update --sandwich-companion
 ```
 
 **Pin to specific version:**
 ```bash
-vestige update --version v2.1.1
+vestige update --version v2.1.21
 ```
 
 **Manage the optional Cognitive Sandwich layer without updating binaries:**

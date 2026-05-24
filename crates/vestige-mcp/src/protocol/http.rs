@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{delete, post};
 use axum::{Json, Router};
@@ -48,6 +48,7 @@ const MAX_BODY_SIZE: usize = 256 * 1024;
 struct Session {
     server: McpServer,
     last_active: Instant,
+    protocol_version: String,
 }
 
 /// Shared state cloned into every axum handler.
@@ -58,6 +59,7 @@ pub struct HttpTransportState {
     cognitive: Arc<Mutex<CognitiveEngine>>,
     event_tx: broadcast::Sender<VestigeEvent>,
     auth_token: String,
+    allowed_origins: Arc<Vec<String>>,
 }
 
 /// Start the HTTP MCP transport on `127.0.0.1:<port>`.
@@ -76,6 +78,7 @@ pub async fn start_http_transport(
         cognitive,
         event_tx,
         auth_token,
+        allowed_origins: Arc::new(allowed_origins(port)),
     };
 
     // Spawn session reaper
@@ -105,6 +108,12 @@ pub async fn start_http_transport(
         });
     }
 
+    let cors_origins = state
+        .allowed_origins
+        .iter()
+        .filter_map(|origin| origin.parse().ok())
+        .collect::<Vec<_>>();
+
     let app = Router::new()
         .route("/mcp", post(post_mcp))
         .route("/mcp", delete(delete_mcp))
@@ -114,15 +123,7 @@ pub async fn start_http_transport(
                 .layer(ConcurrencyLimitLayer::new(CONCURRENCY_LIMIT))
                 .layer(
                     CorsLayer::new()
-                        .allow_origin(
-                            [
-                                format!("http://127.0.0.1:{}", port),
-                                format!("http://localhost:{}", port),
-                            ]
-                            .into_iter()
-                            .filter_map(|s| s.parse().ok())
-                            .collect::<Vec<_>>(),
-                        )
+                        .allow_origin(cors_origins)
                         .allow_methods([
                             axum::http::Method::POST,
                             axum::http::Method::DELETE,
@@ -131,6 +132,12 @@ pub async fn start_http_transport(
                         .allow_headers([
                             axum::http::header::CONTENT_TYPE,
                             axum::http::header::AUTHORIZATION,
+                            axum::http::HeaderName::from_static("mcp-protocol-version"),
+                            axum::http::HeaderName::from_static("mcp-session-id"),
+                        ])
+                        .expose_headers([
+                            axum::http::HeaderName::from_static("mcp-protocol-version"),
+                            axum::http::HeaderName::from_static("mcp-session-id"),
                         ]),
                 ),
         )
@@ -187,6 +194,105 @@ fn validate_auth(headers: &HeaderMap, expected: &str) -> Result<(), (StatusCode,
     Ok(())
 }
 
+fn allowed_origins(port: u16) -> Vec<String> {
+    if let Ok(configured) = std::env::var("VESTIGE_HTTP_ALLOWED_ORIGINS") {
+        let origins: Vec<String> = configured
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if !origins.is_empty() {
+            return origins;
+        }
+    }
+
+    vec![
+        format!("http://127.0.0.1:{}", port),
+        format!("http://localhost:{}", port),
+    ]
+}
+
+fn validate_origin(
+    headers: &HeaderMap,
+    allowed_origins: &[String],
+) -> Result<(), (StatusCode, &'static str)> {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+
+    if allowed_origins.iter().any(|allowed| allowed == origin) {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "Origin not allowed"))
+    }
+}
+
+fn validate_accept(headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
+    let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return Err((
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept must include application/json and text/event-stream",
+        ));
+    };
+
+    let mut accepts_json = false;
+    let mut accepts_sse = false;
+    for mime in accept
+        .split(',')
+        .map(|part| part.trim().split(';').next().unwrap_or("").trim())
+    {
+        accepts_json |= mime == "application/json";
+        accepts_sse |= mime == "text/event-stream";
+    }
+
+    if accepts_json && accepts_sse {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept must include application/json and text/event-stream",
+        ))
+    }
+}
+
+fn protocol_version_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+}
+
+fn validate_protocol_version(
+    headers: &HeaderMap,
+    expected: &str,
+) -> Result<(), (StatusCode, &'static str)> {
+    let Some(version) = protocol_version_from_headers(headers) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "MCP-Protocol-Version header required",
+        ));
+    };
+
+    if version == expected {
+        Ok(())
+    } else {
+        Err((StatusCode::BAD_REQUEST, "MCP-Protocol-Version mismatch"))
+    }
+}
+
+fn response_protocol_version(response: &crate::protocol::types::JsonRpcResponse) -> Option<String> {
+    if response.error.is_some() {
+        return None;
+    }
+
+    response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("protocolVersion"))
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
 /// Extract and validate the `Mcp-Session-Id` header value.
 ///
 /// Only accepts valid UUID v4 format (8-4-4-4-12 hex) to prevent header
@@ -209,6 +315,13 @@ async fn post_mcp(
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
+    if let Err((status, msg)) = validate_origin(&headers, &state.allowed_origins) {
+        return (status, HeaderMap::new(), msg.to_string()).into_response();
+    }
+    if let Err((status, msg)) = validate_accept(&headers) {
+        return (status, HeaderMap::new(), msg.to_string()).into_response();
+    }
+
     // Auth check
     if let Err((status, msg)) = validate_auth(&headers, &state.auth_token) {
         return (status, HeaderMap::new(), msg.to_string()).into_response();
@@ -235,6 +348,7 @@ async fn post_mcp(
         let session = Arc::new(Mutex::new(Session {
             server,
             last_active: Instant::now(),
+            protocol_version: crate::protocol::types::MCP_VERSION.to_string(),
         }));
 
         // Handle the initialize request
@@ -243,12 +357,18 @@ async fn post_mcp(
             sess.server.handle_request(request).await
         };
 
-        // Insert session while still holding write lock — atomic check-and-insert
-        sessions.insert(session_id.clone(), session);
-        drop(sessions);
-
         match response {
             Some(resp) => {
+                let Some(protocol_version) = response_protocol_version(&resp) else {
+                    drop(sessions);
+                    return (StatusCode::OK, HeaderMap::new(), Json(resp)).into_response();
+                };
+                {
+                    let mut sess = session.lock().await;
+                    sess.protocol_version = protocol_version.clone();
+                }
+                sessions.insert(session_id.clone(), session);
+                drop(sessions);
                 let mut resp_headers = HeaderMap::new();
                 resp_headers.insert(
                     "mcp-session-id",
@@ -256,18 +376,14 @@ async fn post_mcp(
                         .parse()
                         .unwrap_or_else(|_| axum::http::HeaderValue::from_static("invalid")),
                 );
+                if let Ok(value) = HeaderValue::from_str(&protocol_version) {
+                    resp_headers.insert("mcp-protocol-version", value);
+                }
                 (StatusCode::OK, resp_headers, Json(resp)).into_response()
             }
             None => {
-                // Notifications return 202
-                let mut resp_headers = HeaderMap::new();
-                resp_headers.insert(
-                    "mcp-session-id",
-                    session_id
-                        .parse()
-                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("invalid")),
-                );
-                (StatusCode::ACCEPTED, resp_headers).into_response()
+                drop(sessions);
+                (StatusCode::ACCEPTED, HeaderMap::new()).into_response()
             }
         }
     } else {
@@ -295,8 +411,14 @@ async fn post_mcp(
             }
         };
 
+        let session_protocol_version;
         let response = {
             let mut sess = session.lock().await;
+            if let Err((status, msg)) = validate_protocol_version(&headers, &sess.protocol_version)
+            {
+                return (status, msg).into_response();
+            }
+            session_protocol_version = sess.protocol_version.clone();
             sess.last_active = Instant::now();
             sess.server.handle_request(request).await
         };
@@ -308,6 +430,9 @@ async fn post_mcp(
                 .parse()
                 .unwrap_or_else(|_| axum::http::HeaderValue::from_static("invalid")),
         );
+        if let Ok(value) = HeaderValue::from_str(&session_protocol_version) {
+            resp_headers.insert("mcp-protocol-version", value);
+        }
 
         match response {
             Some(resp) => (StatusCode::OK, resp_headers, Json(resp)).into_response(),
@@ -321,6 +446,9 @@ async fn delete_mcp(
     State(state): State<HttpTransportState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err((status, msg)) = validate_origin(&headers, &state.allowed_origins) {
+        return (status, msg).into_response();
+    }
     if let Err((status, msg)) = validate_auth(&headers, &state.auth_token) {
         return (status, msg).into_response();
     }
@@ -336,11 +464,103 @@ async fn delete_mcp(
         }
     };
 
+    let session = {
+        let sessions = state.sessions.read().await;
+        sessions.get(&session_id).cloned()
+    };
+    let Some(session) = session else {
+        return (StatusCode::NOT_FOUND, "Session not found").into_response();
+    };
+
+    let protocol_version = {
+        let sess = session.lock().await;
+        sess.protocol_version.clone()
+    };
+    if let Err((status, msg)) = validate_protocol_version(&headers, &protocol_version) {
+        return (status, msg).into_response();
+    }
+
     let mut sessions = state.sessions.write().await;
     if sessions.remove(&session_id).is_some() {
         info!("Session {} deleted via DELETE /mcp", &session_id[..8]);
         (StatusCode::OK, "Session deleted").into_response()
     } else {
         (StatusCode::NOT_FOUND, "Session not found").into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_validation_allows_absent_and_configured_origin() {
+        let allowed = vec!["http://127.0.0.1:3928".to_string()];
+        let mut headers = HeaderMap::new();
+        assert!(validate_origin(&headers, &allowed).is_ok());
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:3928"),
+        );
+        assert!(validate_origin(&headers, &allowed).is_ok());
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        assert_eq!(
+            validate_origin(&headers, &allowed).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn accept_validation_rejects_incompatible_clients() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            validate_accept(&headers).unwrap_err().0,
+            StatusCode::NOT_ACCEPTABLE
+        );
+
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        assert!(validate_accept(&headers).is_ok());
+
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        assert_eq!(
+            validate_accept(&headers).unwrap_err().0,
+            StatusCode::NOT_ACCEPTABLE
+        );
+    }
+
+    #[test]
+    fn protocol_header_must_match_session_when_present() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            validate_protocol_version(&headers, "2025-11-25")
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        headers.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2025-11-25"),
+        );
+        assert!(validate_protocol_version(&headers, "2025-11-25").is_ok());
+
+        headers.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2024-11-05"),
+        );
+        assert_eq!(
+            validate_protocol_version(&headers, "2025-11-25")
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 }

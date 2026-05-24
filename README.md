@@ -2,23 +2,34 @@
 
 # Vestige
 
-### The cognitive engine that gives AI agents a brain.
+### Local cognitive memory for MCP-compatible AI agents.
 
 [![GitHub stars](https://img.shields.io/github/stars/samvallad33/vestige?style=social)](https://github.com/samvallad33/vestige)
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige)](https://github.com/samvallad33/vestige/releases/latest)
-[![Tests](https://img.shields.io/badge/tests-1229%20passing-brightgreen)](https://github.com/samvallad33/vestige/actions)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](https://github.com/samvallad33/vestige/actions)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![MCP Compatible](https://img.shields.io/badge/MCP-compatible-green)](https://modelcontextprotocol.io)
 
-**Your Agent forgets everything between sessions. Vestige fixes that.**
+**Your agent forgets project decisions between sessions. Vestige gives it local, inspectable memory.**
 
-Built on 130 years of memory research — FSRS-6 spaced repetition, prediction error gating, synaptic tagging, spreading activation, memory dreaming — all running in a single Rust binary with a 3D neural visualization dashboard. 100% local. Zero cloud.
+Built on proven memory and retrieval ideas — FSRS-6 spaced repetition, prediction error gating, synaptic tagging, spreading activation, and memory consolidation — all running in a single Rust binary with a local dashboard. 100% local. Zero cloud.
 
-[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-24-mcp-tools) | [Docs](docs/)
+[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-25-mcp-tools) | [Docs](docs/)
 
 </div>
 
 ---
+
+## What's New in v2.1.21 "Agent-Neutral Hardening"
+
+v2.1.21 tightens Vestige for normal use across MCP-compatible agents, without
+making Claude Code companion tooling part of the default path.
+
+- **Agent-neutral default.** Stdio MCP remains the default transport; optional HTTP MCP is explicit with `--http`, `--http-port`, or `VESTIGE_HTTP_ENABLED=1`.
+- **Safer destructive actions.** `memory(action="delete")` now requires `confirm=true`, matching `purge`, and the legacy `delete_knowledge` shim forwards that confirmation instead of bypassing it.
+- **Portable sync repair.** Merge imports preserve purge tombstones, avoid `INSERT OR REPLACE` cascades, rebuild the vector index from a clean state, and write portable archive temp files with private Unix permissions.
+- **Release/package cleanup.** Release builds check the embedded dashboard before packaging, publish checksums, and the npm installer rejects targets that do not have release assets.
+- **Any-agent memory protocol.** The setup docs now include a short agent-agnostic memory protocol for Claude Code, Codex, Cursor, VS Code, Xcode, JetBrains, Windsurf, and other MCP clients.
 
 ## What's New in v2.1.2 "Honest Memory"
 
@@ -27,7 +38,7 @@ v2.1.2 makes Vestige easier to trust in everyday work: literal lookups stay lite
 - **Concrete search mode.** Quoted strings, env vars, UUIDs, paths, and code identifiers now take a keyword/literal path that skips HyDE, semantic fusion, FSRS reweighting, competition, and spreading activation. Exact things like `OPENAI_API_KEY`, `mlx_lm.server`, and migration IDs land first.
 - **Irreversible purge.** `memory(action="purge", confirm=true)` permanently removes memory content and embeddings, scrubs insight JSON references, detaches temporal-summary children, prunes graph edges, and keeps only a non-content deletion tombstone for sync/audit.
 - **First-class contradiction inspection.** New `contradictions` MCP tool surfaces trust-weighted disagreements directly instead of hiding them inside `deep_reference`.
-- **Simple update flow.** `vestige update` and `vestige sandwich install` refresh binaries and companion files without making users paste curl commands.
+- **Simple update flow.** `vestige update` refreshes binaries. Claude Code Cognitive Sandwich companion files are opt-in with `vestige update --sandwich-companion` or `vestige sandwich install`.
 - **Pro waitlist preview.** `/dashboard/waitlist` adds a local-first Solo Pro and Team Pro early-access surface. `VITE_WAITLIST_ENDPOINT` and `VITE_SUPPORT_BOT_ENDPOINT` are opt-in dashboard env vars, so no signup data is captured unless endpoints are configured.
 
 ## What's New in v2.1.1 "Portable Sync"
@@ -116,10 +127,11 @@ Based on [Anderson et al. 2025](https://www.nature.com/articles/s41583-025-00929
 # 1. Install
 npm install -g vestige-mcp-server@latest
 
-# 2. Connect to Claude Code
+# 2. Connect to any MCP-compatible agent
+# Claude Code
 claude mcp add vestige vestige-mcp -s user
 
-# Or connect to Codex
+# Codex
 codex mcp add vestige -- vestige-mcp
 
 # 3. Test it
@@ -137,9 +149,9 @@ codex mcp add vestige -- vestige-mcp
 vestige update
 ```
 
-`vestige update` updates the binaries and refreshes Cognitive Sandwich companion
-files while keeping every hook layer disabled by default. Use
-`vestige update --no-sandwich` if you only want the binaries.
+`vestige update` updates only the Vestige binaries by default. Use
+`vestige update --sandwich-companion` if you also want to refresh optional Claude
+Code Cognitive Sandwich companion files.
 
 **macOS/Linux manual binary install:**
 ```bash
@@ -179,7 +191,7 @@ Open `%APPDATA%\Claude\claude_desktop_config.json` and point Claude Desktop at t
 }
 ```
 
-If Claude Desktop cannot find `vestige-mcp`, run `where vestige-mcp` in PowerShell and use the exact `.cmd` path it prints as `command`. Example: `"C:\\Users\\you\\AppData\\Roaming\\npm\\vestige-mcp.cmd"`. Reopen Claude Desktop after saving. Future binary and companion-file updates can run with `vestige update`.
+If Claude Desktop cannot find `vestige-mcp`, run `where vestige-mcp` in PowerShell and use the exact `.cmd` path it prints as `command`. Example: `"C:\\Users\\you\\AppData\\Roaming\\npm\\vestige-mcp.cmd"`. Reopen Claude Desktop after saving. Future binary updates use `vestige update`; optional Claude Code companion files require `vestige update --sandwich-companion`.
 
 **Windows source build:** Prebuilt binaries ship but `usearch 2.24.0` hit an MSVC compile break ([usearch#746](https://github.com/unum-cloud/usearch/issues/746)); we've pinned `=2.23.0` until upstream fixes it. Source builds work with:
 
@@ -206,7 +218,7 @@ cargo build --release -p vestige-mcp --features metal
 
 ## Works Everywhere
 
-Vestige speaks MCP — the universal protocol for AI tools. One brain, every IDE.
+Vestige speaks MCP, so any client that can register a stdio MCP server can use it.
 
 | IDE | Setup |
 |-----|-------|
@@ -379,16 +391,9 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 
 ## Make Your AI Use Vestige Automatically
 
-Add this to your `CLAUDE.md`:
-
-```markdown
-## Memory
-
-At the start of every session:
-1. Search Vestige for user preferences and project context
-2. Save bug fixes, decisions, and patterns without being asked
-3. Create reminders when the user mentions deadlines
-```
+Registering the MCP server exposes tools; the agent still needs an instruction
+that tells it when to call memory. Use the agent-neutral protocol, then adapt it
+to your client-specific instruction file.
 
 | You Say | AI Does |
 |---------|---------|
@@ -397,7 +402,7 @@ At the start of every session:
 | "Remind me..." | Creates a future trigger |
 | "This is important" | Saves + promotes |
 
-[Full CLAUDE.md templates ->](docs/CLAUDE-SETUP.md)
+[Agent memory protocol ->](docs/AGENT-MEMORY-PROTOCOL.md) · [Claude Code template ->](docs/CLAUDE-SETUP.md)
 
 ---
 
@@ -406,7 +411,7 @@ At the start of every session:
 | Metric | Value |
 |--------|-------|
 | **Language** | Rust 2024 edition (MSRV 1.91) |
-| **Codebase** | 80,000+ lines, 1,292 tests (366 core + 425 mcp + 497 e2e + 4 doctests) |
+| **Codebase** | 80,000+ lines with Rust core/MCP/e2e, dashboard, and hook coverage |
 | **Binary size** | ~20MB |
 | **Embeddings** | Nomic Embed Text v1.5 by default (768d -> 256d Matryoshka, 8192 context); Qwen3 0.6B optional |
 | **Vector search** | USearch HNSW (20x faster than FAISS) |
@@ -481,7 +486,7 @@ First run downloads ~130MB from Hugging Face. If behind a proxy:
 export HTTPS_PROXY=your-proxy:port
 ```
 
-Cache: macOS `~/Library/Caches/com.vestige.core/fastembed` | Linux `~/.cache/vestige/fastembed`
+Cache: platform user cache directory first, then `./.fastembed_cache` as a fallback. Override with `FASTEMBED_CACHE_PATH`.
 </details>
 
 <details>

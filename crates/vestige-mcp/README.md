@@ -1,115 +1,75 @@
 # Vestige MCP Server
 
-A bleeding-edge Rust MCP (Model Context Protocol) server for Vestige - providing Claude and other AI assistants with long-term memory capabilities.
+Local cognitive memory for MCP-compatible AI agents.
 
-## Features
+This crate provides the `vestige-mcp` stdio MCP server plus the `vestige` CLI.
+The cognitive engine lives in `vestige-core`; this crate owns protocol handling,
+tool dispatch, optional dashboard serving, backups, restore, update, and
+portable import/export commands.
 
-- **FSRS-6 Algorithm**: State-of-the-art spaced repetition (21 parameters, personalized decay)
-- **Dual-Strength Memory Model**: Based on Bjork & Bjork 1992 cognitive science research
-- **Local Semantic Embeddings**: nomic-embed-text-v1.5 (768d) via fastembed v5 (no external API)
-- **HNSW Vector Search**: USearch-based, 20x faster than FAISS
-- **Hybrid Search**: BM25 + semantic with RRF fusion
-- **Codebase Memory**: Remember patterns, decisions, and context
+## Install
 
-## Installation
+For normal users, prefer the release package:
 
 ```bash
-cd /path/to/vestige/crates/vestige-mcp
-cargo build --release
+npm install -g vestige-mcp-server
 ```
 
-Binary will be at `target/release/vestige-mcp`
+For local development:
 
-## Claude Desktop Configuration
+```bash
+cargo build --release -p vestige-mcp
+```
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+## Register With An MCP Client
+
+Use the command `vestige-mcp` in any stdio MCP client:
 
 ```json
 {
   "mcpServers": {
     "vestige": {
-      "command": "/path/to/vestige-mcp"
+      "command": "vestige-mcp"
     }
   }
 }
 ```
 
-## Available Tools
+Examples:
 
-### Core Memory
-
-| Tool | Description |
-|------|-------------|
-| `ingest` | Add new knowledge to memory |
-| `recall` | Search and retrieve memories |
-| `semantic_search` | Find conceptually similar content |
-| `hybrid_search` | Combined keyword + semantic search |
-| `get_knowledge` | Retrieve a specific memory by ID |
-| `delete_knowledge` | Delete a memory |
-| `mark_reviewed` | Review with FSRS rating (1-4) |
-
-### Statistics & Maintenance
-
-| Tool | Description |
-|------|-------------|
-| `get_stats` | Memory system statistics |
-| `health_check` | System health status |
-| `run_consolidation` | Apply decay, generate embeddings |
-
-### Codebase Tools
-
-| Tool | Description |
-|------|-------------|
-| `remember_pattern` | Remember code patterns |
-| `remember_decision` | Remember architectural decisions |
-| `get_codebase_context` | Get patterns and decisions |
-
-## Available Resources
-
-### Memory Resources
-
-| URI | Description |
-|-----|-------------|
-| `memory://stats` | Current statistics |
-| `memory://recent?n=10` | Recent memories |
-| `memory://decaying` | Low retention memories |
-| `memory://due` | Memories due for review |
-
-### Codebase Resources
-
-| URI | Description |
-|-----|-------------|
-| `codebase://structure` | Known codebases |
-| `codebase://patterns` | Remembered patterns |
-| `codebase://decisions` | Architectural decisions |
-
-## Example Usage (with Claude)
-
-```
-User: Remember that we decided to use FSRS-6 instead of SM-2 because it's 20-30% more efficient.
-
-Claude: [calls remember_decision]
-I've recorded that architectural decision.
-
-User: What decisions have we made about algorithms?
-
-Claude: [calls get_codebase_context]
-I found 1 decision:
-- We decided to use FSRS-6 instead of SM-2 because it's 20-30% more efficient.
+```bash
+claude mcp add vestige vestige-mcp -s user
+codex mcp add vestige -- vestige-mcp
 ```
 
-## Data Storage
+## Transports
 
-- Database: `~/Library/Application Support/com.vestige.mcp/vestige-mcp.db` (macOS)
-- Uses SQLite with FTS5 for full-text search
-- Vector embeddings stored in separate table
+- Default: JSON-RPC 2.0 over stdio.
+- Optional: MCP-over-HTTP on `/mcp`, enabled only with `--http`,
+  `--http-port`, or `VESTIGE_HTTP_ENABLED=1`.
+- Dashboard: `vestige dashboard` or `VESTIGE_DASHBOARD_ENABLED=1`.
 
-## Protocol
+HTTP and dashboard bearer tokens are generated locally; see
+[`docs/CONFIGURATION.md`](../../docs/CONFIGURATION.md).
 
-- JSON-RPC 2.0 over stdio
-- MCP Protocol Version: 2024-11-05
-- Logging to stderr (stdout reserved for JSON-RPC)
+## Current Tool Surface
+
+The server exposes the current unified MCP tools from
+[`src/server.rs`](src/server.rs), including:
+
+- `session_context`
+- `search`, `smart_ingest`, `memory`, `codebase`, `intention`
+- `deep_reference`, `cross_reference`, `contradictions`
+- `dream`, `explore_connections`, `predict`
+- `memory_health`, `memory_graph`, `system_status`
+- `importance_score`, `find_duplicates`
+- `consolidate`, `memory_timeline`, `memory_changelog`
+- `backup`, `export`, `restore`, `gc`, `suppress`
+
+See the root [`README.md`](../../README.md) and
+[`docs/AGENT-MEMORY-PROTOCOL.md`](../../docs/AGENT-MEMORY-PROTOCOL.md) for
+agent instructions.
 
 ## License
 
-MIT
+AGPL-3.0-only

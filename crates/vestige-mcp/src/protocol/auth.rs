@@ -19,7 +19,7 @@ use tracing::{info, warn};
 const MIN_TOKEN_LENGTH: usize = 32;
 
 /// Return the auth token file path inside the Vestige data directory.
-fn token_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn token_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dirs = ProjectDirs::from("com", "vestige", "core")
         .ok_or("could not determine project directories")?;
     Ok(dirs.data_dir().join("auth_token"))

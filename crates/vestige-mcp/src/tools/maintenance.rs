@@ -6,11 +6,30 @@
 use chrono::{NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::cognitive::CognitiveEngine;
 use vestige_core::{FSRSScheduler, Storage};
+
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)
+    }
+}
 
 // ============================================================================
 // SCHEMAS
@@ -484,7 +503,7 @@ pub async fn execute_export(storage: &Arc<Storage>, args: Option<Value>) -> Resu
     };
 
     // Write export
-    let file = std::fs::File::create(&export_path)
+    let file = create_private_file(&export_path)
         .map_err(|e| format!("Failed to create export file: {}", e))?;
     let mut writer = std::io::BufWriter::new(file);
 

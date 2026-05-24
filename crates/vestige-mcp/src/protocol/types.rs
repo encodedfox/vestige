@@ -114,6 +114,10 @@ impl JsonRpcError {
         Self::new(ErrorCode::MethodNotFound, message)
     }
 
+    pub fn invalid_request(message: &str) -> Self {
+        Self::new(ErrorCode::InvalidRequest, message)
+    }
+
     pub fn invalid_params(message: &str) -> Self {
         Self::new(ErrorCode::InvalidParams, message)
     }

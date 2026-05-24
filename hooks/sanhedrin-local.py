@@ -15,12 +15,17 @@
 # the Cognitive Sandwich on infra errors). The wrapping sanhedrin.sh maps
 # "yes" to exit 0, so this preserves existing fail-open semantics.
 
+from __future__ import annotations
+
 import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any
 
 
 def env_int(name: str, default: int) -> int:
@@ -70,6 +75,218 @@ def post_json(url: str, body: dict, timeout: int):
 
 
 TRUST_FLOOR = 0.55  # filter out low-trust memories that drive false-positive vetoes
+
+CLAIM_MODE_ENV = "VESTIGE_SANHEDRIN_CLAIM_MODE"
+OUTPUT_ENV = "VESTIGE_SANHEDRIN_OUTPUT"
+STAGE_FILE_ENV = "VESTIGE_SANHEDRIN_STAGE_FILE"
+MAX_CLAIMS = env_int("VESTIGE_SANHEDRIN_MAX_CLAIMS", 8)
+MAX_CLAIM_CHARS = env_int("VESTIGE_SANHEDRIN_MAX_CLAIM_CHARS", 500)
+MAX_EVIDENCE_CHARS = env_int("VESTIGE_SANHEDRIN_MAX_EVIDENCE_CHARS", 420)
+
+CLAIM_CLASSES = {
+    "TECHNICAL",
+    "BIOGRAPHICAL",
+    "FINANCIAL",
+    "ACHIEVEMENT",
+    "TIMELINE",
+    "QUANTITATIVE",
+    "ATTRIBUTION",
+    "CAUSAL",
+    "COMPARATIVE",
+    "EXISTENTIAL",
+    "VAGUE-QUANTIFIER",
+    "UNVERIFIED-POSITIVE",
+}
+CRITICAL_ABSENCE_CLASSES = {
+    "BIOGRAPHICAL",
+    "FINANCIAL",
+    "ACHIEVEMENT",
+    "TIMELINE",
+    "QUANTITATIVE",
+    "ATTRIBUTION",
+    "VAGUE-QUANTIFIER",
+}
+STRUCTURED_VERDICTS = {"SUPPORTED", "REFUTED", "REFUTED_BY_ABSENCE", "NEI"}
+SEVERITY_ORDER = {
+    "BIOGRAPHICAL": 0,
+    "FINANCIAL": 1,
+    "ACHIEVEMENT": 2,
+    "ATTRIBUTION": 3,
+    "TIMELINE": 4,
+    "QUANTITATIVE": 5,
+    "VAGUE-QUANTIFIER": 6,
+    "UNVERIFIED-POSITIVE": 7,
+    "TECHNICAL": 8,
+    "EXISTENTIAL": 9,
+    "CAUSAL": 10,
+    "COMPARATIVE": 11,
+}
+USER_TERMS_RE = re.compile(
+    r"\b(sam|sam's|the user|user's|you|your|yours|yourself)\b", re.IGNORECASE
+)
+HYPOTHETICAL_PREFIX_RE = re.compile(
+    r"^\s*(if|suppose|imagine|hypothetically|assume|what if)\b",
+    re.IGNORECASE,
+)
+SUBJECT_MODAL_PREFIX_RE = re.compile(
+    r"^\s*(sam|sam's|the user|user's|you|your)\b\s+(would|could)\b",
+    re.IGNORECASE,
+)
+TRAILING_MODAL_COMMENT_RE = re.compile(
+    r"\s*,?\s+(which|that)\s+(would|could)\b.*$",
+    re.IGNORECASE,
+)
+CURRENT_TURN_PREFIXES = [
+    re.compile(r"^\s*(per your request|as requested)\s*,?\s*", re.IGNORECASE),
+    re.compile(
+        r"^\s*(you|sam|the user)\s+(asked for|requested)\s+maximum subagents\b[^,.;]*(?:,?\s*(and|so)\s*)?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(you|sam|the user)\s+(asked|told|requested|wanted)\s+"
+        r"(?:(me|us|codex|claude)\s+)?(to|for)\s+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(your|sam's|the user's)\s+request\s+(was|is)\s+(to|for)\s+",
+        re.IGNORECASE,
+    ),
+]
+FIRST_PERSON_DISCOURSE_RE = re.compile(
+    r"^\s*(i|we)\s+(reviewed|audited|checked|inspected|looked at|verified|"
+    r"confirmed|found|updated|changed|implemented|fixed|patched|added|removed|"
+    r"wired|ran|left)\b",
+    re.IGNORECASE,
+)
+DISCOURSE_ACTION_PREFIX_RE = re.compile(
+    r"^\s*(audit|review|check|inspect|look at|verify|confirm|implement|fix|"
+    r"patch|add|remove|wire|run|use|go all in)\b",
+    re.IGNORECASE,
+)
+EMBEDDED_USER_CLAIM_RE = re.compile(r"\b(sam|sam's|the user|user's)\b", re.IGNORECASE)
+TECHNICAL_RE = re.compile(
+    r"(/\w|[\w.-]+\.(py|rs|ts|tsx|js|jsx|json|md|toml|yaml|yml|sh)\b|"
+    r"\b(api|endpoint|env|flag|model|server|hook|script|function|class|repo|"
+    r"crate|mcp|http|json|sqlite|rust|python|typescript|command|config)\b|"
+    r"\b[A-Z][A-Z0-9_]{2,}\b)",
+    re.IGNORECASE,
+)
+BIOGRAPHICAL_RE = re.compile(
+    r"\b(born|lives?|located|based in|works? at|employed|employer|school|"
+    r"university|college|graduated|degree|founder|ceo|cto|student|job|role)\b",
+    re.IGNORECASE,
+)
+FINANCIAL_RE = re.compile(
+    r"(\$[\d,.]+|\b(revenue|funding|raised|earned|paid|payout|prize money|"
+    r"salary|net worth|valuation|stock|shares?|portfolio|profit|loss)\b)",
+    re.IGNORECASE,
+)
+ACHIEVEMENT_RE = re.compile(
+    r"\b(won|winner|ranked|placed|scored|score|completed|finished|launched|"
+    r"released|shipped|milestone|award|prize|accepted|published|graduated)\b",
+    re.IGNORECASE,
+)
+TIMELINE_RE = re.compile(
+    r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|"
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?|today|yesterday|tomorrow|last week|next week|"
+    r"\d+\s+(days?|weeks?|months?|years?)\b)",
+    re.IGNORECASE,
+)
+QUANTITATIVE_RE = re.compile(
+    r"(\b\d+(?:\.\d+)?\s*(%|percent|x|times|stars?|users?|customers?|"
+    r"submissions?|points?|gb|mb|ms|s|seconds?|minutes?|hours?)?\b|"
+    r"\b(one|two|three|four|five|six|seven|eight|nine|ten|dozens?|hundreds?|"
+    r"thousands?|many|several|few|most)\b)",
+    re.IGNORECASE,
+)
+TOKEN_RE = re.compile(r"\$?\b[a-z0-9][a-z0-9.-]*\b", re.IGNORECASE)
+STOP_CLAIM_TOKENS = {
+    "about",
+    "after",
+    "also",
+    "because",
+    "been",
+    "before",
+    "claim",
+    "from",
+    "have",
+    "into",
+    "more",
+    "sam",
+    "that",
+    "their",
+    "there",
+    "this",
+    "user",
+    "with",
+    "your",
+}
+ATTRIBUTION_RE = re.compile(
+    r"\b(said|told|asked|agreed|decided|approved|rejected|committed|authored|"
+    r"wrote|built|implemented|requested|wanted|prefers?)\b",
+    re.IGNORECASE,
+)
+VAGUE_QUANTIFIER_RE = re.compile(
+    r"\b(a few|some|several|many|most|multiple)\b.*\b(wins?|won|prizes?|"
+    r"money|customers?|deals?|submissions?|placements?)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class Claim:
+    text: str
+    claim_class: str
+    source_index: int
+    sam_critical: bool
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    id: str
+    preview: str
+    trust: float
+    role: str = "evidence"
+    date: str = ""
+    durable: bool = True
+    source: str = "vestige"
+
+
+@dataclass
+class ClaimVerdict:
+    claim: Claim
+    status: str
+    reason: str = ""
+    evidence_ids: list[str] = field(default_factory=list)
+    durable_evidence_count: int = 0
+    high_trust_evidence_count: int = 0
+
+
+def env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def truncate_chars(text: str, max_chars: int, suffix: str = "...") -> str:
+    """Truncate by Python characters, never UTF-8 bytes, and avoid dangling marks."""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= len(suffix):
+        return text[:max_chars]
+    cut = text[: max_chars - len(suffix)].rstrip()
+    while cut and unicodedata.combining(cut[-1]):
+        cut = cut[:-1]
+    return f"{cut}{suffix}"
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def fetch_evidence(draft: str) -> tuple[str, int]:
@@ -133,6 +350,313 @@ def fetch_evidence(draft: str) -> tuple[str, int]:
 
     header = f"VESTIGE CONFIDENCE: {int(confidence * 100)}% | HIGH-TRUST MEMORIES: {high_trust_count}\n\n"
     return header + "\n".join(parts), high_trust_count
+
+
+def split_candidate_claims(draft: str) -> list[str]:
+    """Return sentence-ish draft fragments that can be classified as claims."""
+    without_fences = re.sub(r"```.*?```", " ", draft, flags=re.DOTALL)
+    fragments: list[str] = []
+    for line in without_fences.splitlines():
+        line = re.sub(r"^\s*[-*+]\s+", "", line).strip()
+        line = re.sub(r"^\s*\d+[.)]\s+", "", line).strip()
+        if not line:
+            continue
+        parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9`\"'])", line)
+        fragments.extend(part.strip(" \t-") for part in parts if part.strip(" \t-"))
+    if not fragments:
+        compact = " ".join(without_fences.split())
+        fragments = [
+            part.strip()
+            for part in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9`\"'])", compact)
+            if part.strip()
+        ]
+    return fragments
+
+
+def normalize_asserted_fragment(text: str) -> str | None:
+    text = " ".join(text.split()).strip()
+    if not text:
+        return None
+    text = TRAILING_MODAL_COMMENT_RE.sub("", text).strip(" ,;:-")
+    if HYPOTHETICAL_PREFIX_RE.search(text) or SUBJECT_MODAL_PREFIX_RE.search(text):
+        return None
+
+    for prefix in CURRENT_TURN_PREFIXES:
+        stripped = prefix.sub("", text, count=1).strip(" ,;:-")
+        if stripped == text:
+            continue
+        embedded = EMBEDDED_USER_CLAIM_RE.search(stripped)
+        if embedded and embedded.start() > 0 and DISCOURSE_ACTION_PREFIX_RE.search(stripped):
+            stripped = stripped[embedded.start() :].strip(" ,;:-")
+        elif DISCOURSE_ACTION_PREFIX_RE.search(stripped) or FIRST_PERSON_DISCOURSE_RE.search(stripped):
+            return None
+        text = stripped
+        break
+
+    if FIRST_PERSON_DISCOURSE_RE.search(text):
+        embedded = EMBEDDED_USER_CLAIM_RE.search(text)
+        if embedded and embedded.start() > 0:
+            text = text[embedded.start() :].strip(" ,;:-")
+        else:
+            return None
+
+    text = TRAILING_MODAL_COMMENT_RE.sub("", text).strip(" ,;:-")
+    if not text or HYPOTHETICAL_PREFIX_RE.search(text) or SUBJECT_MODAL_PREFIX_RE.search(text):
+        return None
+    return text
+
+
+def classify_claim(text: str) -> str | None:
+    """Classify a factual-shaped claim with conservative, testable heuristics."""
+    if VAGUE_QUANTIFIER_RE.search(text):
+        return "VAGUE-QUANTIFIER"
+    if BIOGRAPHICAL_RE.search(text):
+        return "BIOGRAPHICAL"
+    if FINANCIAL_RE.search(text):
+        return "FINANCIAL"
+    if ACHIEVEMENT_RE.search(text):
+        return "ACHIEVEMENT"
+    if ATTRIBUTION_RE.search(text):
+        return "ATTRIBUTION"
+    if TECHNICAL_RE.search(text):
+        return "TECHNICAL"
+    if TIMELINE_RE.search(text):
+        return "TIMELINE"
+    if QUANTITATIVE_RE.search(text):
+        return "QUANTITATIVE"
+    if re.search(r"\b(exists?|there is|there are|contains?|includes?)\b", text, re.I):
+        return "EXISTENTIAL"
+    if re.search(r"\b(because|caused|causes|therefore|so that|as a result)\b", text, re.I):
+        return "CAUSAL"
+    if re.search(r"\b(better|best|faster|fastest|more than|less than|fewer than)\b", text, re.I):
+        return "COMPARATIVE"
+    return None
+
+
+def is_sam_critical_claim(text: str, claim_class: str) -> bool:
+    if claim_class not in CRITICAL_ABSENCE_CLASSES:
+        return False
+    return bool(USER_TERMS_RE.search(text))
+
+
+def extract_check_worthy_claims(
+    draft: str,
+    max_claims: int = MAX_CLAIMS,
+    max_claim_chars: int = MAX_CLAIM_CHARS,
+) -> list[Claim]:
+    claims: list[Claim] = []
+    seen: set[str] = set()
+    for idx, fragment in enumerate(split_candidate_claims(draft)):
+        text = normalize_asserted_fragment(fragment)
+        if not text:
+            continue
+        claim_class = classify_claim(text)
+        if not claim_class:
+            continue
+        text = truncate_chars(text, max_claim_chars)
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        claims.append(
+            Claim(
+                text=text,
+                claim_class=claim_class,
+                source_index=idx,
+                sam_critical=is_sam_critical_claim(text, claim_class),
+            )
+        )
+        if len(claims) >= max_claims:
+            break
+    return claims
+
+
+def normalize_evidence_item(raw: Any, source: str = "vestige") -> EvidenceItem | None:
+    if isinstance(raw, str):
+        preview = raw.strip()
+        if not preview:
+            return None
+        return EvidenceItem(
+            id="stage",
+            preview=truncate_chars(preview, MAX_EVIDENCE_CHARS),
+            trust=1.0,
+            role="staged",
+            durable=False,
+            source="stage",
+        )
+    if not isinstance(raw, dict):
+        return None
+
+    preview = (
+        raw.get("preview")
+        or raw.get("answer_preview")
+        or raw.get("content")
+        or raw.get("text")
+        or raw.get("claim")
+        or ""
+    )
+    preview = str(preview).strip()
+    if not preview:
+        return None
+    trust = safe_float(raw.get("trust", raw.get("trust_score", 1.0 if source == "stage" else 0.0)))
+    item_id = str(raw.get("memory_id") or raw.get("id") or source or "evidence")
+    role = str(raw.get("role") or ("staged" if source == "stage" else "evidence"))
+    date = str(raw.get("date") or raw.get("created_at") or "")[:32]
+    return EvidenceItem(
+        id=item_id,
+        preview=truncate_chars(preview, MAX_EVIDENCE_CHARS),
+        trust=trust,
+        role=role,
+        date=date,
+        durable=(source != "stage"),
+        source=source,
+    )
+
+
+def evidence_from_deep_reference(resp: dict[str, Any]) -> list[EvidenceItem]:
+    items: list[EvidenceItem] = []
+    rec = resp.get("recommended") or {}
+    rec_item = normalize_evidence_item(rec, "vestige")
+    if rec_item:
+        items.append(rec_item)
+    for raw in resp.get("evidence") or []:
+        item = normalize_evidence_item(raw, "vestige")
+        if item:
+            items.append(item)
+    for raw in resp.get("superseded") or []:
+        item = normalize_evidence_item(raw, "vestige")
+        if item:
+            items.append(item)
+    return dedupe_evidence(items)
+
+
+def dedupe_evidence(items: list[EvidenceItem]) -> list[EvidenceItem]:
+    deduped: list[EvidenceItem] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        key = (item.source, item.id)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def load_staged_evidence(path: str | None) -> list[EvidenceItem]:
+    """Read optional JSON-array staged evidence. It is non-durable by design."""
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    items: list[EvidenceItem] = []
+    for idx, raw_item in enumerate(raw):
+        item = normalize_evidence_item(raw_item, "stage")
+        if item is None:
+            continue
+        if item.id == "stage":
+            item = replace(item, id=f"stage:{idx}")
+        items.append(item)
+    return items
+
+
+def claim_query(claim: Claim) -> str:
+    return (
+        f"Class: {claim.claim_class}\n"
+        f"Claim: {claim.text}"
+    )
+
+
+def fetch_claim_evidence(claim: Claim) -> tuple[list[EvidenceItem], bool]:
+    resp = post_json(VESTIGE_ENDPOINT, {"query": claim_query(claim), "depth": 12}, VESTIGE_TIMEOUT)
+    if not isinstance(resp, dict):
+        return [], False
+    if resp.get("error") or resp.get("errors"):
+        return [], False
+    if str(resp.get("status") or "").strip().lower() in {
+        "error",
+        "failed",
+        "failure",
+        "unavailable",
+        "timeout",
+    }:
+        return [], False
+    if not any(
+        key in resp
+        for key in ("confidence", "evidence", "recommended", "reasoning", "query", "status")
+    ):
+        return [], False
+    return evidence_from_deep_reference(resp), True
+
+
+def high_trust(items: list[EvidenceItem]) -> list[EvidenceItem]:
+    return [item for item in items if item.trust >= TRUST_FLOOR]
+
+
+def durable_high_trust(items: list[EvidenceItem]) -> list[EvidenceItem]:
+    return [item for item in items if item.durable and item.trust >= TRUST_FLOOR]
+
+
+def salient_claim_tokens(text: str) -> set[str]:
+    tokens = {token.lower().strip(".") for token in TOKEN_RE.findall(text)}
+    return {
+        token
+        for token in tokens
+        if len(token) >= 4 and token not in STOP_CLAIM_TOKENS
+    }
+
+
+def evidence_relevant_to_claim(claim: Claim, evidence: EvidenceItem) -> bool:
+    claim_numbers = set(re.findall(r"\$?\d+(?:[,.]\d+)*(?:\.\d+)?", claim.text))
+    if claim_numbers and any(num in evidence.preview for num in claim_numbers):
+        return True
+    claim_tokens = salient_claim_tokens(claim.text)
+    if not claim_tokens:
+        return True
+    preview_tokens = salient_claim_tokens(evidence.preview)
+    overlap = claim_tokens & preview_tokens
+    threshold = 1 if claim.claim_class == "TECHNICAL" else 2
+    return len(overlap) >= threshold
+
+
+def relevant_durable_high_trust(claim: Claim, items: list[EvidenceItem]) -> list[EvidenceItem]:
+    return [
+        item
+        for item in durable_high_trust(items)
+        if evidence_relevant_to_claim(claim, item)
+    ]
+
+
+def format_claim_evidence(items: list[EvidenceItem], claim: Claim | None = None) -> str:
+    if not items:
+        return "(no relevant evidence retrieved)"
+    lines = []
+    durable_count = (
+        len(relevant_durable_high_trust(claim, items))
+        if claim is not None
+        else len(durable_high_trust(items))
+    )
+    high_count = len(high_trust(items))
+    lines.append(
+        f"HIGH-TRUST EVIDENCE: {high_count} | DURABLE HIGH-TRUST EVIDENCE: {durable_count}"
+    )
+    stage_count = len([item for item in items if not item.durable])
+    if stage_count:
+        lines.append(
+            "STAGED EVIDENCE PRESENT: non-durable overlay; do not count it as durable memory."
+        )
+    for item in high_trust(items)[:8]:
+        durable = "durable" if item.durable else "staged"
+        short_id = item.id[:12]
+        lines.append(
+            f"[{short_id}] {durable} role={item.role} trust={item.trust:.2f} date={item.date}\n"
+            f"{item.preview}"
+        )
+    return "\n\n".join(lines)
 
 
 SYSTEM_PROMPT = """You are the Sanhedrin Executioner. You judge whether a DRAFT contradicts Vestige memory evidence about the user. ONE LINE OF OUTPUT.
@@ -229,16 +753,34 @@ MULTI-CLAIM SEVERITY ORDERING: if multiple claims are vetoable, choose ACHIEVEME
 When in doubt on TECHNICAL/TIMELINE: PASS. When in doubt on a user-about ACHIEVEMENT/FINANCIAL/BIOGRAPHICAL claim with specific named entities not in evidence: VETO with UNVERIFIED-POSITIVE."""
 
 
-VALID_CLASSES = {
-    "TECHNICAL", "ACHIEVEMENT", "FINANCIAL", "BIOGRAPHICAL",
-    "TIMELINE", "ATTRIBUTION", "VAGUE-QUANTIFIER", "UNVERIFIED-POSITIVE",
+CLAIM_SYSTEM_PROMPT = """You are the Sanhedrin Executioner in claim mode. Judge ONE extracted claim against the provided Vestige evidence.
+
+Return exactly one JSON object, no markdown:
+{
+  "status": "SUPPORTED|REFUTED|REFUTED_BY_ABSENCE|NEI",
+  "class": "<claim class>",
+  "reason": "<short reason, under 140 chars>",
+  "evidence_ids": ["<ids used>"]
 }
+
+Rules:
+- SUPPORTED: high-trust evidence directly supports the claim.
+- REFUTED: high-trust evidence directly contradicts the same-subject claim.
+- REFUTED_BY_ABSENCE: use only when instructions say absence-fail-closed applies.
+- NEI: not enough information, stale/noisy evidence, wrong subject, or inference required.
+- Do not infer contradiction across different subjects, versions, projects, or architecture layers.
+- Staged evidence is context only and is not durable Vestige memory.
+- Reasons must not use implies, suggests, must mean, would mean, indicates, therefore, or this means.
+"""
+
+
+VALID_CLASSES = CLAIM_CLASSES
 INFERENCE_VERBS = (
     "implies", "implying", "suggests", "must mean", "would mean",
     "indicates that", "therefore the", "this means",
 )
 VERDICT_RE = re.compile(
-    r"^no - \[Sanhedrin Veto\] ([A-Z][A-Z\-]*): (.{1,180})$"
+    r"^no - \[Sanhedrin Veto\] \[?([A-Z][A-Z\-]*)\]?: (.{1,180})$"
 )
 
 
@@ -322,10 +864,249 @@ def judge(draft: str, evidence: str) -> str:
     return ""
 
 
+def absence_verdict(claim: Claim) -> ClaimVerdict:
+    reason = (
+        f"{claim.claim_class} claim about Sam has zero high-trust durable Vestige evidence."
+    )
+    return ClaimVerdict(
+        claim=claim,
+        status="REFUTED_BY_ABSENCE",
+        reason=truncate_chars(reason, 140),
+    )
+
+
+def nei_verdict(
+    claim: Claim,
+    reason: str,
+    evidence: list[EvidenceItem] | None = None,
+) -> ClaimVerdict:
+    evidence = evidence or []
+    return ClaimVerdict(
+        claim=claim,
+        status="NEI",
+        reason=truncate_chars(reason, 140),
+        evidence_ids=[item.id for item in high_trust(evidence)[:3]],
+        durable_evidence_count=len(relevant_durable_high_trust(claim, evidence)),
+        high_trust_evidence_count=len(high_trust(evidence)),
+    )
+
+
+def supported_verdict(claim: Claim, evidence: list[EvidenceItem]) -> ClaimVerdict:
+    return ClaimVerdict(
+        claim=claim,
+        status="SUPPORTED",
+        reason="High-trust evidence supports or does not contradict the claim.",
+        evidence_ids=[item.id for item in high_trust(evidence)[:3]],
+        durable_evidence_count=len(relevant_durable_high_trust(claim, evidence)),
+        high_trust_evidence_count=len(high_trust(evidence)),
+    )
+
+
+def parse_json_object(raw: str) -> dict[str, Any] | None:
+    cleaned = THINK_RE.sub("", raw).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        obj = json.loads(cleaned)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(cleaned[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def verdict_from_legacy_line(claim: Claim, raw: str, evidence: list[EvidenceItem]) -> ClaimVerdict | None:
+    line = validate_verdict(raw)
+    if line == "yes":
+        return supported_verdict(claim, evidence)
+    m = VERDICT_RE.match(line)
+    if not m:
+        return None
+    reason = m.group(2)
+    if not relevant_durable_high_trust(claim, evidence):
+        return nei_verdict(claim, "Durable evidence required for refuted verdict.", evidence)
+    return ClaimVerdict(
+        claim=claim,
+        status="REFUTED",
+        reason=truncate_chars(reason, 140),
+        evidence_ids=[item.id for item in high_trust(evidence)[:3]],
+        durable_evidence_count=len(relevant_durable_high_trust(claim, evidence)),
+        high_trust_evidence_count=len(high_trust(evidence)),
+    )
+
+
+def validate_structured_verdict(
+    claim: Claim,
+    data: dict[str, Any],
+    evidence: list[EvidenceItem],
+) -> ClaimVerdict:
+    status = str(data.get("status") or "").strip().upper()
+    if status not in STRUCTURED_VERDICTS:
+        status = "NEI"
+    claim_class = str(data.get("class") or claim.claim_class).strip().upper()
+    if claim_class not in CLAIM_CLASSES:
+        claim_class = claim.claim_class
+    reason = truncate_chars(str(data.get("reason") or "").strip(), 140)
+    if any(verb in reason.lower() for verb in INFERENCE_VERBS):
+        return nei_verdict(claim, "Inference-chain verdict downgraded to NEI.", evidence)
+    if status == "REFUTED_BY_ABSENCE":
+        if not (claim.sam_critical and claim.claim_class in CRITICAL_ABSENCE_CLASSES):
+            return nei_verdict(claim, "Absence veto does not apply to this claim.", evidence)
+        if relevant_durable_high_trust(claim, evidence):
+            return nei_verdict(claim, "Durable evidence exists; absence veto does not apply.", evidence)
+    if status == "REFUTED" and not relevant_durable_high_trust(claim, evidence):
+        return nei_verdict(claim, "Durable evidence required for refuted verdict.", evidence)
+    evidence_ids_raw = data.get("evidence_ids") or []
+    evidence_ids = [
+        str(eid) for eid in evidence_ids_raw[:5]
+    ] if isinstance(evidence_ids_raw, list) else []
+    if not reason:
+        if status == "SUPPORTED":
+            reason = "High-trust evidence supports or does not contradict the claim."
+        elif status == "NEI":
+            reason = "Not enough high-trust evidence to decide."
+        elif status == "REFUTED_BY_ABSENCE":
+            reason = absence_verdict(claim).reason
+        else:
+            reason = "High-trust evidence refutes the claim."
+    return ClaimVerdict(
+        claim=Claim(
+            text=claim.text,
+            claim_class=claim_class,
+            source_index=claim.source_index,
+            sam_critical=claim.sam_critical,
+        ),
+        status=status,
+        reason=reason,
+        evidence_ids=evidence_ids,
+        durable_evidence_count=len(relevant_durable_high_trust(claim, evidence)),
+        high_trust_evidence_count=len(high_trust(evidence)),
+    )
+
+
+def judge_claim_with_model(claim: Claim, evidence: list[EvidenceItem]) -> ClaimVerdict:
+    user_msg = (
+        f"CLAIM CLASS: {claim.claim_class}\n"
+        f"SAM-CRITICAL: {'yes' if claim.sam_critical else 'no'}\n"
+        f"ABSENCE-FAIL-CLOSED APPLIES: "
+        f"{'yes' if claim.sam_critical and claim.claim_class in CRITICAL_ABSENCE_CLASSES else 'no'}\n"
+        f"DURABLE HIGH-TRUST EVIDENCE COUNT: {len(relevant_durable_high_trust(claim, evidence))}\n\n"
+        f"CLAIM:\n{claim.text}\n\n"
+        f"EVIDENCE:\n{format_claim_evidence(evidence, claim)}"
+    )
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": CLAIM_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "max_tokens": 700,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 1,
+        "seed": 42,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    resp = post_json(SANHEDRIN_ENDPOINT, body, SANHEDRIN_TIMEOUT)
+    if not isinstance(resp, dict):
+        return nei_verdict(claim, "Sanhedrin model unavailable; fail-open for this claim.", evidence)
+    try:
+        msg = resp["choices"][0]["message"]
+        raw = msg.get("content") or msg.get("reasoning") or ""
+    except (KeyError, IndexError, TypeError):
+        return nei_verdict(claim, "Malformed Sanhedrin model response.", evidence)
+    data = parse_json_object(raw)
+    if data is not None:
+        return validate_structured_verdict(claim, data, evidence)
+    legacy = verdict_from_legacy_line(claim, raw, evidence)
+    if legacy is not None:
+        return legacy
+    return nei_verdict(claim, "Sanhedrin model did not return structured JSON.", evidence)
+
+
+def judge_claim(claim: Claim, evidence: list[EvidenceItem]) -> ClaimVerdict:
+    durable_count = len(relevant_durable_high_trust(claim, evidence))
+    high_count = len(high_trust(evidence))
+    if claim.sam_critical and claim.claim_class in CRITICAL_ABSENCE_CLASSES and durable_count == 0:
+        verdict = absence_verdict(claim)
+        verdict.high_trust_evidence_count = high_count
+        return verdict
+    if high_count == 0:
+        return nei_verdict(claim, "No high-trust evidence retrieved for this claim.", evidence)
+    return judge_claim_with_model(claim, evidence)
+
+
+def render_legacy_from_verdicts(verdicts: list[ClaimVerdict]) -> str:
+    vetoes = [v for v in verdicts if v.status in {"REFUTED", "REFUTED_BY_ABSENCE"}]
+    if not vetoes:
+        return "yes"
+    vetoes.sort(
+        key=lambda v: (
+            SEVERITY_ORDER.get(v.claim.claim_class, 99),
+            v.claim.source_index,
+        )
+    )
+    chosen = vetoes[0]
+    reason = truncate_chars(chosen.reason or chosen.claim.text, 140)
+    return f"no - [Sanhedrin Veto] [{chosen.claim.claim_class}]: {reason}"
+
+
+def claim_mode_result(draft: str) -> dict[str, Any]:
+    claims = extract_check_worthy_claims(draft)
+    staged = load_staged_evidence(os.environ.get(STAGE_FILE_ENV))
+    verdicts: list[ClaimVerdict] = []
+    for claim in claims:
+        evidence, ok = fetch_claim_evidence(claim)
+        if not ok:
+            verdicts.append(
+                nei_verdict(
+                    claim,
+                    "Vestige retrieval unavailable; fail-open for this claim.",
+                    staged,
+                )
+            )
+            continue
+        combined = dedupe_evidence(evidence + staged)
+        verdicts.append(judge_claim(claim, combined))
+    legacy_verdict = render_legacy_from_verdicts(verdicts)
+    decision = "yes" if legacy_verdict == "yes" else "no"
+    json_reason = "" if decision == "yes" else legacy_verdict.split(" - ", 1)[-1]
+    return {
+        "mode": "claim",
+        "decision": decision,
+        "verdict": decision,
+        "reason": json_reason,
+        "passed": legacy_verdict == "yes",
+        "legacy_verdict": legacy_verdict,
+        "claims_extracted": len(claims),
+        "staged_evidence_count": len(staged),
+        "verdicts": [asdict(v) for v in verdicts],
+    }
+
+
+def print_claim_mode_result(result: dict[str, Any]) -> None:
+    if (os.environ.get(OUTPUT_ENV) or "").strip().lower() == "json":
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(result.get("legacy_verdict") or "yes")
+
+
 def main() -> None:
     draft = sys.stdin.read().strip()
     if not draft:
         print("yes")
+        return
+
+    if env_flag(CLAIM_MODE_ENV):
+        print_claim_mode_result(claim_mode_result(draft))
         return
 
     evidence, high_trust_count = fetch_evidence(draft)

@@ -12,6 +12,19 @@ env:
   VESTIGE_TEST_MOCK_EMBEDDINGS: "1"
 
 jobs:
+  hook-tests:
+    name: Hook Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python3 -m unittest discover -s tests/hooks -p 'test_*.py'
+      - run: python3 -m py_compile hooks/sanhedrin-local.py tests/hooks/test_sanhedrin_claim_mode.py
+      - run: bash -n hooks/sanhedrin.sh scripts/install-sandwich.sh scripts/check-sandwich-prereqs.sh
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest

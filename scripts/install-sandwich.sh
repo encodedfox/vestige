@@ -24,6 +24,18 @@ DASHBOARD_PORT="${VESTIGE_DASHBOARD_PORT:-3927}"
 SANHEDRIN_ENDPOINT="${VESTIGE_SANHEDRIN_ENDPOINT:-${MLX_ENDPOINT:-http://127.0.0.1:8080/v1/chat/completions}}"
 SANHEDRIN_ENDPOINT="${SANHEDRIN_ENDPOINT%/}"
 SANHEDRIN_MODELS_URL="${SANHEDRIN_ENDPOINT%/chat/completions}/models"
+SANHEDRIN_CLAIM_MODE="${VESTIGE_SANHEDRIN_CLAIM_MODE:-1}"
+SANHEDRIN_OUTPUT="${VESTIGE_SANHEDRIN_OUTPUT:-json}"
+MODEL_ID_FROM_INSTALLER=0
+DASHBOARD_PORT_FROM_INSTALLER=0
+SANHEDRIN_ENDPOINT_FROM_INSTALLER=0
+SANHEDRIN_CLAIM_MODE_FROM_INSTALLER=0
+SANHEDRIN_OUTPUT_FROM_INSTALLER=0
+[ -n "${VESTIGE_SANHEDRIN_MODEL:-${VESTIGE_SANDWICH_MODEL:-}}" ] && MODEL_ID_FROM_INSTALLER=1
+[ -n "${VESTIGE_DASHBOARD_PORT:-}" ] && DASHBOARD_PORT_FROM_INSTALLER=1
+[ -n "${VESTIGE_SANHEDRIN_ENDPOINT:-${MLX_ENDPOINT:-}}" ] && SANHEDRIN_ENDPOINT_FROM_INSTALLER=1
+[ -n "${VESTIGE_SANHEDRIN_CLAIM_MODE:-}" ] && SANHEDRIN_CLAIM_MODE_FROM_INSTALLER=1
+[ -n "${VESTIGE_SANHEDRIN_OUTPUT:-}" ] && SANHEDRIN_OUTPUT_FROM_INSTALLER=1
 
 HOOKS_DIR="$HOME/.claude/hooks"
 AGENTS_DIR="$HOME/.claude/agents"
@@ -50,9 +62,11 @@ for arg in "$@"; do
       SANHEDRIN_ENDPOINT="${arg#*=}"
       SANHEDRIN_ENDPOINT="${SANHEDRIN_ENDPOINT%/}"
       SANHEDRIN_MODELS_URL="${SANHEDRIN_ENDPOINT%/chat/completions}/models"
+      SANHEDRIN_ENDPOINT_FROM_INSTALLER=1
       ;;
     --sanhedrin-model=*|--model=*)
       MODEL_ID="${arg#*=}"
+      MODEL_ID_FROM_INSTALLER=1
       ;;
     --src=*) SRC="${arg#--src=}" ;;
     -h|--help)
@@ -85,7 +99,7 @@ fi
 
 # --- Prereqs (warnings only, install proceeds) ---
 command -v jq      >/dev/null || die "jq required: brew install jq"
-command -v python3 >/dev/null || die "python3 required (3.10+)"
+command -v python3 >/dev/null || die "python3 required"
 if [ "$ENABLE_PREFLIGHT" -eq 1 ]; then
   command -v claude  >/dev/null || warn "'claude' CLI not found — preflight-swarm.sh will fail open."
   command -v vestige-mcp >/dev/null || warn "'vestige-mcp' not found — Vestige preflight hooks will fail open."
@@ -165,14 +179,103 @@ quote_env() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+load_vestige_sanhedrin_env() {
+  [ -f "$1" ] || return 0
+  while IFS="$(printf '\t')" read -r key value; do
+    case "$key" in
+      VESTIGE_SANHEDRIN_ENABLED|VESTIGE_SANHEDRIN_MODEL|VESTIGE_SANHEDRIN_ENDPOINT|VESTIGE_SANHEDRIN_CLAIM_MODE|VESTIGE_SANHEDRIN_OUTPUT|VESTIGE_SANHEDRIN_PYTHON|VESTIGE_DASHBOARD_PORT)
+        export "$key=$value"
+        ;;
+    esac
+  done < <(python3 - "$1" <<'PY'
+import shlex
+import sys
+
+allowed = {
+    "VESTIGE_SANHEDRIN_ENABLED",
+    "VESTIGE_SANHEDRIN_MODEL",
+    "VESTIGE_SANHEDRIN_ENDPOINT",
+    "VESTIGE_SANHEDRIN_CLAIM_MODE",
+    "VESTIGE_SANHEDRIN_OUTPUT",
+    "VESTIGE_SANHEDRIN_PYTHON",
+    "VESTIGE_DASHBOARD_PORT",
+}
+
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    sys.exit(0)
+
+for raw in lines:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    try:
+        parts = shlex.split(line, posix=True)
+    except ValueError:
+        continue
+    if len(parts) != 1 or "=" not in parts[0]:
+        continue
+    key, value = parts[0].split("=", 1)
+    if key in allowed and "\t" not in value and "\0" not in value:
+        print(f"{key}\t{value}")
+PY
+  )
+}
+
 if [ "$ENABLE_SANHEDRIN" -eq 1 ]; then
   SANHEDRIN_ENV="$HOOKS_DIR/vestige-sanhedrin.env"
+  INSTALLER_MODEL_ID="$MODEL_ID"
+  INSTALLER_DASHBOARD_PORT="$DASHBOARD_PORT"
+  INSTALLER_SANHEDRIN_ENDPOINT="$SANHEDRIN_ENDPOINT"
+  INSTALLER_SANHEDRIN_CLAIM_MODE="$SANHEDRIN_CLAIM_MODE"
+  INSTALLER_SANHEDRIN_OUTPUT="$SANHEDRIN_OUTPUT"
+  if [ -f "$SANHEDRIN_ENV" ]; then
+    load_vestige_sanhedrin_env "$SANHEDRIN_ENV" || true
+    if [ "$MODEL_ID_FROM_INSTALLER" -eq 1 ]; then
+      MODEL_ID="$INSTALLER_MODEL_ID"
+    else
+      MODEL_ID="${VESTIGE_SANHEDRIN_MODEL:-$MODEL_ID}"
+    fi
+    if [ "$DASHBOARD_PORT_FROM_INSTALLER" -eq 1 ]; then
+      DASHBOARD_PORT="$INSTALLER_DASHBOARD_PORT"
+    else
+      DASHBOARD_PORT="${VESTIGE_DASHBOARD_PORT:-$DASHBOARD_PORT}"
+    fi
+    if [ "$SANHEDRIN_ENDPOINT_FROM_INSTALLER" -eq 1 ]; then
+      SANHEDRIN_ENDPOINT="$INSTALLER_SANHEDRIN_ENDPOINT"
+    else
+      SANHEDRIN_ENDPOINT="${VESTIGE_SANHEDRIN_ENDPOINT:-$SANHEDRIN_ENDPOINT}"
+      SANHEDRIN_ENDPOINT="${SANHEDRIN_ENDPOINT%/}"
+    fi
+    SANHEDRIN_MODELS_URL="${SANHEDRIN_ENDPOINT%/chat/completions}/models"
+    if [ "$SANHEDRIN_CLAIM_MODE_FROM_INSTALLER" -eq 1 ]; then
+      SANHEDRIN_CLAIM_MODE="$INSTALLER_SANHEDRIN_CLAIM_MODE"
+    else
+      SANHEDRIN_CLAIM_MODE="${VESTIGE_SANHEDRIN_CLAIM_MODE:-$SANHEDRIN_CLAIM_MODE}"
+    fi
+    if [ "$SANHEDRIN_OUTPUT_FROM_INSTALLER" -eq 1 ]; then
+      SANHEDRIN_OUTPUT="$INSTALLER_SANHEDRIN_OUTPUT"
+    else
+      SANHEDRIN_OUTPUT="${VESTIGE_SANHEDRIN_OUTPUT:-$SANHEDRIN_OUTPUT}"
+    fi
+  fi
+  TMP_ENV="$(mktemp)"
+  if [ -f "$SANHEDRIN_ENV" ]; then
+    awk -F= '
+      $1 !~ /^(VESTIGE_SANHEDRIN_ENABLED|VESTIGE_SANHEDRIN_ENDPOINT|VESTIGE_SANHEDRIN_MODEL|VESTIGE_DASHBOARD_PORT|VESTIGE_SANHEDRIN_CLAIM_MODE|VESTIGE_SANHEDRIN_OUTPUT)$/
+    ' "$SANHEDRIN_ENV" > "$TMP_ENV"
+  fi
   {
+    cat "$TMP_ENV"
     printf 'VESTIGE_SANHEDRIN_ENABLED=1\n'
     printf 'VESTIGE_SANHEDRIN_ENDPOINT=%s\n' "$(quote_env "$SANHEDRIN_ENDPOINT")"
     printf 'VESTIGE_SANHEDRIN_MODEL=%s\n' "$(quote_env "$MODEL_ID")"
     printf 'VESTIGE_DASHBOARD_PORT=%s\n' "$(quote_env "$DASHBOARD_PORT")"
+    printf 'VESTIGE_SANHEDRIN_CLAIM_MODE=%s\n' "$(quote_env "$SANHEDRIN_CLAIM_MODE")"
+    printf 'VESTIGE_SANHEDRIN_OUTPUT=%s\n' "$(quote_env "$SANHEDRIN_OUTPUT")"
   } > "$SANHEDRIN_ENV"
+  rm -f "$TMP_ENV"
   chmod 0600 "$SANHEDRIN_ENV"
   say "Sanhedrin opt-in config written to $SANHEDRIN_ENV"
 fi

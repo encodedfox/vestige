@@ -43,7 +43,7 @@ fn build_instructions() -> String {
          Every retrieval MUST be composed into a recommendation, never summarized.\
          \n\nCOMPOSITION MANDATE: When you receive memories from search, deep_reference, \
          cross_reference, or explore_connections, your response MUST follow this shape. \
-         (a) Composing: [memory IDs], followed by your composition logic (your chain-of-thought \
+         (a) Composing: [memory IDs], followed by a brief composition rationale \
          about how the memories relate, NOT a restatement of their contents). \
          (b) Never-composed detected: list combinations of retrieved memories that share \
          tags/topics but have never been referenced together, or write 'None.' \
@@ -62,6 +62,10 @@ fn build_instructions() -> String {
          memory(action='demote') for wrong ones — do not ask permission, just act."
             .to_string()
     }
+}
+
+fn supported_protocol_versions() -> &'static [&'static str] {
+    &["2024-11-05", "2025-03-26", "2025-06-18", MCP_VERSION]
 }
 
 /// MCP Server implementation
@@ -113,6 +117,13 @@ impl McpServer {
     pub async fn handle_request(&mut self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         debug!("Handling request: {}", request.method);
 
+        if request.id.is_none() {
+            if request.method != "notifications/initialized" {
+                debug!("Dropping JSON-RPC notification '{}'", request.method);
+            }
+            return None;
+        }
+
         // Check initialization for non-initialize requests
         if !self.initialized
             && request.method != "initialize"
@@ -130,10 +141,9 @@ impl McpServer {
 
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(request.params).await,
-            "notifications/initialized" => {
-                // Notification, no response needed
-                return None;
-            }
+            "notifications/initialized" => Err(JsonRpcError::invalid_request(
+                "notifications/initialized must be sent without an id",
+            )),
             "tools/list" => self.handle_tools_list().await,
             "tools/call" => self.handle_tools_call(request.params).await,
             "resources/list" => self.handle_resources_list().await,
@@ -159,20 +169,27 @@ impl McpServer {
         let request: InitializeRequest = match params {
             Some(p) => serde_json::from_value(p)
                 .map_err(|e| JsonRpcError::invalid_params(&e.to_string()))?,
-            None => InitializeRequest::default(),
+            None => {
+                return Err(JsonRpcError::invalid_params(
+                    "initialize params are required",
+                ));
+            }
         };
 
-        // Version negotiation: use client's version if older than server's
-        // Claude Desktop rejects servers with newer protocol versions
-        let negotiated_version = if request.protocol_version.as_str() < MCP_VERSION {
-            info!(
-                "Client requested older protocol version {}, using it",
-                request.protocol_version
-            );
-            request.protocol_version.clone()
-        } else {
-            MCP_VERSION.to_string()
-        };
+        let negotiated_version =
+            if supported_protocol_versions().contains(&request.protocol_version.as_str()) {
+                info!(
+                    "Client requested supported protocol version {}, using it",
+                    request.protocol_version
+                );
+                request.protocol_version.clone()
+            } else {
+                info!(
+                    "Client requested unsupported protocol version {}, using {}",
+                    request.protocol_version, MCP_VERSION
+                );
+                MCP_VERSION.to_string()
+            };
 
         self.initialized = true;
         info!(
@@ -207,7 +224,7 @@ impl McpServer {
 
     /// Handle tools/list request
     async fn handle_tools_list(&self) -> Result<serde_json::Value, JsonRpcError> {
-        // v2.1.2+: 25 tools (verified by the `tools.len() == 25` assertion in the
+        // v2.1.21: 25 tools (verified by the `tools.len() == 25` assertion in the
         // handle_tools_list test below — the `suppress` tool landed in v2.0.5).
         // Deprecated tools still work via redirects in handle_tools_call.
         let tools = vec![
@@ -386,6 +403,13 @@ impl McpServer {
                 .map_err(|e| JsonRpcError::invalid_params(&e.to_string()))?,
             None => return Err(JsonRpcError::invalid_params("Missing tool call parameters")),
         };
+        if let Some(arguments) = &request.arguments
+            && !arguments.is_object()
+        {
+            return Err(JsonRpcError::invalid_params(
+                "tools/call arguments must be an object",
+            ));
+        }
 
         // Record activity on every tool call (non-blocking)
         if let Ok(mut cog) = self.cognitive.try_lock() {
@@ -554,14 +578,19 @@ impl McpServer {
             }
             "delete_knowledge" => {
                 warn!(
-                    "Tool 'delete_knowledge' is deprecated. Use 'memory' with action='delete' instead."
+                    "Tool 'delete_knowledge' is deprecated. Use 'memory' with action='purge', confirm=true instead."
                 );
                 let unified_args = match request.arguments {
                     Some(ref args) => {
                         let id = args.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        let confirm = args
+                            .get("confirm")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Bool(false));
                         Some(serde_json::json!({
                             "action": "delete",
-                            "id": id
+                            "id": id,
+                            "confirm": confirm
                         }))
                     }
                     None => None,
@@ -845,7 +874,7 @@ impl McpServer {
             "suppress" => tools::suppress::execute(&self.storage, request.arguments).await,
 
             name => {
-                return Err(JsonRpcError::method_not_found_with_message(&format!(
+                return Err(JsonRpcError::invalid_params(&format!(
                     "Unknown tool: {}",
                     name
                 )));
@@ -868,17 +897,20 @@ impl McpServer {
                         text: serde_json::to_string_pretty(&content)
                             .unwrap_or_else(|_| content.to_string()),
                     }],
+                    structured_content: Some(content),
                     is_error: Some(false),
                 };
                 serde_json::to_value(call_result)
                     .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
             }
             Err(e) => {
+                let error_content = serde_json::json!({ "error": e });
                 let call_result = CallToolResult {
                     content: vec![crate::protocol::messages::ToolResultContent {
                         content_type: "text".to_string(),
-                        text: serde_json::json!({ "error": e }).to_string(),
+                        text: error_content.to_string(),
                     }],
+                    structured_content: Some(error_content),
                     is_error: Some(true),
                 };
                 serde_json::to_value(call_result)
@@ -1043,7 +1075,15 @@ impl McpServer {
                 serde_json::to_value(result)
                     .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
             }
-            Err(e) => Err(JsonRpcError::internal_error(&e)),
+            Err(e) => {
+                if e.to_ascii_lowercase().contains("unknown")
+                    || e.to_ascii_lowercase().contains("not found")
+                {
+                    Err(JsonRpcError::resource_not_found(uri))
+                } else {
+                    Err(JsonRpcError::internal_error(&e))
+                }
+            }
         }
     }
 
@@ -1171,7 +1211,21 @@ impl McpServer {
                     .to_string();
                 match action {
                     "delete" | "purge" => {
-                        self.emit(VestigeEvent::MemoryDeleted { id, timestamp: now });
+                        if result
+                            .get("success")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            let node_id = result
+                                .get("nodeId")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(&id)
+                                .to_string();
+                            self.emit(VestigeEvent::MemoryDeleted {
+                                id: node_id,
+                                timestamp: now,
+                            });
+                        }
                     }
                     "promote" => {
                         let retention = result
@@ -1385,6 +1439,26 @@ mod tests {
         }
     }
 
+    fn make_notification(method: &str, params: Option<serde_json::Value>) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    fn init_params() -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": MCP_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "test-client",
+                "version": "1.0.0"
+            }
+        })
+    }
+
     // ========================================================================
     // INITIALIZATION TESTS
     // ========================================================================
@@ -1436,13 +1510,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initialize_with_default_params() {
+    async fn test_initialize_unsupported_protocol_falls_back_to_latest() {
+        let (mut server, _dir) = test_server().await;
+        let params = serde_json::json!({
+            "protocolVersion": "1.0.0",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        });
+        let request = make_request("initialize", Some(params));
+
+        let response = server.handle_request(request).await.unwrap();
+        let result = response.result.unwrap();
+
+        assert_eq!(result["protocolVersion"], MCP_VERSION);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_missing_params_returns_error() {
         let (mut server, _dir) = test_server().await;
         let request = make_request("initialize", None);
 
         let response = server.handle_request(request).await.unwrap();
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+        assert!(!server.initialized);
     }
 
     // ========================================================================
@@ -1482,15 +1574,37 @@ mod tests {
         let (mut server, _dir) = test_server().await;
 
         // First initialize
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         // Send initialized notification
-        let notification = make_request("notifications/initialized", None);
+        let notification = make_notification("notifications/initialized", None);
         let response = server.handle_request(notification).await;
 
         // Notifications should return None
         assert!(response.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_initialized_notification_with_id_returns_invalid_request() {
+        let (mut server, _dir) = test_server().await;
+
+        let request = make_request("notifications/initialized", None);
+        let response = server.handle_request(request).await.unwrap();
+
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32600);
+    }
+
+    #[tokio::test]
+    async fn test_notification_does_not_emit_response_or_side_effect() {
+        let (mut server, _dir) = test_server().await;
+
+        let notification = make_notification("initialize", None);
+        let response = server.handle_request(notification).await;
+
+        assert!(response.is_none());
+        assert!(!server.initialized);
     }
 
     // ========================================================================
@@ -1502,7 +1616,7 @@ mod tests {
         let (mut server, _dir) = test_server().await;
 
         // Initialize first
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("tools/list", None);
@@ -1511,8 +1625,8 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // v2.1.2: 25 tools (adds first-class contradictions surface)
-        assert_eq!(tools.len(), 25, "Expected exactly 25 tools in v2.1.2+");
+        // v2.1.21: 25 tools (includes first-class contradictions surface)
+        assert_eq!(tools.len(), 25, "Expected exactly 25 tools in v2.1.21");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -1592,7 +1706,7 @@ mod tests {
     async fn test_tools_have_descriptions_and_schemas() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("tools/list", None);
@@ -1622,7 +1736,7 @@ mod tests {
     async fn test_resources_list_returns_all_resources() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("resources/list", None);
@@ -1651,7 +1765,7 @@ mod tests {
     async fn test_resources_have_descriptions() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("resources/list", None);
@@ -1679,7 +1793,7 @@ mod tests {
         let (mut server, _dir) = test_server().await;
 
         // Initialize first
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("unknown/method", None);
@@ -1695,7 +1809,7 @@ mod tests {
     async fn test_unknown_tool_returns_error() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request(
@@ -1708,7 +1822,7 @@ mod tests {
 
         let response = server.handle_request(request).await.unwrap();
         assert!(response.error.is_some());
-        assert_eq!(response.error.unwrap().code, -32601);
+        assert_eq!(response.error.unwrap().code, -32602);
     }
 
     // ========================================================================
@@ -1719,7 +1833,7 @@ mod tests {
     async fn test_ping_returns_empty_object() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("ping", None);
@@ -1738,7 +1852,7 @@ mod tests {
     async fn test_tools_call_missing_params_returns_error() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("tools/call", None);
@@ -1752,13 +1866,33 @@ mod tests {
     async fn test_tools_call_invalid_params_returns_error() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request(
             "tools/call",
             Some(serde_json::json!({
                 "invalid": "params"
+            })),
+        );
+
+        let response = server.handle_request(request).await.unwrap();
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_rejects_non_object_arguments() {
+        let (mut server, _dir) = test_server().await;
+
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let request = make_request(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "search",
+                "arguments": "not-an-object"
             })),
         );
 

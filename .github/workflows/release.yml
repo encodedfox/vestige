@@ -50,14 +50,80 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      - name: Validate release version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          node <<'NODE'
+          const { execFileSync } = require('node:child_process');
+          const tag = process.env.RELEASE_TAG || '';
+          const expected = tag.replace(/^refs\/tags\//, '').replace(/^v/, '');
+          if (!expected) {
+            throw new Error('Release tag is empty');
+          }
+
+          const packageFiles = [
+            'package.json',
+            'apps/dashboard/package.json',
+            'packages/vestige-init/package.json',
+            'packages/vestige-mcp-npm/package.json'
+          ];
+          for (const file of packageFiles) {
+            const actual = require(`./${file}`).version;
+            if (actual !== expected) {
+              throw new Error(`${file} version ${actual} does not match ${tag}`);
+            }
+          }
+
+          const metadata = JSON.parse(execFileSync('cargo', [
+            'metadata',
+            '--format-version',
+            '1',
+            '--locked',
+            '--no-deps'
+          ], { encoding: 'utf8' }));
+          for (const name of ['vestige-core', 'vestige-mcp']) {
+            const pkg = metadata.packages.find((candidate) => candidate.name === name);
+            if (!pkg) throw new Error(`Missing Cargo package ${name}`);
+            if (pkg.version !== expected) {
+              throw new Error(`${name} version ${pkg.version} does not match ${tag}`);
+            }
+          }
+          NODE
+
+      - name: Build embedded dashboard
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @vestige/dashboard check
+          pnpm --filter @vestige/dashboard test
+          pnpm --filter @vestige/dashboard build
+          if [ -n "$(git status --porcelain -- apps/dashboard/build)" ]; then
+            git status --short -- apps/dashboard/build
+            exit 1
+          fi
+
       - name: Build
-        run: cargo build --package vestige-mcp --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
+        run: cargo build --locked --package vestige-mcp --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
@@ -77,10 +143,21 @@ jobs:
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path vestige-mcp.exe,vestige.exe,vestige-restore.exe -DestinationPath ../../../vestige-mcp-${{ matrix.target }}.zip
 
+      - name: Generate checksum
+        shell: bash
+        run: |
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 vestige-mcp-${{ matrix.target }}.${{ matrix.archive }} > vestige-mcp-${{ matrix.target }}.${{ matrix.archive }}.sha256
+          else
+            sha256sum vestige-mcp-${{ matrix.target }}.${{ matrix.archive }} > vestige-mcp-${{ matrix.target }}.${{ matrix.archive }}.sha256
+          fi
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: vestige-mcp-${{ matrix.target }}.${{ matrix.archive }}
+          files: |
+            vestige-mcp-${{ matrix.target }}.${{ matrix.archive }}
+            vestige-mcp-${{ matrix.target }}.${{ matrix.archive }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

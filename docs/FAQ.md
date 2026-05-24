@@ -22,13 +22,13 @@
 ## Getting Started
 
 <details>
-<summary><b>"Can Vestige support a two-Claude household?"</b></summary>
+<summary><b>"Can Vestige support multiple agents or MCP clients?"</b></summary>
 
-**Yes!** See [Storage Modes](STORAGE.md#option-3-multi-claude-household). You can either:
-- **Share memories**: Both Claudes point to the same `--data-dir`
-- **Separate identities**: Each Claude gets its own data directory
+**Yes.** See [Storage Modes](STORAGE.md#option-3-multi-agent-household). You can either:
+- **Share memories**: Multiple agents point to the same `--data-dir`
+- **Separate identities**: Each agent gets its own data directory
 
-For two Claudes with distinct personas (e.g., "Domovoi" and "Storm") sharing the same human, use separate directories but consider a shared "household" memory for common knowledge.
+For two agents with distinct roles sharing the same human, use separate directories but consider a shared "household" memory for common knowledge.
 </details>
 
 <details>
@@ -38,28 +38,28 @@ For two Claudes with distinct personas (e.g., "Domovoi" and "Storm") sharing the
 
 **For non-technical users:**
 1. Have a technical friend do the 5-minute install
-2. Add the CLAUDE.md instructions
-3. Just talk to Claude normally—it handles the memory calls
+2. Add the [agent memory protocol](AGENT-MEMORY-PROTOCOL.md) to your MCP client's instruction file
+3. Just talk normally; the agent handles the memory calls
 
-**The magic**: Once set up, you never think about it. Claude just... remembers.
+**The magic**: Once set up, you never think about it. Your agent just remembers.
 </details>
 
 <details>
 <summary><b>"What input do you feed it? How does it create memories?"</b></summary>
 
-Claude creates memories via MCP tool calls. Three ways:
+Your agent creates memories via MCP tool calls. Three ways:
 
-1. **Explicit**: You say "Remember that I prefer dark mode" → Claude calls `smart_ingest`
-2. **Automatic**: Claude notices something important → calls `smart_ingest` proactively
-3. **Codebase**: Claude detects patterns/decisions → calls `remember_pattern` or `remember_decision`
+1. **Explicit**: You say "Remember that I prefer dark mode" -> the agent calls `smart_ingest`
+2. **Automatic**: The agent notices something important -> calls `smart_ingest` proactively
+3. **Codebase**: The agent detects patterns/decisions -> calls `codebase(action="remember_pattern")` or `codebase(action="remember_decision")`
 
-The CLAUDE.md instructions tell Claude when to create memories proactively.
+The agent memory protocol tells the client when to create memories proactively.
 </details>
 
 <details>
 <summary><b>"Can it be filled with a conversation stream in realtime?"</b></summary>
 
-Not currently. Vestige is **tool-based**, not stream-based. Claude decides what's worth remembering, not everything gets saved.
+Not currently. Vestige is **tool-based**, not stream-based. The agent decides what's worth remembering, not everything gets saved.
 
 This is intentional—saving everything would:
 - Bloat the knowledge base
@@ -211,11 +211,9 @@ In Vestige's current implementation:
 
 In Vestige's implementation:
 ```
-importance(
-  memory_id="the-important-one",
-  event_type="user_flag",  # or "emotional", "novelty", "repeated_access", "cross_reference"
-  hours_back=9,   # Look back 9 hours (configurable)
-  hours_forward=2  # Capture next 2 hours too
+importance_score(
+  content="the-important content",
+  context_topics=["release", "memory"]
 )
 ```
 
@@ -330,9 +328,9 @@ The unified `search` always uses hybrid, which gives you the best of both worlds
 
 Three approaches:
 
-1. **Mark as important**: `importance(memory_id="xxx", event_type="user_flag")`
+1. **Mark as important**: `importance_score(content="...", event_type="user_flag")`
 2. **Access regularly**: The Testing Effect strengthens memories each time you retrieve them
-3. **Promote explicitly**: `promote_memory(id="xxx")` after it proves valuable
+3. **Promote explicitly**: `memory(action="promote", id="xxx")` after it proves valuable
 
 For truly critical information, consider also:
 - Using specific tags like `["critical", "never-forget"]`
@@ -549,13 +547,13 @@ Common issues:
 
 | Feature | Notes App | Vestige |
 |---------|-----------|---------|
-| Retrieval | You search manually | Claude searches contextually |
+| Retrieval | You search manually | The agent searches contextually |
 | Decay | Everything stays forever | Unused knowledge fades naturally |
 | Duplicates | You manage manually | Prediction Error Gating auto-merges |
 | Context | Static text | Active part of AI reasoning |
 | Strengthening | Manual review | Automatic via Testing Effect |
 
-The key difference: **Vestige is part of Claude's cognitive loop.** Notes are external reference—Vestige is internal memory.
+The key difference: **Vestige is part of the agent's cognitive loop.** Notes are external reference; Vestige is active working memory.
 </details>
 
 <details>
@@ -619,7 +617,7 @@ Why Nomic:
 - No API costs or rate limits
 - Fast enough for real-time search
 
-The model is cached at `~/.cache/huggingface/` after first run.
+The model is cached in the platform user cache directory first, with `./.fastembed_cache` as a fallback. Set `FASTEMBED_CACHE_PATH` to choose a specific cache path.
 </details>
 
 <details>
@@ -817,11 +815,11 @@ See [CLAUDE-SETUP.md](CLAUDE-SETUP.md) for the full template. The key elements:
 **During Work**:
 - Notice a pattern? `codebase(action="remember_pattern")`
 - Made a decision? `codebase(action="remember_decision")` with rationale
-- Something important? `importance()` to strengthen recent memories
+- Something important? `importance_score(content="...")` to score it before saving or promoting
 
 **Memory Hygiene**:
-- When a memory helps: `promote_memory`
-- When a memory misleads: `demote_memory`
+- When a memory helps: `memory(action="promote", id="...")`
+- When a memory misleads: `memory(action="demote", id="...")`
 </details>
 
 ---

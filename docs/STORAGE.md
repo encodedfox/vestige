@@ -1,6 +1,6 @@
 # Storage Configuration
 
-> Global, per-project, and multi-Claude setups
+> Global, per-project, and multi-agent setups
 
 ---
 
@@ -89,9 +89,9 @@ Separate memory per codebase. Good for:
 - Different coding styles per project
 - Team environments
 
-**Claude Code Setup:**
+**MCP Client Setup:**
 
-Add to your project's `.claude/settings.local.json`:
+Add an MCP server entry to your client or project config:
 ```json
 {
   "mcpServers": {
@@ -131,11 +131,11 @@ For power users who want both global AND project memory:
 }
 ```
 
-### Option 3: Multi-Claude Household
+### Option 3: Multi-Agent Household
 
-For setups with multiple Claude instances (e.g., Claude Desktop + Claude Code, or two personas):
+For setups with multiple MCP clients or agent personas:
 
-**Shared Memory (Both Claudes share memories):**
+**Shared Memory (all clients share memories):**
 ```json
 {
   "mcpServers": {
@@ -147,27 +147,27 @@ For setups with multiple Claude instances (e.g., Claude Desktop + Claude Code, o
 }
 ```
 
-**Separate Identities (Each Claude has own memory):**
+**Separate Identities (each agent has its own memory):**
 
-Claude Desktop config - for "Domovoi":
+Client config for "Research":
 ```json
 {
   "mcpServers": {
     "vestige": {
       "command": "vestige-mcp",
-      "args": ["--data-dir", "~/vestige-domovoi"]
+      "args": ["--data-dir", "~/vestige-research"]
     }
   }
 }
 ```
 
-Claude Code config - for "Storm":
+Client config for "Builder":
 ```json
 {
   "mcpServers": {
     "vestige": {
       "command": "vestige-mcp",
-      "args": ["--data-dir", "~/vestige-storm"]
+      "args": ["--data-dir", "~/vestige-builder"]
     }
   }
 }
@@ -263,9 +263,9 @@ Internally the `Storage` type holds **separate reader and writer connections**, 
 
 | Pattern | Status | Notes |
 |---------|--------|-------|
-| One `vestige-mcp` + one Claude client | **Supported** | The default case. Zero contention. |
-| Multiple Claude clients, separate `--data-dir` | **Supported** | Each process owns its own DB file. No shared state. |
-| Multiple Claude clients, **shared** `--data-dir`, **one** `vestige-mcp` | **Supported** | Clients talk to a single MCP process that owns the DB. Recommended for multi-agent setups. |
+| One `vestige-mcp` + one MCP client | **Supported** | The default case. Zero contention. |
+| Multiple MCP clients, separate `--data-dir` | **Supported** | Each process owns its own DB file. No shared state. |
+| Multiple MCP clients, **shared** `--data-dir`, **one** `vestige-mcp` | **Supported** | Clients talk to a single MCP process that owns the DB. Recommended for multi-agent setups. |
 | CLI (`vestige` binary) reading while `vestige-mcp` runs | **Supported** | WAL makes this safe — queries see a consistent snapshot. |
 | Time Machine / `rsync` backup during writes | **Supported** | WAL journal gets copied with the main file; recovery handles it. |
 

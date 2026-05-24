@@ -10,20 +10,20 @@ For current user-facing release information, use:
 - `CHANGELOG.md`
 - `docs/STORAGE.md`
 - `docs/COGNITIVE_SANDWICH.md`
+- `docs/AGENT-MEMORY-PROTOCOL.md`
 - `docs/CLAUDE-SETUP.md`
 
 ## Current Release Shape
 
-Vestige v2.1.2 is the "Honest Memory" release. Its public scope is:
+Vestige v2.1.21 is the "Agent-Neutral Hardening" release. Its public scope is:
 
-- concrete literal search for quoted strings, env vars, UUIDs, paths, and code
-  identifiers
-- irreversible purge semantics with content-free deletion tombstones
-- first-class contradiction inspection through the MCP `contradictions` tool
-- the `vestige update` CLI flow for binary and Cognitive Sandwich updates
-- dense dream connection persistence fixes
-- embedding-model upgrade repair during consolidation
-- an opt-in `/dashboard/waitlist` preview for Vestige Pro early access
+- stdio MCP as the default agent transport, with HTTP MCP opt-in only
+- binary-only `vestige update` by default
+- delete and purge confirmation parity for destructive memory removal
+- portable sync fixes for purge tombstones, UPSERT merge, and vector index
+  reloads
+- safer release packaging with dashboard freshness checks and checksums
+- agent-neutral memory instructions for any MCP-compatible client
 
 The release keeps the local-first baseline intact. Heavy model hooks, local
 verifier models, and preflight automation remain optional.
@@ -69,23 +69,25 @@ Vestige is organized as:
 - `packages/vestige-init`: installer helper
 - `docs`: user and integration documentation
 
-## v2.1.2 Implementation Notes
+## v2.1.21 Implementation Notes
 
-Concrete search is implemented in the MCP `search` tool and core SQLite
-storage. Literal-looking queries use a keyword path instead of HyDE expansion,
-semantic fusion, FSRS reweighting, retrieval competition, and spreading
-activation.
+HTTP MCP is disabled unless the user passes `--http`, passes `--http-port`, or
+sets `VESTIGE_HTTP_ENABLED=1`. The stdio MCP server remains the portable default
+for Claude Code, Codex, Cursor, VS Code, Xcode, JetBrains, Windsurf, and other
+clients.
 
 Purge is implemented transactionally in storage and surfaced through the MCP
 `memory` tool. `memory(action="purge", confirm=true)` is the explicit hard
-delete path. `delete` remains a backwards-compatible alias.
+delete path. `delete` remains a backwards-compatible alias but also requires
+`confirm=true`.
 
-Contradictions are exposed as a first-class MCP tool and reuse the same trust
-and topic-overlap logic used by the deeper reference pipeline.
+Portable merge imports preserve both sync tombstones and non-content deletion
+tombstones. Keyed table writes use UPSERT rather than `INSERT OR REPLACE` so
+related rows are not accidentally cascaded away.
 
-The waitlist preview is a dashboard route. Its capture and support endpoints
-are controlled by opt-in public dashboard environment variables. If unset, the
-page does not silently capture private signup data.
+Claude Code Cognitive Sandwich files are optional companion files, not the
+default Vestige setup path. Use `vestige update --sandwich-companion` or
+`vestige sandwich install` only when that hook layer is wanted.
 
 ## 15. Autopilot Rationale
 

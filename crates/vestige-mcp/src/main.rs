@@ -1,4 +1,4 @@
-//! Vestige MCP Server v1.0 - Cognitive Memory for Claude
+//! Vestige MCP Server - local cognitive memory for MCP agents.
 //!
 //! A bleeding-edge Rust MCP (Model Context Protocol) server that provides
 //! Claude and other AI assistants with long-term memory capabilities
@@ -54,6 +54,7 @@ const DATABASE_FILE: &str = "vestige.db";
 struct Config {
     data_dir: Option<PathBuf>,
     http_port: u16,
+    http_enabled: bool,
     dashboard_enabled: bool,
 }
 
@@ -79,6 +80,9 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3928);
+    let mut http_enabled = std::env::var("VESTIGE_HTTP_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
     let dashboard_enabled = std::env::var("VESTIGE_DASHBOARD_ENABLED")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false);
@@ -101,7 +105,9 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
                 println!(
                     "    --data-dir <PATH>       Custom data directory (overrides VESTIGE_DATA_DIR)"
                 );
-                println!("    --http-port <PORT>      HTTP transport port (default: 3928)");
+                println!("    --http                  Enable Streamable HTTP transport");
+                println!("    --no-http               Disable Streamable HTTP transport");
+                println!("    --http-port <PORT>      HTTP transport port (also enables HTTP)");
                 println!();
                 println!("ENVIRONMENT:");
                 println!(
@@ -111,10 +117,14 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
                     "    RUST_LOG                  Log level filter (e.g., debug, info, warn, error)"
                 );
                 println!(
-                    "    VESTIGE_AUTH_TOKEN         Override the bearer token for HTTP transport"
+                    "    VESTIGE_AUTH_TOKEN       Override the bearer token for HTTP transport"
                 );
-                println!("    VESTIGE_HTTP_PORT          HTTP transport port (default: 3928)");
-                println!("    VESTIGE_DASHBOARD_ENABLED     Enable dashboard (default: disabled)");
+                println!("    VESTIGE_HTTP_ENABLED     Enable HTTP transport (default: false)");
+                println!("    VESTIGE_HTTP_PORT        HTTP transport port (default: 3928)");
+                println!(
+                    "    VESTIGE_HTTP_ALLOWED_ORIGINS  Comma-separated browser origins allowed for HTTP"
+                );
+                println!("    VESTIGE_DASHBOARD_ENABLED Enable dashboard (default: disabled)");
                 println!("    VESTIGE_DASHBOARD_PORT     Dashboard port (default: 3927)");
                 println!(
                     "    VESTIGE_SYSTEM_PROMPT_MODE Inject the full composition mandate into every MCP session (minimal|full, default: minimal)"
@@ -124,7 +134,7 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
                 println!("    vestige-mcp");
                 println!("    vestige-mcp --data-dir /custom/path");
                 println!("    VESTIGE_DATA_DIR=~/.vestige vestige-mcp");
-                println!("    vestige-mcp --http-port 8080");
+                println!("    vestige-mcp --http --http-port 8080");
                 println!("    RUST_LOG=debug vestige-mcp");
                 std::process::exit(0);
             }
@@ -156,7 +166,14 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
                 }
                 data_dir = Some(PathBuf::from(path));
             }
+            "--http" => {
+                http_enabled = true;
+            }
+            "--no-http" => {
+                http_enabled = false;
+            }
             "--http-port" => {
+                http_enabled = true;
                 i += 1;
                 if i >= args.len() {
                     eprintln!("error: --http-port requires a port number");
@@ -173,6 +190,7 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
                 };
             }
             arg if arg.starts_with("--http-port=") => {
+                http_enabled = true;
                 let val = arg.strip_prefix("--http-port=").unwrap_or("");
                 http_port = match val.parse() {
                     Ok(p) => p,
@@ -195,6 +213,7 @@ fn parse_args_from(args: Vec<OsString>, env_data_dir: Option<PathBuf>) -> Config
     Config {
         data_dir,
         http_port,
+        http_enabled,
         dashboard_enabled,
     }
 }
@@ -430,8 +449,8 @@ async fn main() {
         info!("Dashboard disabled by VESTIGE_DASHBOARD_ENABLED=false");
     }
 
-    // Start HTTP MCP transport (Streamable HTTP for Claude.ai / remote clients)
-    {
+    // Start optional HTTP MCP transport for clients that need Streamable HTTP.
+    if config.http_enabled {
         let http_storage = Arc::clone(&storage);
         let http_cognitive = Arc::clone(&cognitive);
         let http_event_tx = event_tx.clone();
@@ -442,7 +461,9 @@ async fn main() {
                 let bind =
                     std::env::var("VESTIGE_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
                 eprintln!("Vestige HTTP transport: http://{}:{}/mcp", bind, http_port);
-                eprintln!("Auth token: {}...", &token[..token.len().min(8)]);
+                if let Ok(path) = protocol::auth::token_path() {
+                    eprintln!("Auth token file: {}", path.display());
+                }
                 tokio::spawn(async move {
                     if let Err(e) = protocol::http::start_http_transport(
                         http_storage,
@@ -464,6 +485,8 @@ async fn main() {
                 );
             }
         }
+    } else {
+        info!("HTTP MCP transport disabled; set VESTIGE_HTTP_ENABLED=1 or pass --http to enable");
     }
 
     // Load cross-encoder reranker in the background (downloads ~150MB on first run)
@@ -511,6 +534,7 @@ mod tests {
         );
 
         assert_eq!(config.data_dir, Some(PathBuf::from("/tmp/vestige-env")));
+        assert!(!config.http_enabled);
     }
 
     #[test]
@@ -524,6 +548,16 @@ mod tests {
     }
 
     #[test]
+    fn http_is_opt_in_and_port_flag_enables_it() {
+        let disabled = parse_args_from(os_args(&["vestige-mcp"]), None);
+        assert!(!disabled.http_enabled);
+
+        let enabled = parse_args_from(os_args(&["vestige-mcp", "--http-port", "8080"]), None);
+        assert!(enabled.http_enabled);
+        assert_eq!(enabled.http_port, 8080);
+    }
+
+    #[test]
     fn prepare_storage_path_creates_dir_and_points_to_vestige_db() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("nested").join("vestige");
@@ -531,6 +565,17 @@ mod tests {
         let db_path = prepare_storage_path(Some(data_dir.clone())).unwrap();
 
         assert!(data_dir.is_dir());
+        assert_eq!(db_path, Some(data_dir.join(DATABASE_FILE)));
+    }
+
+    #[test]
+    fn prepare_storage_path_reuses_existing_data_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("existing");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = prepare_storage_path(Some(data_dir.clone())).unwrap();
+
         assert_eq!(db_path, Some(data_dir.join(DATABASE_FILE)));
     }
 
