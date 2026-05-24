@@ -112,15 +112,28 @@ jobs:
 
       - name: Build embedded dashboard
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           pnpm install --frozen-lockfile
           pnpm --filter @vestige/dashboard check
           pnpm --filter @vestige/dashboard test
           pnpm --filter @vestige/dashboard build
-          if [ -n "$(git status --porcelain -- apps/dashboard/build)" ]; then
-            git status --short -- apps/dashboard/build
-            exit 1
-          fi
+          node <<'NODE'
+          const fs = require('node:fs');
+          const tag = process.env.RELEASE_TAG || '';
+          const expected = tag.replace(/^refs\/tags\//, '').replace(/^v/, '');
+          const versionFile = 'apps/dashboard/build/_app/version.json';
+          const version = JSON.parse(fs.readFileSync(versionFile, 'utf8')).version;
+          if (version !== expected) {
+            throw new Error(`${versionFile} version ${version} does not match ${tag}`);
+          }
+          for (const file of ['apps/dashboard/build/index.html', versionFile]) {
+            if (!fs.existsSync(file)) {
+              throw new Error(`Dashboard build did not produce ${file}`);
+            }
+          }
+          NODE
 
       - name: Build
         run: cargo build --locked --package vestige-mcp --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
