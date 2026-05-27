@@ -504,7 +504,7 @@ own migrations.
 - Validate local Postgres dev cluster before PR C work begins. Recipe at
   `docs/plans/local-dev-postgres-setup.md` is correct but needs to be applied
   on this machine (delandtj-home): cluster is not initdb'd, pgvector is not
-  installed. Containerized `pgvector/pgvector:pg16` is a viable alternative
+  installed. Containerized `pgvector/pgvector:pg18` is a viable alternative
   if pgvector packaging is friction. See open discussion thread.
 
 ### Phase 4 sketch: `sharing_rules` and the precedence chain

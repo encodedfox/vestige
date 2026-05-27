@@ -1612,7 +1612,7 @@ use vestige_core::storage::postgres::PgMemoryStore;
 #[tokio::test]
 async fn round_trip_crud_search_scheduling_edges() {
     let docker = clients::Cli::default();
-    let image = GenericImage::new("pgvector/pgvector", "pg16")
+    let image = GenericImage::new("pgvector/pgvector", "pg18")
         .with_env_var("POSTGRES_PASSWORD", "test")
         .with_env_var("POSTGRES_DB", "vestige_test")
         .with_exposed_port(5432);
@@ -1759,7 +1759,7 @@ This sub-plan is complete when ALL of the following hold:
    and the `Visibility` enum is exported alongside it. The SQLite
    backend reads and writes the same four fields.
 8. The `tests/postgres_round_trip.rs` integration test passes against
-   a `pgvector/pgvector:pg16` container (insert / get / update / delete
+   a `pgvector/pgvector:pg18` container (insert / get / update / delete
    / fts_search / vector_search / get_scheduling / update_scheduling
    / add_edge / get_edges / remove_edge / get_neighbors / cascade
    delete).

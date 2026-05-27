@@ -166,12 +166,12 @@ use vestige_core::storage::postgres::PgMemoryStore;
 pub async fn fresh_pg_store(
     embedder: Arc<dyn Embedder>,
 ) -> Result<(PgMemoryStore, ContainerAsync<Postgres>)> {
-    // pgvector/pgvector:pg16 is the official pgvector image built on the
-    // postgres:16 base. testcontainers-modules::postgres::Postgres targets
+    // pgvector/pgvector:pg18 is the official pgvector image built on the
+    // postgres:18 base. testcontainers-modules::postgres::Postgres targets
     // the upstream postgres image by default; we override name + tag.
     let container = Postgres::default()
         .with_name("pgvector/pgvector")
-        .with_tag("pg16")
+        .with_tag("pg18")
         .start()
         .await?;
 
@@ -867,7 +867,7 @@ Requirements:
   the `docker_available()` check in `common/mod.rs`. The test output
   includes a `docker unavailable; skip` line per test so the developer
   knows the tests were not silently dropped.
-- The pgvector image (`pgvector/pgvector:pg16`) is pulled on first run;
+- The pgvector image (`pgvector/pgvector:pg18`) is pulled on first run;
   ~200 MB. A pre-pulled image keeps the per-run overhead at the cold-start
   container boot (~2-5 seconds).
 
@@ -920,7 +920,7 @@ async fn build_bench(rows: usize) -> Bench {
     let embedder = TestEmbedder::new_768();
     let container = Postgres::default()
         .with_name("pgvector/pgvector")
-        .with_tag("pg16")
+        .with_tag("pg18")
         .start()
         .await
         .unwrap();
@@ -1092,7 +1092,7 @@ Notes:
 - The Postgres feature tests should run in a separate CI matrix entry to
   isolate failures and skip them entirely on platforms (Windows runners
   if any) where the pgvector image is not available.
-- Cache the `pgvector/pgvector:pg16` image between runs. The
+- Cache the `pgvector/pgvector:pg18` image between runs. The
   `docker/setup-buildx-action` cache or a simple `docker pull` step before
   the test step keeps cold-start under the existing CI time budget.
 - Skip CI: contributors without Docker can still merge changes that do
@@ -1113,7 +1113,7 @@ jobs:
       # no `postgres` service block needed; testcontainers manages its own
     steps:
       - uses: actions/checkout@v4
-      - run: docker pull pgvector/pgvector:pg16
+      - run: docker pull pgvector/pgvector:pg18
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p vestige-core --features postgres-backend --test '*'
 ```

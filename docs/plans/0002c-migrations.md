@@ -843,7 +843,7 @@ podman run --rm -d --name vestige-pg \
     -e POSTGRES_USER=vestige \
     -e POSTGRES_DB=vestige \
     -p 5432:5432 \
-    docker.io/pgvector/pgvector:pg16
+    docker.io/pgvector/pgvector:pg18
 
 export DATABASE_URL="postgresql://vestige:devpw@127.0.0.1:5432/vestige"
 ```
