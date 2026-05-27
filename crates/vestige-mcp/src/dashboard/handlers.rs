@@ -2,10 +2,15 @@
 //!
 //! v2.0: Adds cognitive operation endpoints (dream, explore, predict, importance, consolidation)
 
+use std::cmp::Reverse;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path as FsPath, PathBuf};
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Json, Redirect};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -340,6 +345,328 @@ pub async fn unsuppress_memory(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SanhedrinAppealRequest {
+    pub reason: String,
+    pub note: Option<String>,
+    #[serde(rename = "receiptId")]
+    pub receipt_id: Option<String>,
+    #[serde(rename = "claimId")]
+    pub claim_id: Option<String>,
+}
+
+/// Return the latest Sanhedrin receipt written by the Stop-hook bridge.
+pub async fn get_sanhedrin_latest() -> Result<Json<Value>, StatusCode> {
+    let state_dir = sanhedrin_state_dir();
+    let latest_path = state_dir.join("latest.json");
+    if !latest_path.exists() {
+        return Ok(Json(serde_json::json!({
+            "receipt": null,
+            "stateDir": state_dir,
+        })));
+    }
+
+    let raw = fs::read_to_string(&latest_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let receipt: Value =
+        serde_json::from_str(&raw).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "receipt": receipt,
+        "stateDir": state_dir,
+        "receiptPath": latest_path,
+        "htmlPath": state_dir.join("latest.html"),
+    })))
+}
+
+/// Record feedback that a Sanhedrin veto was stale, wrong, or too strict.
+///
+/// This intentionally does not promote, demote, suppress, edit, or delete any
+/// memory. The hook reads this ledger and suppresses future same-fingerprint
+/// vetoes, which keeps appeal training scoped to Sanhedrin behavior.
+pub async fn appeal_sanhedrin(
+    State(state): State<AppState>,
+    Json(req): Json<SanhedrinAppealRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let reason = req.reason.trim().to_ascii_lowercase();
+    if !matches!(reason.as_str(), "stale" | "wrong" | "too_strict") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let state_dir = sanhedrin_state_dir();
+    let latest_path = state_dir.join("latest.json");
+    let raw = match fs::read_to_string(&latest_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let mut receipt: Value = serde_json::from_str(&raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let original_receipt = receipt.clone();
+    let note = req.note.unwrap_or_default();
+    let receipt_id = receipt
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let receipt_id_ref = receipt_id.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    let _ = sanitize_receipt_id(receipt_id_ref)?;
+    let expected_receipt_id = req.receipt_id.as_deref().ok_or(StatusCode::BAD_REQUEST)?;
+    if expected_receipt_id != receipt_id_ref {
+        return Err(StatusCode::CONFLICT);
+    }
+    if receipt
+        .get("verdictBar")
+        .and_then(Value::as_str)
+        .map(|v| v != "VETO")
+        .unwrap_or(true)
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    let claim = mark_sanhedrin_claim(&mut receipt, &reason, &note, req.claim_id.as_deref())?;
+
+    let appeal = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "receiptId": receipt_id.as_deref(),
+        "claimId": claim.get("id").and_then(Value::as_str),
+        "claimFingerprint": claim.get("fingerprint").and_then(Value::as_str),
+        "claim": claim.get("text").and_then(Value::as_str),
+        "reason": &reason,
+        "note": &note,
+        "status": "active",
+    });
+
+    set_json_field(&mut receipt, "overall", "appealed");
+    set_json_field(&mut receipt, "verdictBar", "APPEALED");
+    set_json_field(&mut receipt, "summary", &format!("Appealed as {}.", reason));
+    save_sanhedrin_receipt(&state_dir, &receipt)?;
+    if let Err(err) = append_sanhedrin_appeal(&state_dir, &appeal) {
+        let _ = save_sanhedrin_receipt(&state_dir, &original_receipt);
+        return Err(err);
+    }
+
+    state.emit(VestigeEvent::HookVerdictRecorded {
+        hook: "sanhedrin".to_string(),
+        verdict: "APPEALED".to_string(),
+        phase: "appeal".to_string(),
+        reason: reason.clone(),
+        receipt_id: receipt_id.clone(),
+        timestamp: Utc::now(),
+    });
+
+    Ok(Json(serde_json::json!({
+        "appeal": appeal,
+        "receipt": receipt,
+    })))
+}
+
+fn sanhedrin_state_dir() -> PathBuf {
+    std::env::var_os("VESTIGE_SANHEDRIN_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".vestige/sanhedrin"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".vestige/sanhedrin"))
+}
+
+fn ensure_sanhedrin_dirs(state_dir: &FsPath) -> Result<(), StatusCode> {
+    fs::create_dir_all(state_dir.join("receipts")).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn mark_sanhedrin_claim(
+    receipt: &mut Value,
+    reason: &str,
+    note: &str,
+    claim_id: Option<&str>,
+) -> Result<Value, StatusCode> {
+    let claim_id = claim_id.ok_or(StatusCode::BAD_REQUEST)?;
+    let claims = receipt
+        .get_mut("claims")
+        .and_then(Value::as_array_mut)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    if claims.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let selected = claims
+        .iter()
+        .position(|claim| claim.get("id").and_then(Value::as_str) == Some(claim_id))
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if claims
+        .get(selected)
+        .and_then(|claim| claim.get("decision"))
+        .and_then(Value::as_str)
+        != Some("veto")
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let claim = claims
+        .get_mut(selected)
+        .and_then(Value::as_object_mut)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    claim.insert(
+        "decision".to_string(),
+        Value::String("appealed".to_string()),
+    );
+    claim.insert(
+        "evidence_state".to_string(),
+        Value::String("appealed".to_string()),
+    );
+    claim.insert(
+        "appeal".to_string(),
+        serde_json::json!({
+            "status": "appealed",
+            "lastReason": reason,
+            "note": note,
+            "actions": ["stale", "wrong", "too_strict"],
+        }),
+    );
+
+    Ok(Value::Object(claim.clone()))
+}
+
+fn set_json_field(receipt: &mut Value, key: &str, value: &str) {
+    if let Some(obj) = receipt.as_object_mut() {
+        obj.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn save_sanhedrin_receipt(state_dir: &FsPath, receipt: &Value) -> Result<(), StatusCode> {
+    ensure_sanhedrin_dirs(state_dir)?;
+    let rendered = render_sanhedrin_receipt_html(receipt);
+    let pretty = serde_json::to_string_pretty(receipt).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let safe_id = receipt
+        .get("id")
+        .and_then(Value::as_str)
+        .map(sanitize_receipt_id)
+        .transpose()?;
+
+    if let Some(safe_id) = safe_id {
+        write_atomic(
+            &state_dir.join("receipts").join(format!("{}.json", safe_id)),
+            pretty.as_bytes(),
+        )?;
+        write_atomic(
+            &state_dir.join("receipts").join(format!("{}.html", safe_id)),
+            rendered.as_bytes(),
+        )?;
+    }
+
+    write_atomic(&state_dir.join("latest.json"), pretty.as_bytes())?;
+    write_atomic(&state_dir.join("latest.html"), rendered.as_bytes())?;
+    Ok(())
+}
+
+fn append_sanhedrin_appeal(state_dir: &FsPath, appeal: &Value) -> Result<(), StatusCode> {
+    ensure_sanhedrin_dirs(state_dir)?;
+    let mut appeals = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("appeals.jsonl"))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    writeln!(appeals, "{}", appeal).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn sanitize_receipt_id(id: &str) -> Result<&str, StatusCode> {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        Ok(id)
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
+
+fn write_atomic(path: &FsPath, bytes: &[u8]) -> Result<(), StatusCode> {
+    let parent = path.parent().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    fs::create_dir_all(parent).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::write(&tmp, bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    fs::rename(&tmp, path).map_err(|_| {
+        let _ = fs::remove_file(&tmp);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+fn render_sanhedrin_receipt_html(receipt: &Value) -> String {
+    let verdict = escape_html(
+        receipt
+            .get("verdictBar")
+            .and_then(Value::as_str)
+            .unwrap_or("PASS"),
+    );
+    let summary = escape_html(receipt.get("summary").and_then(Value::as_str).unwrap_or(""));
+    let mut claims_html = String::new();
+
+    if let Some(claims) = receipt.get("claims").and_then(Value::as_array) {
+        for claim in claims {
+            let text = escape_html(claim.get("text").and_then(Value::as_str).unwrap_or(""));
+            let decision = escape_html(claim.get("decision").and_then(Value::as_str).unwrap_or(""));
+            let evidence_state = escape_html(
+                claim
+                    .get("evidence_state")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            );
+            let fix = escape_html(
+                claim
+                    .get("fix")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("No change required."),
+            );
+            let mut precedents = String::new();
+            if let Some(items) = claim.get("precedent").and_then(Value::as_array) {
+                for item in items {
+                    let summary = item
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Precedent recorded.");
+                    precedents.push_str(&format!("<li>{}</li>", escape_html(summary)));
+                }
+            }
+            claims_html.push_str(&format!(
+                "<section class='claim'><div class='meta'>{} / {}</div><h2>{}</h2><p><strong>Fix:</strong> {}</p><p><strong>Appeal:</strong> stale | wrong | too_strict</p><ul>{}</ul></section>",
+                decision, evidence_state, text, fix, precedents
+            ));
+        }
+    }
+
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Vestige Veto Receipt</title>
+<style>
+body{{margin:0;background:#050509;color:#e7e7f4;font-family:Inter,ui-sans-serif,system-ui;padding:32px}}
+.bar{{display:inline-flex;gap:10px;align-items:center;border:1px solid #6d5dfc66;border-radius:8px;padding:10px 14px;background:#171528}}
+.status{{font-weight:800;color:#fff;letter-spacing:.08em}}
+.claim{{margin-top:18px;border:1px solid #ffffff1a;border-radius:8px;padding:16px;background:#0e0f18}}
+.meta{{font-size:12px;color:#a8a8c8;text-transform:uppercase;letter-spacing:.08em}}
+h1{{font-size:24px;margin:18px 0 4px}} h2{{font-size:16px;line-height:1.4}} p,li{{color:#c7c7dd}}
+</style></head><body>
+<div class="bar"><span>Verdict</span><span class="status">{}</span></div>
+<h1>Veto Receipt</h1><p>{}</p>{}
+</body></html>"#,
+        verdict, summary, claims_html
+    )
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 /// Get system stats
 pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let stats = state
@@ -370,6 +697,13 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<Value>, Sta
 #[derive(Debug, Deserialize)]
 pub struct TimelineParams {
     pub days: Option<i64>,
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChangelogParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
     pub limit: Option<i32>,
 }
 
@@ -428,6 +762,108 @@ pub async fn get_timeline(
     })))
 }
 
+/// Recent cognitive events in the same envelope used by the WebSocket event
+/// stream. The pulse hook polls this endpoint once per Claude wake, so keep it
+/// cheap, bounded, and tolerant of empty history.
+pub async fn get_changelog(
+    State(state): State<AppState>,
+    Query(params): Query<ChangelogParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 100);
+    let start = parse_changelog_bound(params.start.as_deref())?;
+    let end = parse_changelog_bound(params.end.as_deref())?;
+    let fetch_limit = if start.is_some() || end.is_some() {
+        limit.saturating_mul(4)
+    } else {
+        limit
+    };
+
+    let mut events: Vec<(DateTime<Utc>, Value)> = Vec::new();
+
+    let dreams = state
+        .storage
+        .get_dream_history(fetch_limit)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for dream in dreams {
+        if changelog_window_contains(dream.dreamed_at, start.as_ref(), end.as_ref()) {
+            events.push((dream.dreamed_at, dream_changelog_event(&dream)));
+        }
+    }
+
+    // Connections are currently persisted as graph edges rather than as audit
+    // rows, so filter by created_at from the connection table.
+    let connections = state
+        .storage
+        .get_all_connections()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for conn in connections {
+        if changelog_window_contains(conn.created_at, start.as_ref(), end.as_ref()) {
+            events.push((conn.created_at, connection_changelog_event(&conn)));
+        }
+    }
+
+    events.sort_by_key(|event| Reverse(event.0));
+    events.truncate(limit as usize);
+    let formatted_events: Vec<Value> = events.into_iter().map(|(_, event)| event).collect();
+    let total_events = formatted_events.len();
+
+    Ok(Json(serde_json::json!({
+        "events": formatted_events,
+        "totalEvents": total_events,
+        "filter": {
+            "start": start.as_ref().map(DateTime::to_rfc3339),
+            "end": end.as_ref().map(DateTime::to_rfc3339),
+            "limit": limit,
+        },
+    })))
+}
+
+fn parse_changelog_bound(raw: Option<&str>) -> Result<Option<DateTime<Utc>>, StatusCode> {
+    match raw {
+        Some(value) if !value.trim().is_empty() => DateTime::parse_from_rfc3339(value)
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+            .map_err(|_| StatusCode::BAD_REQUEST),
+        _ => Ok(None),
+    }
+}
+
+fn changelog_window_contains(
+    ts: DateTime<Utc>,
+    start: Option<&DateTime<Utc>>,
+    end: Option<&DateTime<Utc>>,
+) -> bool {
+    start.is_none_or(|s| ts >= *s) && end.is_none_or(|e| ts <= *e)
+}
+
+fn dream_changelog_event(dream: &vestige_core::DreamHistoryRecord) -> Value {
+    serde_json::json!({
+        "type": "DreamCompleted",
+        "timestamp": dream.dreamed_at.to_rfc3339(),
+        "data": {
+            "memories_replayed": dream.memories_replayed,
+            "connections_found": dream.connections_found,
+            "connections_persisted": dream.connections_found,
+            "insights_generated": dream.insights_generated,
+            "duration_ms": dream.duration_ms,
+            "timestamp": dream.dreamed_at.to_rfc3339(),
+        },
+    })
+}
+
+fn connection_changelog_event(conn: &vestige_core::ConnectionRecord) -> Value {
+    serde_json::json!({
+        "type": "ConnectionDiscovered",
+        "timestamp": conn.created_at.to_rfc3339(),
+        "data": {
+            "source_id": &conn.source_id,
+            "target_id": &conn.target_id,
+            "connection_type": &conn.link_type,
+            "weight": conn.strength,
+            "timestamp": conn.created_at.to_rfc3339(),
+        },
+    })
+}
+
 /// Health check
 pub async fn health_check(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let stats = state
@@ -468,6 +904,30 @@ pub struct GraphParams {
     pub center_id: Option<String>,
     pub depth: Option<u32>,
     pub max_nodes: Option<usize>,
+    /// How to choose the default center when neither `query` nor `center_id`
+    /// is provided. "recent" (default) uses the newest memory — matches
+    /// what users actually expect ("show me my recent stuff"). "connected"
+    /// uses the most-connected memory for a richer initial subgraph; used
+    /// to be the default but ended up clustering on historical hotspots
+    /// and hiding fresh memories that hadn't accumulated edges yet.
+    /// Unknown values fall back to "recent".
+    pub sort: Option<String>,
+}
+
+/// Which memory to center the default subgraph on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphSort {
+    Recent,
+    Connected,
+}
+
+impl GraphSort {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::to_ascii_lowercase).as_deref() {
+            Some("connected") => Self::Connected,
+            _ => Self::Recent,
+        }
+    }
 }
 
 /// Get memory graph data (nodes + edges with layout positions)
@@ -477,8 +937,10 @@ pub async fn get_graph(
 ) -> Result<Json<Value>, StatusCode> {
     let depth = params.depth.unwrap_or(2).clamp(1, 3);
     let max_nodes = params.max_nodes.unwrap_or(50).clamp(1, 200);
+    let sort = GraphSort::parse(params.sort.as_deref());
 
     // Determine center node
+    let explicit_center = params.center_id.is_some() || params.query.is_some();
     let center_id = if let Some(ref id) = params.center_id {
         id.clone()
     } else if let Some(ref query) = params.query {
@@ -491,31 +953,35 @@ pub async fn get_graph(
             .map(|n| n.id.clone())
             .ok_or(StatusCode::NOT_FOUND)?
     } else {
-        // Default: most connected memory (for a rich initial graph)
-        let most_connected = state
-            .storage
-            .get_most_connected_memory()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if let Some(id) = most_connected {
-            id
-        } else {
-            // Fallback: most recent memory
-            let recent = state
-                .storage
-                .get_all_nodes(1, 0)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            recent
-                .first()
-                .map(|n| n.id.clone())
-                .ok_or(StatusCode::NOT_FOUND)?
-        }
+        default_center_id(&state.storage, sort)?
     };
 
     // Get subgraph
-    let (nodes, edges) = state
+    let (mut nodes, mut edges) = state
         .storage
         .get_memory_subgraph(&center_id, depth, max_nodes)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Default-load fallback: if the newest memory is isolated (1 node, 0 edges),
+    // silently re-resolve via Connected so the user sees the densest cluster
+    // instead of a lonely orb. Explicit query/center_id requests are honored
+    // as-is — the user asked for that specific subgraph.
+    let mut center_id = center_id;
+    if !explicit_center
+        && sort == GraphSort::Recent
+        && nodes.len() <= 1
+        && edges.is_empty()
+        && let Ok(fallback) = default_center_id(&state.storage, GraphSort::Connected)
+        && fallback != center_id
+        && let Ok((n2, e2)) = state
+            .storage
+            .get_memory_subgraph(&fallback, depth, max_nodes)
+        && n2.len() > nodes.len()
+    {
+        center_id = fallback;
+        nodes = n2;
+        edges = e2;
+    }
 
     if nodes.is_empty() {
         return Err(StatusCode::NOT_FOUND);
@@ -563,6 +1029,46 @@ pub async fn get_graph(
         "nodeCount": nodes.len(),
         "edgeCount": edges.len(),
     })))
+}
+
+/// Pick the default subgraph center when neither `query` nor `center_id`
+/// was provided. Factored out so both the route handler and unit tests can
+/// exercise the same branching (recent vs connected + empty-db fallback)
+/// without spinning up a full axum server.
+fn default_center_id(
+    storage: &std::sync::Arc<vestige_core::Storage>,
+    sort: GraphSort,
+) -> Result<String, StatusCode> {
+    match sort {
+        GraphSort::Recent => {
+            let recent = storage
+                .get_all_nodes(1, 0)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            recent
+                .first()
+                .map(|n| n.id.clone())
+                .ok_or(StatusCode::NOT_FOUND)
+        }
+        GraphSort::Connected => {
+            let most_connected = storage
+                .get_most_connected_memory()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if let Some(id) = most_connected {
+                Ok(id)
+            } else {
+                // Nothing connected yet (fresh DB, or every node is isolated) —
+                // fall through to the newest memory so the user still sees
+                // SOMETHING rather than a 404.
+                let recent = storage
+                    .get_all_nodes(1, 0)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                recent
+                    .first()
+                    .map(|n| n.id.clone())
+                    .ok_or(StatusCode::NOT_FOUND)
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -677,23 +1183,14 @@ pub async fn trigger_dream(State(state): State<AppState>) -> Result<Json<Value>,
 
     // Run dream through CognitiveEngine
     let cog = cognitive.lock().await;
-    // Capture start time before the dream — composite-score eviction in store_connections
-    // reorders the buffer, making positional slicing (pre_dream_count..) unreliable.
-    let dream_start = Utc::now();
-    let dream_result = cog.dreamer.dream(&dream_memories).await;
+    let (dream_result, new_connections) = cog.dreamer.dream_with_connections(&dream_memories).await;
     let insights = cog.dreamer.synthesize_insights(&dream_memories);
-    let all_connections = cog.dreamer.get_connections();
     drop(cog);
 
     // Persist new connections
-    // Filter by timestamp — same approach as dream.rs to avoid positional index issues.
-    let new_connections: Vec<&vestige_core::DiscoveredConnection> = all_connections
-        .iter()
-        .filter(|c| c.discovered_at >= dream_start)
-        .collect();
     let mut connections_persisted = 0u64;
     let now = Utc::now();
-    for conn in new_connections.iter() {
+    for conn in &new_connections {
         let link_type = match conn.connection_type {
             vestige_core::DiscoveredConnectionType::Semantic => "semantic",
             vestige_core::DiscoveredConnectionType::SharedConcept => "shared_concepts",
@@ -725,14 +1222,38 @@ pub async fn trigger_dream(State(state): State<AppState>) -> Result<Json<Value>,
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
+    let completed_at = Utc::now();
+    let insights_generated = insights.len();
+
+    if let Err(e) = state
+        .storage
+        .save_dream_history(&vestige_core::DreamHistoryRecord {
+            dreamed_at: completed_at,
+            duration_ms: duration_ms as i64,
+            memories_replayed: dream_memories.len() as i32,
+            connections_found: connections_persisted as i32,
+            insights_generated: insights_generated as i32,
+            memories_strengthened: dream_result.memories_strengthened as i32,
+            memories_compressed: dream_result.memories_compressed as i32,
+            phase_nrem1_ms: None,
+            phase_nrem3_ms: None,
+            phase_rem_ms: None,
+            phase_integration_ms: None,
+            summaries_generated: None,
+            emotional_memories_processed: None,
+            creative_connections_found: None,
+        })
+    {
+        tracing::warn!("Failed to persist dashboard dream history: {}", e);
+    }
 
     // Emit completion event
     state.emit(VestigeEvent::DreamCompleted {
         memories_replayed: dream_memories.len(),
         connections_found: connections_persisted as usize,
-        insights_generated: insights.len(),
+        insights_generated,
         duration_ms,
-        timestamp: Utc::now(),
+        timestamp: completed_at,
     });
 
     Ok(Json(serde_json::json!({
@@ -904,6 +1425,7 @@ pub async fn score_importance(
         let attention = score.attention;
 
         state.emit(VestigeEvent::ImportanceScored {
+            memory_id: None, // /api/importance scores arbitrary content, not a stored memory
             content_preview: req.content.chars().take(80).collect(),
             composite_score: composite,
             novelty,
@@ -1087,4 +1609,306 @@ pub async fn list_intentions(
         "total": count,
         "filter": status_filter,
     })))
+}
+
+// ============================================================================
+// DEEP REFERENCE (Reasoning Theater, v2.0.8)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DeepReferenceBody {
+    pub query: String,
+    pub depth: Option<i32>,
+}
+
+/// Run the 8-stage deep_reference cognitive pipeline over HTTP.
+///
+/// Wraps the existing `crate::tools::cross_reference::execute` tool so the
+/// dashboard can surface the same reasoning chain the MCP clients see. Emits
+/// a `DeepReferenceCompleted` event with primary + supporting + contradicting
+/// memory IDs so Graph3D can camera-glide, pulse evidence nodes, and draw
+/// contradiction arcs in the 3D scene.
+pub async fn deep_reference_query(
+    State(state): State<AppState>,
+    Json(body): Json<DeepReferenceBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let cognitive = state
+        .cognitive
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    if body.query.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let args = serde_json::json!({
+        "query": body.query.clone(),
+        "depth": body.depth.unwrap_or(20).clamp(5, 50),
+    });
+
+    let start = std::time::Instant::now();
+    let response = crate::tools::cross_reference::execute(&state.storage, cognitive, Some(args))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Pull evidence IDs out for the WebSocket event so Graph3D can glide,
+    // pulse, and arc. We intentionally read from the serialized JSON rather
+    // than re-running the pipeline — whatever the tool decided is what the
+    // Theater visualizes.
+    let primary_id = response
+        .get("recommended")
+        .and_then(|r| r.get("memory_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let supporting_ids: Vec<String> = response
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let role = e.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role == "supporting" || role == "primary" {
+                        e.get("id").and_then(|v| v.as_str()).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let contradicting_ids: Vec<String> = response
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let role = e.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role == "contradicting" {
+                        e.get("id").and_then(|v| v.as_str()).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let contradiction_pairs: Vec<(String, String)> = response
+        .get("contradictions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let a = c.get("a_id").and_then(|v| v.as_str())?.to_string();
+                    let b = c.get("b_id").and_then(|v| v.as_str())?.to_string();
+                    Some((a, b))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let memories_analyzed = response
+        .get("memoriesAnalyzed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let confidence = response
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let intent = response
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Synthesis")
+        .to_string();
+
+    let status = response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    state.emit(VestigeEvent::DeepReferenceCompleted {
+        query: body.query,
+        intent,
+        status,
+        confidence,
+        primary_id,
+        supporting_ids,
+        contradicting_ids,
+        contradiction_pairs,
+        memories_analyzed,
+        duration_ms,
+        timestamp: Utc::now(),
+    });
+
+    Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use vestige_core::memory::IngestInput;
+    use vestige_core::{ConnectionRecord, DreamHistoryRecord, Storage};
+
+    #[test]
+    fn graph_sort_parse_defaults_to_recent() {
+        assert_eq!(GraphSort::parse(None), GraphSort::Recent);
+        assert_eq!(GraphSort::parse(Some("")), GraphSort::Recent);
+        assert_eq!(GraphSort::parse(Some("recent")), GraphSort::Recent);
+        assert_eq!(GraphSort::parse(Some("RECENT")), GraphSort::Recent);
+        assert_eq!(GraphSort::parse(Some("Recent")), GraphSort::Recent);
+        assert_eq!(GraphSort::parse(Some("garbage")), GraphSort::Recent);
+    }
+
+    #[test]
+    fn graph_sort_parse_accepts_connected_case_insensitive() {
+        assert_eq!(GraphSort::parse(Some("connected")), GraphSort::Connected);
+        assert_eq!(GraphSort::parse(Some("CONNECTED")), GraphSort::Connected);
+        assert_eq!(GraphSort::parse(Some("Connected")), GraphSort::Connected);
+    }
+
+    #[test]
+    fn changelog_dream_event_uses_pulse_compatible_shape() {
+        let now = Utc::now();
+        let event = dream_changelog_event(&DreamHistoryRecord {
+            dreamed_at: now,
+            duration_ms: 1234,
+            memories_replayed: 12,
+            connections_found: 3,
+            insights_generated: 2,
+            memories_strengthened: 0,
+            memories_compressed: 0,
+            phase_nrem1_ms: None,
+            phase_nrem3_ms: None,
+            phase_rem_ms: None,
+            phase_integration_ms: None,
+            summaries_generated: None,
+            emotional_memories_processed: None,
+            creative_connections_found: None,
+        });
+
+        assert_eq!(event["type"], "DreamCompleted");
+        assert_eq!(event["data"]["insights_generated"], 2);
+        assert_eq!(event["data"]["connections_persisted"], 3);
+        assert_eq!(event["data"]["timestamp"], now.to_rfc3339());
+    }
+
+    #[test]
+    fn changelog_connection_event_uses_pulse_compatible_shape() {
+        let now = Utc::now();
+        let event = connection_changelog_event(&ConnectionRecord {
+            source_id: "source-memory".to_string(),
+            target_id: "target-memory".to_string(),
+            strength: 0.82,
+            link_type: "semantic".to_string(),
+            created_at: now,
+            last_activated: now,
+            activation_count: 1,
+        });
+
+        assert_eq!(event["type"], "ConnectionDiscovered");
+        assert_eq!(event["data"]["source_id"], "source-memory");
+        assert_eq!(event["data"]["target_id"], "target-memory");
+        assert_eq!(event["data"]["connection_type"], "semantic");
+    }
+
+    fn seed_storage() -> (tempfile::TempDir, Arc<Storage>) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = Arc::new(Storage::new(Some(db_path)).unwrap());
+        (dir, storage)
+    }
+
+    fn ingest(storage: &Storage, content: &str) -> String {
+        let node = storage
+            .ingest(IngestInput {
+                content: content.to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        node.id
+    }
+
+    #[test]
+    fn default_center_id_recent_returns_newest_node() {
+        let (_dir, storage) = seed_storage();
+        ingest(&storage, "first");
+        ingest(&storage, "second");
+        let newest = ingest(&storage, "third");
+
+        let center = default_center_id(&storage, GraphSort::Recent).unwrap();
+        assert_eq!(
+            center, newest,
+            "Recent mode should pick the newest ingested memory"
+        );
+    }
+
+    fn link(storage: &Storage, source: &str, target: &str) {
+        let now = Utc::now();
+        storage
+            .save_connection(&ConnectionRecord {
+                source_id: source.to_string(),
+                target_id: target.to_string(),
+                strength: 0.9,
+                link_type: "semantic".to_string(),
+                created_at: now,
+                last_activated: now,
+                activation_count: 0,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn default_center_id_connected_prefers_hub_over_newest() {
+        let (_dir, storage) = seed_storage();
+        let hub = ingest(&storage, "hub node");
+        let spoke_a = ingest(&storage, "spoke A");
+        let spoke_b = ingest(&storage, "spoke B");
+        let spoke_c = ingest(&storage, "spoke C");
+        // Wire the spokes into `hub` so it has the most connections. Leave
+        // the final `lonely` node unconnected — it's the newest by
+        // insertion order and would win in Recent mode.
+        for spoke in [&spoke_a, &spoke_b, &spoke_c] {
+            link(&storage, &hub, spoke);
+        }
+        let _lonely = ingest(&storage, "lonely newcomer");
+
+        let center = default_center_id(&storage, GraphSort::Connected).unwrap();
+        assert_eq!(
+            center, hub,
+            "Connected mode should pick the densest node, not the newest"
+        );
+    }
+
+    #[test]
+    fn default_center_id_connected_falls_back_to_recent_when_no_edges() {
+        let (_dir, storage) = seed_storage();
+        ingest(&storage, "alpha");
+        let newest = ingest(&storage, "beta");
+
+        // No connections exist — Connected mode should degrade to Recent
+        // rather than returning 404.
+        let center = default_center_id(&storage, GraphSort::Connected).unwrap();
+        assert_eq!(center, newest);
+    }
+
+    #[test]
+    fn default_center_id_returns_not_found_on_empty_db() {
+        let (_dir, storage) = seed_storage();
+
+        let recent_err = default_center_id(&storage, GraphSort::Recent).unwrap_err();
+        assert_eq!(recent_err, StatusCode::NOT_FOUND);
+
+        let connected_err = default_center_id(&storage, GraphSort::Connected).unwrap_err();
+        assert_eq!(connected_err, StatusCode::NOT_FOUND);
+    }
 }

@@ -126,11 +126,9 @@ In Vestige's implementation:
 
 In Vestige:
 ```
-importance(
-  memory_id="the-important-one",
-  event_type="user_flag",
-  hours_back=9,
-  hours_forward=2
+importance_score(
+  content="the-important content",
+  context_topics=["release", "memory"]
 )
 ```
 
@@ -183,7 +181,7 @@ This gives you exact keyword matching AND semantic understanding in one search.
 - Runs 100% local (after first download)
 - Competitive with OpenAI's ada-002
 
-The model is cached at `~/.cache/huggingface/` after first run.
+The model is cached in the platform user cache directory after first run, with `./.fastembed_cache` as a fallback. Set `FASTEMBED_CACHE_PATH` to choose a specific cache path.
 
 ---
 

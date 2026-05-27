@@ -3,13 +3,16 @@
 //! Core storage layer with integrated embeddings and vector search.
 
 use chrono::{DateTime, Duration, Utc};
-use directories::ProjectDirs;
-#[cfg(feature = "embeddings")]
+use directories::{BaseDirs, ProjectDirs};
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use lru::LruCache;
-use rusqlite::{Connection, OptionalExtension, params};
-#[cfg(feature = "embeddings")]
+use rusqlite::types::{Type, Value, ValueRef};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -18,13 +21,20 @@ use crate::fsrs::{
 };
 use crate::fts::sanitize_fts5_query;
 use crate::memory::{
-    ConsolidationResult, IngestInput, KnowledgeNode, MemoryStats, RecallInput, SearchMode,
+    ConsolidationResult, IngestInput, KnowledgeNode, MatchType, MemoryStats, RecallInput,
+    SearchMode, SearchResult,
 };
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-use crate::memory::{EmbeddingResult, MatchType, SearchResult, SimilarityResult};
+use crate::memory::{EmbeddingResult, SimilarityResult};
+use crate::storage::portable::{
+    PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode, PortableImportReport,
+    PortableTable, PortableValue, encode_hex,
+};
 
 #[cfg(feature = "embeddings")]
-use crate::embeddings::{EMBEDDING_DIMENSIONS, Embedding, EmbeddingService, matryoshka_truncate};
+use crate::embeddings::EmbeddingService;
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
+use crate::embeddings::{EMBEDDING_DIMENSIONS, Embedding, matryoshka_truncate};
 
 #[cfg(feature = "vector-search")]
 use crate::search::{VectorIndex, linear_combination};
@@ -78,9 +88,196 @@ pub struct SmartIngestResult {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeWrite {
+    Inserted,
+    Updated,
+}
+
+/// Backend interface for portable sync storage.
+///
+/// The first shipped backend is a local file, which works with Dropbox, iCloud,
+/// Syncthing, Git, shared volumes, or any other folder sync tool. Remote stores
+/// can implement this trait without changing merge semantics.
+pub trait PortableSyncBackend {
+    /// Human-readable backend label for reports.
+    fn label(&self) -> String;
+    /// Read the current remote archive. `Ok(None)` means no remote exists yet.
+    fn read_archive(&self) -> Result<Option<PortableArchive>>;
+    /// Atomically write the merged archive back to the backend when possible.
+    fn write_archive(&self, archive: &PortableArchive) -> Result<()>;
+}
+
+/// File-backed portable sync backend.
+#[derive(Debug, Clone)]
+pub struct FilePortableSyncBackend {
+    path: PathBuf,
+}
+
+impl FilePortableSyncBackend {
+    /// Create a file-backed sync backend for a portable archive path.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Archive path backing this sync store.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl PortableSyncBackend for FilePortableSyncBackend {
+    fn label(&self) -> String {
+        format!("file:{}", self.path.display())
+    }
+
+    fn read_archive(&self) -> Result<Option<PortableArchive>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(&self.path)?;
+        let archive: PortableArchive = serde_json::from_reader(file).map_err(|e| {
+            StorageError::Init(format!(
+                "Failed to parse portable sync archive '{}': {}",
+                self.path.display(),
+                e
+            ))
+        })?;
+        Ok(Some(archive))
+    }
+
+    fn write_archive(&self, archive: &PortableArchive) -> Result<()> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let filename = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("vestige-sync.json");
+        let temp_path = parent.join(format!(".{}.tmp-{}", filename, Uuid::new_v4()));
+
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::create(&temp_path)?;
+        if let Err(e) = serde_json::to_writer_pretty(&mut file, archive) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(StorageError::Init(format!(
+                "Failed to write portable sync archive '{}': {}",
+                self.path.display(),
+                e
+            )));
+        }
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+
+        if let Err(rename_err) = std::fs::rename(&temp_path, &self.path) {
+            if self.path.exists() {
+                std::fs::remove_file(&self.path)?;
+                std::fs::rename(&temp_path, &self.path)?;
+            } else {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(rename_err.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Summary of a pull-merge-push sync operation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableSyncReport {
+    /// Backend label that was synced.
+    pub backend: String,
+    /// Whether an existing remote archive was pulled before pushing.
+    pub pulled: bool,
+    /// Merge report from the pull phase, if a remote archive existed.
+    pub pull: Option<PortableImportReport>,
+    /// Number of tables written to the backend during push.
+    pub pushed_tables: usize,
+    /// Number of rows written to the backend during push.
+    pub pushed_rows: usize,
+    /// Portable archive format written during push.
+    pub archive_format: String,
+}
+
+/// Report returned by an irreversible content purge.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeReport {
+    /// Memory ID requested for purge.
+    pub memory_id: String,
+    /// Whether a live memory row was found and removed.
+    pub deleted: bool,
+    /// Non-content tombstone timestamp.
+    pub deleted_at: DateTime<Utc>,
+    /// Number of graph edges removed by foreign-key cascade.
+    pub edges_pruned: i64,
+    /// Number of insight rows whose source list was rewritten.
+    pub insights_rewritten: i64,
+    /// Number of insight rows dropped because fewer than two source memories remained.
+    pub insights_deleted: i64,
+    /// Number of temporal-summary children detached from this parent.
+    pub children_orphaned: i64,
+}
+
 // ============================================================================
 // STORAGE
 // ============================================================================
+
+const PORTABLE_TABLES: &[&str] = &[
+    "knowledge_nodes",
+    "node_embeddings",
+    "fsrs_cards",
+    "memory_states",
+    "memory_connections",
+    "memory_access_log",
+    "state_transitions",
+    "intentions",
+    "insights",
+    "sessions",
+    "fsrs_config",
+    "consolidation_history",
+    "dream_history",
+    "retention_snapshots",
+    "sync_tombstones",
+    "deletion_tombstones",
+];
+
+const PORTABLE_USER_DATA_TABLES: &[&str] = &[
+    "knowledge_nodes",
+    "node_embeddings",
+    "fsrs_cards",
+    "memory_states",
+    "memory_connections",
+    "memory_access_log",
+    "state_transitions",
+    "intentions",
+    "insights",
+    "sessions",
+    "consolidation_history",
+    "dream_history",
+    "retention_snapshots",
+    "sync_tombstones",
+    "deletion_tombstones",
+];
+
+#[derive(Default)]
+struct PortableMergeState {
+    locally_newer_nodes: HashSet<String>,
+}
+
+const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
+const DATABASE_FILE: &str = "vestige.db";
 
 /// Main storage struct with integrated embedding and vector search
 ///
@@ -88,6 +285,7 @@ pub struct SmartIngestResult {
 /// All methods take `&self` (not `&mut self`), making Storage `Send + Sync`
 /// so the MCP layer can use `Arc<Storage>` instead of `Arc<Mutex<Storage>>`.
 pub struct Storage {
+    db_path: PathBuf,
     writer: Mutex<Connection>,
     reader: Mutex<Connection>,
     scheduler: Mutex<FSRSScheduler>,
@@ -96,11 +294,75 @@ pub struct Storage {
     #[cfg(feature = "vector-search")]
     vector_index: Mutex<VectorIndex>,
     /// LRU cache for query embeddings to avoid re-embedding repeated queries
-    #[cfg(feature = "embeddings")]
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     query_cache: Mutex<LruCache<String, Vec<f32>>>,
 }
 
 impl Storage {
+    fn data_dir_from_env() -> Option<PathBuf> {
+        std::env::var_os(DATA_DIR_ENV).and_then(|value| {
+            if value.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(value))
+            }
+        })
+    }
+
+    fn expand_tilde(path: PathBuf) -> PathBuf {
+        let rest = {
+            let mut components = path.components();
+            match components.next() {
+                Some(Component::Normal(first)) if first == "~" => {
+                    Some(components.as_path().to_path_buf())
+                }
+                _ => None,
+            }
+        };
+
+        match rest {
+            Some(rest) => BaseDirs::new()
+                .map(|dirs| dirs.home_dir().join(rest))
+                .unwrap_or(path),
+            None => path,
+        }
+    }
+
+    fn prepare_data_dir(data_dir: PathBuf) -> Result<PathBuf> {
+        let data_dir = Self::expand_tilde(data_dir);
+        std::fs::create_dir_all(&data_dir)?;
+        // Restrict directory permissions to owner-only on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            let _ = std::fs::set_permissions(&data_dir, perms);
+        }
+        Ok(data_dir.join(DATABASE_FILE))
+    }
+
+    /// Resolve a Vestige database path from an explicit data directory.
+    pub fn db_path_for_data_dir(data_dir: PathBuf) -> Result<PathBuf> {
+        Self::prepare_data_dir(data_dir)
+    }
+
+    /// Resolve the default Vestige database path.
+    ///
+    /// `VESTIGE_DATA_DIR` is treated as a directory and wins over the platform
+    /// per-user data directory. The database file is always `vestige.db` inside
+    /// that directory.
+    pub fn default_db_path() -> Result<PathBuf> {
+        if let Some(data_dir) = Self::data_dir_from_env() {
+            return Self::prepare_data_dir(data_dir);
+        }
+
+        let proj_dirs = ProjectDirs::from("com", "vestige", "core").ok_or_else(|| {
+            StorageError::Init("Could not determine project directories".to_string())
+        })?;
+
+        Self::prepare_data_dir(proj_dirs.data_dir().to_path_buf())
+    }
+
     /// Apply PRAGMAs and optional encryption to a connection
     fn configure_connection(conn: &Connection) -> Result<()> {
         // Apply encryption key if SQLCipher is enabled and key is provided
@@ -133,22 +395,7 @@ impl Storage {
     pub fn new(db_path: Option<PathBuf>) -> Result<Self> {
         let path = match db_path {
             Some(p) => p,
-            None => {
-                let proj_dirs = ProjectDirs::from("com", "vestige", "core").ok_or_else(|| {
-                    StorageError::Init("Could not determine project directories".to_string())
-                })?;
-
-                let data_dir = proj_dirs.data_dir();
-                std::fs::create_dir_all(data_dir)?;
-                // Restrict directory permissions to owner-only on Unix
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o700);
-                    let _ = std::fs::set_permissions(data_dir, perms);
-                }
-                data_dir.join("vestige.db")
-            }
+            None => Self::default_db_path()?,
         };
 
         // Open writer connection
@@ -180,12 +427,13 @@ impl Storage {
 
         // Initialize LRU cache for query embeddings (capacity: 100 queries)
         // SAFETY: 100 is always non-zero, this cannot fail
-        #[cfg(feature = "embeddings")]
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         let query_cache = Mutex::new(LruCache::new(
             NonZeroUsize::new(100).expect("100 is non-zero"),
         ));
 
         let storage = Self {
+            db_path: path,
             writer: Mutex::new(writer_conn),
             reader: Mutex::new(reader_conn),
             scheduler: Mutex::new(FSRSScheduler::default()),
@@ -193,7 +441,7 @@ impl Storage {
             embedding_service,
             #[cfg(feature = "vector-search")]
             vector_index: Mutex::new(vector_index),
-            #[cfg(feature = "embeddings")]
+            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             query_cache,
         };
 
@@ -203,35 +451,74 @@ impl Storage {
         Ok(storage)
     }
 
+    /// Absolute path of the SQLite database this storage instance uses.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Data directory containing the SQLite database and sidecar folders.
+    pub fn data_dir(&self) -> &Path {
+        self.db_path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    /// Sidecar directory for files belonging to this storage instance.
+    pub fn sidecar_dir(&self, name: &str) -> PathBuf {
+        self.data_dir().join(name)
+    }
+
     /// Load existing embeddings into vector index
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn load_embeddings_into_index(&self) -> Result<()> {
+        let mut index = self
+            .vector_index
+            .lock()
+            .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
         let reader = self
             .reader
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
 
-        let mut stmt = reader.prepare("SELECT node_id, embedding FROM node_embeddings")?;
+        let mut stmt = reader.prepare("SELECT node_id, embedding, model FROM node_embeddings")?;
 
-        let embeddings: Vec<(String, Vec<u8>)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        let embeddings: Vec<(String, Vec<u8>, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .filter_map(|r| r.ok())
             .collect();
 
         drop(stmt);
         drop(reader);
 
-        let mut index = self
-            .vector_index
-            .lock()
-            .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
+        *index = VectorIndex::new().map_err(|e| {
+            StorageError::Init(format!("Failed to rebuild vector index before load: {}", e))
+        })?;
 
         let mut load_failures = 0u32;
-        for (node_id, embedding_bytes) in embeddings {
+        let mut skipped_model_mismatches = 0u32;
+        let active_model = self.embedding_service.model_name();
+        for (node_id, embedding_bytes, model_name) in embeddings {
+            if !Self::embedding_model_matches_active(&model_name, active_model) {
+                skipped_model_mismatches += 1;
+                continue;
+            }
+
             if let Some(embedding) = Embedding::from_bytes(&embedding_bytes) {
-                // Handle Matryoshka migration: old 768-dim → truncate to 256-dim
+                // Handle Matryoshka models explicitly. Do not silently truncate
+                // unknown embedding families into the active 256d index.
                 let vector = if embedding.dimensions != EMBEDDING_DIMENSIONS {
-                    matryoshka_truncate(embedding.vector)
+                    let model_lower = model_name.to_ascii_lowercase();
+                    if model_lower.contains("nomic") || model_lower.contains("qwen3") {
+                        matryoshka_truncate(embedding.vector)
+                    } else {
+                        load_failures += 1;
+                        tracing::warn!(
+                            node_id = %node_id,
+                            model = %model_name,
+                            dimensions = embedding.dimensions,
+                            expected = EMBEDDING_DIMENSIONS,
+                            "Skipping embedding with incompatible dimensions"
+                        );
+                        continue;
+                    }
                 } else {
                     embedding.vector
                 };
@@ -246,6 +533,13 @@ impl Storage {
                 count = load_failures,
                 "Vector index: {} embeddings failed to load",
                 load_failures
+            );
+        }
+        if skipped_model_mismatches > 0 {
+            tracing::info!(
+                count = skipped_model_mismatches,
+                active_model = active_model,
+                "Vector index skipped embeddings from a different model family; run consolidation to re-embed them"
             );
         }
 
@@ -569,14 +863,19 @@ impl Storage {
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
         let mut stmt =
-            reader.prepare("SELECT embedding FROM node_embeddings WHERE node_id = ?1")?;
+            reader.prepare("SELECT embedding, model FROM node_embeddings WHERE node_id = ?1")?;
 
-        let embedding_bytes: Option<Vec<u8>> = stmt
-            .query_row(params![node_id], |row| row.get(0))
+        let embedding_row: Option<(Vec<u8>, String)> = stmt
+            .query_row(params![node_id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
 
-        Ok(embedding_bytes
-            .and_then(|bytes| crate::embeddings::Embedding::from_bytes(&bytes).map(|e| e.vector)))
+        Ok(embedding_row.and_then(|(bytes, model)| {
+            Self::embedding_vector_for_active_model(
+                &bytes,
+                &model,
+                self.embedding_service.model_name(),
+            )
+        }))
     }
 
     /// Get all embedding vectors for duplicate detection
@@ -586,21 +885,30 @@ impl Storage {
             .reader
             .lock()
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-        let mut stmt = reader.prepare("SELECT node_id, embedding FROM node_embeddings")?;
+        let mut stmt = reader.prepare("SELECT node_id, embedding, model FROM node_embeddings")?;
+        let active_model = self.embedding_service.model_name();
 
         let results: Vec<(String, Vec<f32>)> = stmt
             .query_map([], |row| {
                 let node_id: String = row.get(0)?;
                 let embedding_bytes: Vec<u8> = row.get(1)?;
-                Ok((node_id, embedding_bytes))
+                let model: String = row.get(2)?;
+                Ok((node_id, embedding_bytes, model))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(id, bytes)| {
-                crate::embeddings::Embedding::from_bytes(&bytes).map(|e| (id, e.vector))
+            .filter_map(|(id, bytes, model)| {
+                Self::embedding_vector_for_active_model(&bytes, &model, active_model)
+                    .map(|vector| (id, vector))
             })
             .collect();
 
         Ok(results)
+    }
+
+    /// Fallback for builds without local embeddings/vector search.
+    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    pub fn get_node_embedding(&self, _node_id: &str) -> Result<Option<Vec<f32>>> {
+        Ok(None)
     }
 
     /// Update the content of an existing node
@@ -645,6 +953,7 @@ impl Storage {
             .embedding_service
             .embed(content)
             .map_err(|e| StorageError::Init(format!("Embedding failed: {}", e)))?;
+        let model_name = self.embedding_service.model_name();
 
         let now = Utc::now();
 
@@ -659,15 +968,15 @@ impl Storage {
                 params![
                     node_id,
                     embedding.to_bytes(),
-                    EMBEDDING_DIMENSIONS as i32,
-                    "nomic-embed-text-v1.5",
+                    embedding.dimensions as i32,
+                    model_name,
                     now.to_rfc3339(),
                 ],
             )?;
 
             writer.execute(
-                "UPDATE knowledge_nodes SET has_embedding = 1, embedding_model = 'nomic-embed-text-v1.5' WHERE id = ?1",
-                params![node_id],
+                "UPDATE knowledge_nodes SET has_embedding = 1, embedding_model = ?2 WHERE id = ?1",
+                params![node_id, model_name],
             )?;
         }
 
@@ -1449,11 +1758,56 @@ impl Storage {
             |row| row.get(0),
         )?;
 
-        let embedding_model: Option<String> = if nodes_with_embeddings > 0 {
-            Some("nomic-embed-text-v1.5".to_string())
-        } else {
-            None
+        let embedding_model: Option<String> = reader
+            .query_row(
+                "SELECT model
+                 FROM node_embeddings
+                 GROUP BY model
+                 ORDER BY COUNT(*) DESC, model ASC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        #[cfg(feature = "embeddings")]
+        let active_embedding_model = Some(self.embedding_service.model_name().to_string());
+        #[cfg(not(feature = "embeddings"))]
+        let active_embedding_model = None;
+
+        #[cfg(feature = "embeddings")]
+        let (nodes_with_active_embeddings, nodes_with_mismatched_embeddings) = {
+            let active_model = active_embedding_model.as_deref().unwrap_or_default();
+            let model_pattern = Self::active_embedding_model_like_pattern(active_model);
+            let active_count: i64 = reader.query_row(
+                "SELECT COUNT(*)
+                 FROM knowledge_nodes kn
+                 WHERE kn.has_embedding = 1
+                   AND EXISTS (
+                       SELECT 1 FROM node_embeddings ne
+                       WHERE ne.node_id = kn.id
+                         AND ne.model LIKE ?1
+                   )",
+                params![&model_pattern],
+                |row| row.get(0),
+            )?;
+            let mismatched_count: i64 = reader.query_row(
+                "SELECT COUNT(*)
+                 FROM knowledge_nodes kn
+                 WHERE kn.has_embedding = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM node_embeddings ne
+                       WHERE ne.node_id = kn.id
+                         AND ne.model LIKE ?1
+                   )",
+                params![&model_pattern],
+                |row| row.get(0),
+            )?;
+            (active_count, mismatched_count)
         };
+        #[cfg(not(feature = "embeddings"))]
+        let (nodes_with_active_embeddings, nodes_with_mismatched_embeddings) =
+            (nodes_with_embeddings, 0);
 
         Ok(MemoryStats {
             total_nodes: total,
@@ -1472,17 +1826,25 @@ impl Storage {
                     .ok()
             }),
             nodes_with_embeddings,
+            nodes_with_active_embeddings,
+            nodes_with_mismatched_embeddings,
             embedding_model,
+            active_embedding_model,
         })
     }
 
     /// Delete a node
     pub fn delete_node(&self, id: &str) -> Result<bool> {
-        let writer = self
+        let mut writer = self
             .writer
             .lock()
             .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
-        let rows = writer.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![id])?;
+        let tx = writer.transaction()?;
+        if Self::node_exists(&tx, id)? {
+            Self::record_sync_tombstone(&tx, "knowledge_nodes", id, "delete_node")?;
+        }
+        let rows = tx.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![id])?;
+        tx.commit()?;
 
         // Clean up vector index to prevent stale search results
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
@@ -1493,6 +1855,155 @@ impl Storage {
         }
 
         Ok(rows > 0)
+    }
+
+    /// Permanently purge a memory's content and embeddings.
+    ///
+    /// Unlike `delete_node`, purge also scrubs non-FK JSON references in
+    /// `insights.source_memories`, detaches temporal-summary children, and
+    /// writes a content-free deletion tombstone for audit/sync.
+    pub fn purge_node(&self, id: &str, reason: Option<&str>) -> Result<PurgeReport> {
+        let deleted_at = Utc::now();
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let tx = writer.transaction()?;
+
+        let node = tx
+            .prepare("SELECT * FROM knowledge_nodes WHERE id = ?1")?
+            .query_row(params![id], Self::row_to_node)
+            .optional()?;
+
+        let Some(node) = node else {
+            return Ok(PurgeReport {
+                memory_id: id.to_string(),
+                deleted: false,
+                deleted_at,
+                edges_pruned: 0,
+                insights_rewritten: 0,
+                insights_deleted: 0,
+                children_orphaned: 0,
+            });
+        };
+
+        let edges_pruned: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM memory_connections WHERE source_id = ?1 OR target_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+
+        let insight_refs: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, source_memories FROM insights WHERE source_memories LIKE ?1",
+            )?;
+            let pattern = format!("%{}%", id);
+            stmt.query_map(params![pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|row| row.ok())
+                .collect()
+        };
+
+        let mut insights_rewritten = 0_i64;
+        let mut insights_deleted = 0_i64;
+        for (insight_id, source_json) in insight_refs {
+            let mut sources: Vec<String> = serde_json::from_str(&source_json).unwrap_or_default();
+            let before = sources.len();
+            sources.retain(|source_id| source_id != id);
+
+            if sources.len() == before {
+                continue;
+            }
+
+            if sources.len() < 2 {
+                insights_deleted +=
+                    tx.execute("DELETE FROM insights WHERE id = ?1", params![insight_id])? as i64;
+            } else {
+                let rewritten = serde_json::to_string(&sources).unwrap_or_else(|_| "[]".into());
+                insights_rewritten += tx.execute(
+                    "UPDATE insights SET source_memories = ?1 WHERE id = ?2",
+                    params![rewritten, insight_id],
+                )? as i64;
+            }
+        }
+
+        let children_orphaned = tx.execute(
+            "UPDATE knowledge_nodes SET summary_parent_id = NULL WHERE summary_parent_id = ?1",
+            params![id],
+        )? as i64;
+
+        let tags_json = serde_json::to_string(&node.tags).unwrap_or_else(|_| "[]".to_string());
+        tx.execute(
+            "INSERT INTO deletion_tombstones (
+                memory_id, deleted_at, reason, node_type, tags,
+                edges_pruned, insights_rewritten, insights_deleted, children_orphaned
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(memory_id) DO UPDATE SET
+                deleted_at = excluded.deleted_at,
+                reason = excluded.reason,
+                node_type = excluded.node_type,
+                tags = excluded.tags,
+                edges_pruned = excluded.edges_pruned,
+                insights_rewritten = excluded.insights_rewritten,
+                insights_deleted = excluded.insights_deleted,
+                children_orphaned = excluded.children_orphaned",
+            params![
+                id,
+                deleted_at.to_rfc3339(),
+                reason,
+                node.node_type,
+                tags_json,
+                edges_pruned,
+                insights_rewritten,
+                insights_deleted,
+                children_orphaned,
+            ],
+        )?;
+
+        Self::record_sync_tombstone(&tx, "knowledge_nodes", id, "purge_node")?;
+        tx.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![id])?;
+        tx.commit()?;
+
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        if let Ok(mut index) = self.vector_index.lock() {
+            let _ = index.remove(id);
+        }
+
+        Ok(PurgeReport {
+            memory_id: id.to_string(),
+            deleted: true,
+            deleted_at,
+            edges_pruned,
+            insights_rewritten,
+            insights_deleted,
+            children_orphaned,
+        })
+    }
+
+    fn node_exists(conn: &Connection, id: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_nodes WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn record_sync_tombstone(
+        conn: &Connection,
+        table_name: &str,
+        row_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO sync_tombstones (table_name, row_id, deleted_at, reason)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(table_name, row_id) DO UPDATE SET
+                deleted_at = excluded.deleted_at,
+                reason = excluded.reason",
+            params![table_name, row_id, Utc::now().to_rfc3339(), reason],
+        )?;
+        Ok(())
     }
 
     /// Search with full-text search
@@ -1518,6 +2029,234 @@ impl Storage {
             result.push(node?);
         }
         Ok(result)
+    }
+
+    /// FTS5 keyword search using individual-term matching (implicit AND).
+    ///
+    /// Unlike `search()` which uses phrase matching (words must be adjacent),
+    /// this returns documents containing ALL query words in any order and position.
+    /// This is more useful for free-text queries from external callers.
+    pub fn search_terms(&self, query: &str, limit: i32) -> Result<Vec<KnowledgeNode>> {
+        use crate::fts::sanitize_fts5_terms;
+        let Some(terms) = sanitize_fts5_terms(query) else {
+            return Ok(vec![]);
+        };
+
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT n.* FROM knowledge_nodes n
+             JOIN knowledge_fts fts ON n.id = fts.id
+             WHERE knowledge_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+
+        let nodes = stmt.query_map(params![terms, limit], Self::row_to_node)?;
+
+        let mut result = Vec::new();
+        for node in nodes {
+            result.push(node?);
+        }
+        Ok(result)
+    }
+
+    /// Concrete keyword/literal search that skips semantic expansion and
+    /// cognitive reranking.
+    ///
+    /// This path is for identifiers, paths, quoted strings, env vars, UUIDs,
+    /// and other exact user intent where "close enough" is wrong.
+    pub fn concrete_search_filtered(
+        &self,
+        query: &str,
+        limit: i32,
+        include_types: Option<&[String]>,
+        exclude_types: Option<&[String]>,
+    ) -> Result<Vec<SearchResult>> {
+        let literal = Self::normalize_literal_query(query);
+        if literal.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let limit = limit.max(1) as usize;
+        let fetch_limit = ((limit * 10).min(500)) as i32;
+        let mut by_id: HashMap<String, SearchResult> = HashMap::new();
+
+        if let Some(terms) = crate::fts::sanitize_fts5_terms(&literal) {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT n.*, rank AS fts_rank FROM knowledge_nodes n
+                 JOIN knowledge_fts fts ON n.id = fts.id
+                 WHERE knowledge_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )?;
+
+            let rows = stmt.query_map(params![terms, fetch_limit], |row| {
+                let node = Self::row_to_node(row)?;
+                let rank = row.get::<_, f64>("fts_rank").unwrap_or(0.0);
+                Ok((node, rank))
+            })?;
+
+            for (idx, row) in rows.enumerate() {
+                let (node, rank) = row?;
+                if !Self::node_matches_type_filters(&node, include_types, exclude_types) {
+                    continue;
+                }
+                let base_score = (1.0 / (idx as f32 + 1.0)).max((-rank as f32).max(0.0));
+                Self::upsert_concrete_result(&mut by_id, node, base_score, Some(base_score));
+            }
+        }
+
+        let escaped = Self::escape_like(&literal.to_lowercase());
+        let pattern = format!("%{}%", escaped);
+        let prefix_pattern = format!("{}%", escaped);
+        {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT n.* FROM knowledge_nodes n
+                 WHERE lower(n.id) = ?2
+                    OR lower(n.content) LIKE ?1 ESCAPE '\\'
+                    OR lower(COALESCE(n.source, '')) LIKE ?1 ESCAPE '\\'
+                    OR lower(n.tags) LIKE ?1 ESCAPE '\\'
+                 ORDER BY
+                    CASE
+                        WHEN lower(n.id) = ?2 THEN 0
+                        WHEN lower(n.content) = ?2 THEN 1
+                        WHEN lower(n.content) LIKE ?3 ESCAPE '\\' THEN 2
+                        ELSE 3
+                    END,
+                    n.updated_at DESC
+                 LIMIT ?4",
+            )?;
+
+            let rows = stmt.query_map(
+                params![pattern, literal.to_lowercase(), prefix_pattern, fetch_limit],
+                Self::row_to_node,
+            )?;
+
+            for row in rows {
+                let node = row?;
+                if !Self::node_matches_type_filters(&node, include_types, exclude_types) {
+                    continue;
+                }
+                if let Some(score) = Self::literal_match_score(&literal, &node) {
+                    Self::upsert_concrete_result(&mut by_id, node, score, Some(score));
+                }
+            }
+        }
+
+        let mut results: Vec<SearchResult> = by_id.into_values().collect();
+        results.sort_by(|a, b| {
+            b.combined_score
+                .partial_cmp(&a.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.node.updated_at.cmp(&a.node.updated_at))
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    fn upsert_concrete_result(
+        by_id: &mut HashMap<String, SearchResult>,
+        node: KnowledgeNode,
+        score: f32,
+        keyword_score: Option<f32>,
+    ) {
+        by_id
+            .entry(node.id.clone())
+            .and_modify(|existing| {
+                existing.combined_score = existing.combined_score.max(score);
+                existing.keyword_score = match (existing.keyword_score, keyword_score) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (None, Some(b)) => Some(b),
+                    (a, None) => a,
+                };
+            })
+            .or_insert(SearchResult {
+                node,
+                keyword_score,
+                semantic_score: None,
+                combined_score: score,
+                match_type: MatchType::Keyword,
+            });
+    }
+
+    fn normalize_literal_query(query: &str) -> String {
+        let trimmed = query.trim();
+        if trimmed.len() >= 2 {
+            let bytes = trimmed.as_bytes();
+            let quoted = (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+                || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'');
+            if quoted {
+                return trimmed[1..trimmed.len() - 1].trim().to_string();
+            }
+        }
+        trimmed.to_string()
+    }
+
+    fn escape_like(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '\\' | '%' | '_' => {
+                    escaped.push('\\');
+                    escaped.push(ch);
+                }
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
+    }
+
+    fn literal_match_score(query: &str, node: &KnowledgeNode) -> Option<f32> {
+        let q = query.to_lowercase();
+        let content = node.content.to_lowercase();
+        let tags = node.tags.join(" ").to_lowercase();
+        let source = node.source.as_deref().unwrap_or("").to_lowercase();
+        let id = node.id.to_lowercase();
+
+        if id == q {
+            Some(3.0)
+        } else if content == q {
+            Some(2.5)
+        } else if content.starts_with(&q) {
+            Some(2.0)
+        } else if content.contains(&q) {
+            Some(1.6)
+        } else if source.contains(&q) {
+            Some(1.4)
+        } else if tags.contains(&q) {
+            Some(1.2)
+        } else {
+            None
+        }
+    }
+
+    fn node_matches_type_filters(
+        node: &KnowledgeNode,
+        include_types: Option<&[String]>,
+        exclude_types: Option<&[String]>,
+    ) -> bool {
+        if let Some(includes) = include_types
+            && !includes.is_empty()
+        {
+            return includes.iter().any(|t| t == &node.node_type);
+        }
+        if let Some(excludes) = exclude_types
+            && !excludes.is_empty()
+        {
+            return !excludes.iter().any(|t| t == &node.node_type);
+        }
+        true
     }
 
     /// Get all nodes (paginated)
@@ -1620,15 +2359,16 @@ impl Storage {
     }
 
     /// Get query embedding from cache or compute it
-    #[cfg(feature = "embeddings")]
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn get_query_embedding(&self, query: &str) -> Result<Vec<f32>> {
+        let cache_key = format!("{}\0{}", self.embedding_service.model_name(), query);
         // Check cache first
         {
             let mut cache = self
                 .query_cache
                 .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
-            if let Some(cached) = cache.get(query) {
+            if let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached.clone());
             }
         }
@@ -1636,7 +2376,7 @@ impl Storage {
         // Not in cache, compute embedding
         let embedding = self
             .embedding_service
-            .embed(query)
+            .embed_query(query)
             .map_err(|e| StorageError::Init(format!("Failed to embed query: {}", e)))?;
 
         // Store in cache
@@ -1645,7 +2385,7 @@ impl Storage {
                 .query_cache
                 .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
-            cache.put(query.to_string(), embedding.vector.clone());
+            cache.put(cache_key, embedding.vector.clone());
         }
 
         Ok(embedding.vector)
@@ -1832,6 +2572,60 @@ impl Storage {
         Ok(results)
     }
 
+    /// Keyword-only fallback for builds without local embeddings/vector search.
+    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    pub fn hybrid_search(
+        &self,
+        query: &str,
+        limit: i32,
+        _keyword_weight: f32,
+        _semantic_weight: f32,
+    ) -> Result<Vec<SearchResult>> {
+        self.hybrid_search_filtered(query, limit, 1.0, 0.0, None, None)
+    }
+
+    /// Keyword-only fallback for builds without local embeddings/vector search.
+    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    pub fn hybrid_search_filtered(
+        &self,
+        query: &str,
+        limit: i32,
+        _keyword_weight: f32,
+        _semantic_weight: f32,
+        include_types: Option<&[String]>,
+        exclude_types: Option<&[String]>,
+    ) -> Result<Vec<SearchResult>> {
+        let nodes = self.search_terms(query, limit.max(1) * 4)?;
+        let mut results = Vec::new();
+
+        for node in nodes {
+            if let Some(includes) = include_types {
+                if !includes.iter().any(|t| t == &node.node_type) {
+                    continue;
+                }
+            } else if let Some(excludes) = exclude_types
+                && excludes.iter().any(|t| t == &node.node_type)
+            {
+                continue;
+            }
+
+            let score = 1.0 / (results.len() as f32 + 1.0);
+            results.push(SearchResult {
+                node,
+                keyword_score: Some(score),
+                semantic_score: None,
+                combined_score: score,
+                match_type: MatchType::Keyword,
+            });
+
+            if results.len() >= limit.max(1) as usize {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Keyword search returning scores, with optional type filtering in the SQL query.
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn keyword_search_with_scores(
@@ -1841,7 +2635,12 @@ impl Storage {
         include_types: Option<&[String]>,
         exclude_types: Option<&[String]>,
     ) -> Result<Vec<(String, f32)>> {
-        let sanitized_query = sanitize_fts5_query(query);
+        // Use individual-term matching (implicit AND) so multi-word queries find
+        // documents where all words appear anywhere, not just as adjacent phrases.
+        use crate::fts::sanitize_fts5_terms;
+        let Some(terms_query) = sanitize_fts5_terms(query) else {
+            return Ok(vec![]);
+        };
 
         // Build the type filter clause and collect parameter values.
         // We use numbered parameters: ?1 = query, ?2 = limit, ?3.. = type strings.
@@ -1887,7 +2686,7 @@ impl Storage {
 
         // Build the parameter list: [query, limit, ...type_values]
         let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        param_values.push(Box::new(sanitized_query.clone()));
+        param_values.push(Box::new(terms_query));
         param_values.push(Box::new(limit));
         for tv in &type_values {
             param_values.push(Box::new(tv.to_string()));
@@ -1971,66 +2770,30 @@ impl Storage {
         }
 
         let mut result = EmbeddingResult::default();
+        let active_model = self.embedding_service.model_name();
+        let nodes = self.embedding_regeneration_candidates(node_ids, force)?;
 
-        let nodes: Vec<(String, String)> = {
-            let reader = self
-                .reader
-                .lock()
-                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-            if let Some(ids) = node_ids {
-                let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let query = format!(
-                    "SELECT id, content FROM knowledge_nodes WHERE id IN ({})",
-                    placeholders
-                );
-
-                let mut result_nodes = Vec::new();
-                {
-                    let mut stmt = reader.prepare(&query)?;
-                    let params: Vec<&dyn rusqlite::ToSql> =
-                        ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-
-                    let rows = stmt.query_map(params.as_slice(), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?;
-
-                    for r in rows.flatten() {
-                        result_nodes.push(r);
-                    }
-                }
-                result_nodes
-            } else if force {
-                let mut stmt = reader.prepare("SELECT id, content FROM knowledge_nodes")?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                rows.filter_map(|r| r.ok()).collect()
-            } else {
-                let mut stmt = reader.prepare(
-                    "SELECT id, content FROM knowledge_nodes
-                         WHERE has_embedding = 0 OR has_embedding IS NULL",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                rows.filter_map(|r| r.ok()).collect()
-            }
-        };
-
-        for (id, content) in nodes {
+        for (id, content, stored_model) in nodes {
             if !force {
-                let has_emb: i32 = self
+                let (has_emb, stored_model): (i32, Option<String>) = self
                     .reader
                     .lock()
                     .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?
                     .query_row(
-                        "SELECT COALESCE(has_embedding, 0) FROM knowledge_nodes WHERE id = ?1",
-                        params![id],
-                        |row| row.get(0),
+                        "SELECT COALESCE(kn.has_embedding, 0), COALESCE(ne.model, kn.embedding_model)
+                         FROM knowledge_nodes kn
+                         LEFT JOIN node_embeddings ne ON ne.node_id = kn.id
+                         WHERE kn.id = ?1",
+                        params![&id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
-                    .unwrap_or(0);
+                    .unwrap_or((0, stored_model));
 
-                if has_emb == 1 {
+                if has_emb == 1
+                    && stored_model.as_deref().is_some_and(|model| {
+                        Self::embedding_model_matches_active(model, active_model)
+                    })
+                {
                     result.skipped += 1;
                     continue;
                 }
@@ -2046,6 +2809,78 @@ impl Storage {
         }
 
         Ok(result)
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn embedding_regeneration_candidates(
+        &self,
+        node_ids: Option<&[String]>,
+        force: bool,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+
+        if let Some(ids) = node_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let query = format!(
+                "SELECT kn.id, kn.content, COALESCE(ne.model, kn.embedding_model) AS embedding_model
+                 FROM knowledge_nodes kn
+                 LEFT JOIN node_embeddings ne ON ne.node_id = kn.id
+                 WHERE kn.id IN ({})",
+                placeholders
+            );
+
+            let mut stmt = reader.prepare(&query)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            return Ok(rows.filter_map(|r| r.ok()).collect());
+        }
+
+        if force {
+            let mut stmt =
+                reader.prepare("SELECT id, content, embedding_model FROM knowledge_nodes")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+            return Ok(rows.filter_map(|r| r.ok()).collect());
+        }
+
+        let active_model = self.embedding_service.model_name();
+        let model_pattern = Self::active_embedding_model_like_pattern(active_model);
+        let mut stmt = reader.prepare(
+            "SELECT kn.id, kn.content, COALESCE(ne.model, kn.embedding_model) AS embedding_model
+             FROM knowledge_nodes kn
+             LEFT JOIN node_embeddings ne ON ne.node_id = kn.id
+             WHERE kn.has_embedding = 0
+                OR kn.has_embedding IS NULL
+                OR ne.node_id IS NULL
+                OR COALESCE(ne.model, kn.embedding_model, '') NOT LIKE ?1",
+        )?;
+        let rows = stmt.query_map(params![model_pattern], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Query memories valid at a specific time
@@ -2321,7 +3156,8 @@ impl Storage {
             }
         }
 
-        // 3. Generate missing embeddings
+        // 3. Generate missing and model-mismatched embeddings.
+        // This must drain the whole set so embedder upgrades do not strand v1 corpora.
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         let embeddings_generated = self.generate_missing_embeddings()?;
         #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
@@ -2875,7 +3711,7 @@ impl Storage {
         Ok(Some(optimized_w20))
     }
 
-    /// Generate missing embeddings
+    /// Generate all missing or active-model-mismatched embeddings.
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn generate_missing_embeddings(&self) -> Result<i64> {
         if !self.embedding_service.is_ready()
@@ -2885,33 +3721,15 @@ impl Storage {
             return Ok(0);
         }
 
-        let nodes: Vec<(String, String)> = {
-            let reader = self
-                .reader
-                .lock()
-                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
-            reader
-                .prepare(
-                    "SELECT id, content FROM knowledge_nodes
-                     WHERE has_embedding = 0 OR has_embedding IS NULL
-                     LIMIT 100",
-                )?
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        let mut count = 0i64;
-
-        for (id, content) in nodes {
-            if let Err(e) = self.generate_embedding_for_node(&id, &content) {
-                tracing::warn!("Failed to generate embedding for {}: {}", id, e);
-            } else {
-                count += 1;
-            }
+        let result = self.generate_embeddings(None, false)?;
+        if result.failed > 0 {
+            tracing::warn!(
+                failed = result.failed,
+                "Some embeddings could not be regenerated during consolidation"
+            );
         }
 
-        Ok(count)
+        Ok(result.successful)
     }
 }
 
@@ -3826,19 +4644,14 @@ impl Storage {
         Ok(count)
     }
 
-    /// Get last backup timestamp by scanning the backups directory.
-    /// Parses `vestige-YYYYMMDD-HHMMSS.db` filenames.
-    pub fn get_last_backup_timestamp() -> Option<DateTime<Utc>> {
-        let proj_dirs = directories::ProjectDirs::from("com", "vestige", "core")?;
-        let backup_dir = proj_dirs.data_dir().parent()?.join("backups");
-
+    fn scan_last_backup_timestamp(backup_dir: &Path) -> Option<DateTime<Utc>> {
         if !backup_dir.exists() {
             return None;
         }
 
         let mut latest: Option<DateTime<Utc>> = None;
 
-        if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+        if let Ok(entries) = std::fs::read_dir(backup_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
@@ -3858,6 +4671,1034 @@ impl Storage {
         }
 
         latest
+    }
+
+    /// Get last backup timestamp for this storage instance.
+    /// Parses `vestige-YYYYMMDD-HHMMSS.db` filenames.
+    pub fn last_backup_timestamp(&self) -> Option<DateTime<Utc>> {
+        Self::scan_last_backup_timestamp(&self.sidecar_dir("backups"))
+    }
+
+    /// Get last backup timestamp in the default backups directory.
+    /// Kept for compatibility with older callers.
+    pub fn get_last_backup_timestamp() -> Option<DateTime<Utc>> {
+        let backup_dir = Self::default_db_path().ok()?.parent()?.join("backups");
+        Self::scan_last_backup_timestamp(&backup_dir)
+    }
+
+    /// Export an exact portable archive preserving raw Vestige storage rows.
+    ///
+    /// Unlike the user-facing JSON export, this preserves IDs, timestamps,
+    /// FSRS state, graph edges, suppression state, history tables, and raw
+    /// embedding blobs. It is intended for Vestige-to-Vestige device transfer.
+    pub fn export_portable_archive(&self) -> Result<PortableArchive> {
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let tx = reader.transaction()?;
+
+        let schema_version = Self::current_schema_version(&tx)?;
+        let mut tables = Vec::new();
+
+        for table_name in PORTABLE_TABLES {
+            if !Self::table_exists(&tx, table_name)? {
+                continue;
+            }
+
+            let quoted_table = Self::quote_ident(table_name);
+            let mut stmt = tx.prepare(&format!("SELECT * FROM {} ORDER BY rowid", quoted_table))?;
+            let columns: Vec<String> = stmt
+                .column_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+            let column_count = columns.len();
+
+            let rows = stmt.query_map([], |row| {
+                let mut values = Vec::with_capacity(column_count);
+                for idx in 0..column_count {
+                    values.push(Self::portable_value_from_ref(row.get_ref(idx)?)?);
+                }
+                Ok(values)
+            })?;
+
+            let mut portable_rows = Vec::new();
+            for row in rows {
+                portable_rows.push(row?);
+            }
+
+            tables.push(PortableTable {
+                name: (*table_name).to_string(),
+                columns,
+                rows: portable_rows,
+            });
+        }
+
+        let archive = PortableArchive {
+            archive_format: PORTABLE_ARCHIVE_FORMAT.to_string(),
+            vestige_version: crate::VERSION.to_string(),
+            schema_version,
+            exported_at: Utc::now(),
+            mode: "exact".to_string(),
+            tables,
+        };
+        tx.commit()?;
+        Ok(archive)
+    }
+
+    /// Write an exact portable archive to a JSON file.
+    pub fn export_portable_archive_to_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<PortableArchive> {
+        let archive = self.export_portable_archive()?;
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("vestige-portable.json");
+        let temp_path = parent.join(format!(".{}.tmp-{}", filename, Uuid::new_v4()));
+
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::create(&temp_path)?;
+        if let Err(e) = serde_json::to_writer_pretty(&mut file, &archive) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(StorageError::Init(format!(
+                "Failed to write portable archive: {}",
+                e
+            )));
+        }
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+
+        if let Err(rename_err) = std::fs::rename(&temp_path, path) {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+                std::fs::rename(&temp_path, path)?;
+            } else {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(rename_err.into());
+            }
+        }
+        Ok(archive)
+    }
+
+    /// Import an exact portable archive.
+    ///
+    /// `EmptyOnly` preserves the conservative migration path. `Merge` is used
+    /// by portable sync to combine non-empty databases with tombstones and
+    /// newer-local conflict handling.
+    pub fn import_portable_archive(
+        &self,
+        archive: &PortableArchive,
+        mode: PortableImportMode,
+    ) -> Result<PortableImportReport> {
+        if archive.archive_format != PORTABLE_ARCHIVE_FORMAT {
+            return Err(StorageError::Init(format!(
+                "Unsupported portable archive format '{}'",
+                archive.archive_format
+            )));
+        }
+        if archive.mode != "exact" {
+            return Err(StorageError::Init(format!(
+                "Unsupported portable archive mode '{}'",
+                archive.mode
+            )));
+        }
+
+        let mut seen_tables = std::collections::HashSet::new();
+        let mut tables_by_name = std::collections::HashMap::new();
+        for table in &archive.tables {
+            if !PORTABLE_TABLES.contains(&table.name.as_str()) {
+                return Err(StorageError::Init(format!(
+                    "Portable archive contains unsupported table '{}'",
+                    table.name
+                )));
+            }
+            if !seen_tables.insert(table.name.as_str()) {
+                return Err(StorageError::Init(format!(
+                    "Portable archive contains duplicate table '{}'",
+                    table.name
+                )));
+            }
+            tables_by_name.insert(table.name.as_str(), table);
+        }
+
+        let mut report = PortableImportReport {
+            tables_imported: 0,
+            rows_imported: 0,
+            tables_skipped: 0,
+            fts_rebuilt: false,
+            rows_inserted: 0,
+            rows_updated: 0,
+            rows_skipped: 0,
+            rows_deleted: 0,
+            conflicts_kept_local: 0,
+        };
+
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+
+            let current_schema = Self::current_schema_version(&writer)?;
+            if archive.schema_version > current_schema {
+                return Err(StorageError::Init(format!(
+                    "Archive schema version {} is newer than this Vestige database schema {}",
+                    archive.schema_version, current_schema
+                )));
+            }
+
+            match mode {
+                PortableImportMode::EmptyOnly => {
+                    Self::ensure_portable_import_target_empty(&writer)?
+                }
+                PortableImportMode::Merge => {}
+            }
+
+            let tx = writer.transaction()?;
+            let mut merge_state = PortableMergeState::default();
+
+            for table_name in PORTABLE_TABLES {
+                let Some(table) = tables_by_name.get(table_name) else {
+                    continue;
+                };
+
+                if !Self::table_exists(&tx, table_name)? {
+                    report.tables_skipped += 1;
+                    continue;
+                }
+
+                if mode == PortableImportMode::Merge {
+                    Self::merge_portable_table(
+                        &tx,
+                        table_name,
+                        table,
+                        &mut report,
+                        &mut merge_state,
+                    )?;
+                    report.tables_imported += 1;
+                    continue;
+                }
+
+                let target_columns = Self::table_columns(&tx, table_name)?;
+                let mut insert_columns = Vec::new();
+                let mut source_indexes = Vec::new();
+
+                for (idx, column) in table.columns.iter().enumerate() {
+                    if target_columns.iter().any(|target| target == column) {
+                        insert_columns.push(column.clone());
+                        source_indexes.push(idx);
+                    }
+                }
+
+                if insert_columns.is_empty() {
+                    report.tables_skipped += 1;
+                    continue;
+                }
+
+                let quoted_table = Self::quote_ident(table_name);
+                let quoted_columns = insert_columns
+                    .iter()
+                    .map(|column| Self::quote_ident(column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let placeholders = std::iter::repeat_n("?", insert_columns.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let verb = if *table_name == "fsrs_config" {
+                    "INSERT OR REPLACE"
+                } else {
+                    "INSERT"
+                };
+                let sql = format!(
+                    "{} INTO {} ({}) VALUES ({})",
+                    verb, quoted_table, quoted_columns, placeholders
+                );
+
+                for row in &table.rows {
+                    if row.len() != table.columns.len() {
+                        return Err(StorageError::Init(format!(
+                            "Portable archive row in table '{}' has {} values for {} columns",
+                            table_name,
+                            row.len(),
+                            table.columns.len()
+                        )));
+                    }
+
+                    let values = source_indexes
+                        .iter()
+                        .map(|idx| row[*idx].to_sql_value())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|e| {
+                            StorageError::Init(format!("Invalid portable value: {}", e))
+                        })?;
+                    tx.execute(&sql, params_from_iter(values))?;
+                    report.rows_imported += 1;
+                    report.rows_inserted += 1;
+                }
+
+                report.tables_imported += 1;
+            }
+
+            if Self::table_exists(&tx, "knowledge_fts")? {
+                tx.execute(
+                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')",
+                    [],
+                )?;
+                report.fts_rebuilt = true;
+            }
+
+            tx.commit()?;
+        }
+
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        self.load_embeddings_into_index()?;
+
+        Ok(report)
+    }
+
+    /// Read and import an exact portable archive JSON file.
+    pub fn import_portable_archive_from_path(
+        &self,
+        path: &std::path::Path,
+        mode: PortableImportMode,
+    ) -> Result<PortableImportReport> {
+        let file = std::fs::File::open(path)?;
+        let archive: PortableArchive = serde_json::from_reader(file)
+            .map_err(|e| StorageError::Init(format!("Failed to parse portable archive: {}", e)))?;
+        self.import_portable_archive(&archive, mode)
+    }
+
+    /// Synchronize this database with a pluggable portable archive backend.
+    ///
+    /// Sync is pull-merge-push:
+    /// 1. read remote archive if present,
+    /// 2. merge it into the local database using tombstones and conflict rules,
+    /// 3. export the merged local database,
+    /// 4. write the archive back through the backend.
+    pub fn sync_portable_archive<B: PortableSyncBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<PortableSyncReport> {
+        let (pulled, pull) = match backend.read_archive()? {
+            Some(remote) => (
+                true,
+                Some(self.import_portable_archive(&remote, PortableImportMode::Merge)?),
+            ),
+            None => (false, None),
+        };
+
+        let archive = self.export_portable_archive()?;
+        let pushed_tables = archive.tables.len();
+        let pushed_rows = archive.total_rows();
+        let archive_format = archive.archive_format.clone();
+        backend.write_archive(&archive)?;
+
+        Ok(PortableSyncReport {
+            backend: backend.label(),
+            pulled,
+            pull,
+            pushed_tables,
+            pushed_rows,
+            archive_format,
+        })
+    }
+
+    /// Synchronize this database with a file-backed portable archive.
+    pub fn sync_portable_archive_file(&self, path: &std::path::Path) -> Result<PortableSyncReport> {
+        let backend = FilePortableSyncBackend::new(path);
+        self.sync_portable_archive(&backend)
+    }
+
+    fn merge_portable_table(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        table: &PortableTable,
+        report: &mut PortableImportReport,
+        state: &mut PortableMergeState,
+    ) -> Result<()> {
+        match table_name {
+            "sync_tombstones" => Self::merge_sync_tombstones(tx, table, report),
+            "knowledge_nodes" => Self::merge_knowledge_nodes(tx, table, report, state),
+            "memory_access_log"
+            | "state_transitions"
+            | "consolidation_history"
+            | "dream_history"
+            | "retention_snapshots" => Self::merge_append_only_table(tx, table_name, table, report),
+            "node_embeddings" => {
+                Self::merge_keyed_table(tx, table_name, table, &["node_id"], report, state)
+            }
+            "fsrs_cards" | "memory_states" => {
+                Self::merge_keyed_table(tx, table_name, table, &["memory_id"], report, state)
+            }
+            "deletion_tombstones" => Self::merge_deletion_tombstones(tx, table, report),
+            "memory_connections" => Self::merge_keyed_table(
+                tx,
+                table_name,
+                table,
+                &["source_id", "target_id"],
+                report,
+                state,
+            ),
+            "intentions" | "insights" | "sessions" => {
+                Self::merge_keyed_table(tx, table_name, table, &["id"], report, state)
+            }
+            "fsrs_config" => {
+                Self::merge_keyed_table(tx, table_name, table, &["key"], report, state)
+            }
+            _ => {
+                report.tables_skipped += 1;
+                Ok(())
+            }
+        }
+    }
+
+    fn merge_knowledge_nodes(
+        tx: &rusqlite::Transaction<'_>,
+        table: &PortableTable,
+        report: &mut PortableImportReport,
+        state: &mut PortableMergeState,
+    ) -> Result<()> {
+        for row in &table.rows {
+            let Some(id) = Self::portable_text(table, row, "id") else {
+                report.rows_skipped += 1;
+                continue;
+            };
+            let incoming_updated = Self::portable_timestamp(table, row, "updated_at");
+
+            if let Some(deleted_at) = Self::tombstone_timestamp(tx, "knowledge_nodes", id)?
+                && incoming_updated.is_some_and(|updated| deleted_at >= updated)
+            {
+                report.conflicts_kept_local += 1;
+                report.rows_skipped += 1;
+                continue;
+            }
+
+            let existing_updated: Option<String> = tx
+                .query_row(
+                    "SELECT updated_at FROM knowledge_nodes WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let (Some(existing), Some(incoming)) = (
+                existing_updated
+                    .as_deref()
+                    .and_then(Self::parse_rfc3339_opt),
+                incoming_updated,
+            ) && existing > incoming
+            {
+                state.locally_newer_nodes.insert(id.to_string());
+                report.conflicts_kept_local += 1;
+                report.rows_skipped += 1;
+                continue;
+            }
+
+            let affected = Self::insert_or_replace_row(tx, "knowledge_nodes", table, row)?;
+            report.rows_imported += 1;
+            if affected == MergeWrite::Inserted {
+                report.rows_inserted += 1;
+            } else {
+                report.rows_updated += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_sync_tombstones(
+        tx: &rusqlite::Transaction<'_>,
+        table: &PortableTable,
+        report: &mut PortableImportReport,
+    ) -> Result<()> {
+        for row in &table.rows {
+            let Some(table_name) = Self::portable_text(table, row, "table_name") else {
+                report.rows_skipped += 1;
+                continue;
+            };
+            let Some(row_id) = Self::portable_text(table, row, "row_id") else {
+                report.rows_skipped += 1;
+                continue;
+            };
+            let incoming_deleted_at = Self::portable_timestamp(table, row, "deleted_at");
+            let incoming_reason = Self::portable_text(table, row, "reason").map(ToOwned::to_owned);
+
+            let existing_tombstone: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT deleted_at, reason FROM sync_tombstones WHERE table_name = ?1 AND row_id = ?2",
+                    params![table_name, row_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let existing_deleted_at = existing_tombstone
+                .as_ref()
+                .and_then(|(deleted_at, _)| Self::parse_rfc3339_opt(deleted_at));
+            let incoming_wins = match (existing_deleted_at, incoming_deleted_at) {
+                (Some(existing), Some(incoming)) => incoming >= existing,
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+
+            let (effective_deleted_at, effective_reason) = if incoming_wins {
+                let affected = Self::insert_or_replace_row(tx, "sync_tombstones", table, row)?;
+                report.rows_imported += 1;
+                if affected == MergeWrite::Inserted {
+                    report.rows_inserted += 1;
+                } else {
+                    report.rows_updated += 1;
+                }
+                (incoming_deleted_at, incoming_reason)
+            } else {
+                report.rows_skipped += 1;
+                (
+                    existing_deleted_at,
+                    existing_tombstone.and_then(|(_, reason)| reason),
+                )
+            };
+
+            if table_name == "knowledge_nodes" {
+                let local_updated: Option<String> = tx
+                    .query_row(
+                        "SELECT updated_at FROM knowledge_nodes WHERE id = ?1",
+                        params![row_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let should_delete = match (
+                    local_updated.as_deref().and_then(Self::parse_rfc3339_opt),
+                    effective_deleted_at,
+                ) {
+                    (Some(local), Some(deleted)) => {
+                        effective_reason.as_deref() == Some("purge_node") || deleted >= local
+                    }
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if should_delete {
+                    let deleted =
+                        tx.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![row_id])?;
+                    report.rows_deleted += deleted;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_deletion_tombstones(
+        tx: &rusqlite::Transaction<'_>,
+        table: &PortableTable,
+        report: &mut PortableImportReport,
+    ) -> Result<()> {
+        for row in &table.rows {
+            let Some(memory_id) = Self::portable_text(table, row, "memory_id") else {
+                report.rows_skipped += 1;
+                continue;
+            };
+            let incoming_deleted_at = Self::portable_timestamp(table, row, "deleted_at");
+            let existing_deleted_at: Option<String> = tx
+                .query_row(
+                    "SELECT deleted_at FROM deletion_tombstones WHERE memory_id = ?1",
+                    params![memory_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let (Some(existing), Some(incoming)) = (
+                existing_deleted_at
+                    .as_deref()
+                    .and_then(Self::parse_rfc3339_opt),
+                incoming_deleted_at,
+            ) && existing > incoming
+            {
+                report.rows_skipped += 1;
+                continue;
+            }
+
+            let affected = Self::insert_or_replace_row(tx, "deletion_tombstones", table, row)?;
+            report.rows_imported += 1;
+            if affected == MergeWrite::Inserted {
+                report.rows_inserted += 1;
+            } else {
+                report.rows_updated += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_keyed_table(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        table: &PortableTable,
+        key_columns: &[&str],
+        report: &mut PortableImportReport,
+        state: &PortableMergeState,
+    ) -> Result<()> {
+        for row in &table.rows {
+            if !Self::parent_rows_exist(tx, table_name, table, row)? {
+                report.rows_skipped += 1;
+                continue;
+            }
+            if key_columns
+                .iter()
+                .any(|column| Self::portable_value(table, row, column).is_none())
+            {
+                report.rows_skipped += 1;
+                continue;
+            }
+            if Self::row_references_locally_newer_node(table_name, table, row, state) {
+                report.conflicts_kept_local += 1;
+                report.rows_skipped += 1;
+                continue;
+            }
+            let affected = Self::insert_or_replace_row(tx, table_name, table, row)?;
+            report.rows_imported += 1;
+            if affected == MergeWrite::Inserted {
+                report.rows_inserted += 1;
+            } else {
+                report.rows_updated += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn row_references_locally_newer_node(
+        table_name: &str,
+        table: &PortableTable,
+        row: &[PortableValue],
+        state: &PortableMergeState,
+    ) -> bool {
+        match table_name {
+            "node_embeddings" => Self::portable_text(table, row, "node_id")
+                .is_some_and(|id| state.locally_newer_nodes.contains(id)),
+            "fsrs_cards" | "memory_states" => Self::portable_text(table, row, "memory_id")
+                .is_some_and(|id| state.locally_newer_nodes.contains(id)),
+            "memory_connections" => {
+                Self::portable_text(table, row, "source_id")
+                    .is_some_and(|id| state.locally_newer_nodes.contains(id))
+                    || Self::portable_text(table, row, "target_id")
+                        .is_some_and(|id| state.locally_newer_nodes.contains(id))
+            }
+            _ => false,
+        }
+    }
+
+    fn merge_append_only_table(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        table: &PortableTable,
+        report: &mut PortableImportReport,
+    ) -> Result<()> {
+        for row in &table.rows {
+            if !Self::parent_rows_exist(tx, table_name, table, row)? {
+                report.rows_skipped += 1;
+                continue;
+            }
+
+            let insert_columns: Vec<String> = table
+                .columns
+                .iter()
+                .filter(|column| column.as_str() != "id")
+                .cloned()
+                .collect();
+            if insert_columns.is_empty() {
+                report.rows_skipped += 1;
+                continue;
+            }
+
+            let values = Self::row_values_for_columns(table, row, &insert_columns)?;
+            if Self::row_exists_by_values(tx, table_name, &insert_columns, &values)? {
+                report.rows_skipped += 1;
+                continue;
+            }
+
+            Self::insert_row_with_columns(tx, table_name, &insert_columns, values)?;
+            report.rows_imported += 1;
+            report.rows_inserted += 1;
+        }
+        Ok(())
+    }
+
+    fn parent_rows_exist(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        table: &PortableTable,
+        row: &[PortableValue],
+    ) -> Result<bool> {
+        match table_name {
+            "node_embeddings" | "memory_access_log" => Self::portable_text(table, row, "node_id")
+                .map(|id| Self::node_exists(tx, id))
+                .transpose()
+                .map(|v| v.unwrap_or(false)),
+            "fsrs_cards" | "memory_states" | "state_transitions" => {
+                Self::portable_text(table, row, "memory_id")
+                    .map(|id| Self::node_exists(tx, id))
+                    .transpose()
+                    .map(|v| v.unwrap_or(false))
+            }
+            "memory_connections" => {
+                let source_exists = Self::portable_text(table, row, "source_id")
+                    .map(|id| Self::node_exists(tx, id))
+                    .transpose()?
+                    .unwrap_or(false);
+                let target_exists = Self::portable_text(table, row, "target_id")
+                    .map(|id| Self::node_exists(tx, id))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(source_exists && target_exists)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn insert_or_replace_row(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        table: &PortableTable,
+        row: &[PortableValue],
+    ) -> Result<MergeWrite> {
+        let key_exists = Self::merge_row_exists(tx, table_name, table, row)?;
+        let values = Self::row_values_for_columns(table, row, &table.columns)?;
+        Self::upsert_row_with_columns(tx, table_name, &table.columns, values)?;
+        Ok(if key_exists {
+            MergeWrite::Updated
+        } else {
+            MergeWrite::Inserted
+        })
+    }
+
+    fn merge_key_columns(table_name: &str) -> &'static [&'static str] {
+        match table_name {
+            "knowledge_nodes" | "intentions" | "insights" | "sessions" => &["id"],
+            "node_embeddings" => &["node_id"],
+            "fsrs_cards" | "memory_states" | "deletion_tombstones" => &["memory_id"],
+            "memory_connections" => &["source_id", "target_id"],
+            "fsrs_config" => &["key"],
+            "sync_tombstones" => &["table_name", "row_id"],
+            _ => &[],
+        }
+    }
+
+    fn upsert_row_with_columns(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        columns: &[String],
+        values: Vec<Value>,
+    ) -> Result<()> {
+        let key_columns = Self::merge_key_columns(table_name);
+        if key_columns.is_empty() {
+            return Self::insert_row_with_columns(tx, table_name, columns, values);
+        }
+
+        let quoted_table = Self::quote_ident(table_name);
+        let quoted_columns = columns
+            .iter()
+            .map(|column| Self::quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = std::iter::repeat_n("?", columns.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conflict_target = key_columns
+            .iter()
+            .map(|column| Self::quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_columns = columns
+            .iter()
+            .filter(|column| !key_columns.iter().any(|key| key == &column.as_str()))
+            .map(|column| {
+                let quoted = Self::quote_ident(column);
+                format!("{quoted} = excluded.{quoted}")
+            })
+            .collect::<Vec<_>>();
+
+        let conflict_action = if update_columns.is_empty() {
+            "DO NOTHING".to_string()
+        } else {
+            format!("DO UPDATE SET {}", update_columns.join(", "))
+        };
+
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) {}",
+            quoted_table, quoted_columns, placeholders, conflict_target, conflict_action
+        );
+        tx.execute(&sql, params_from_iter(values))?;
+        Ok(())
+    }
+
+    fn insert_row_with_columns(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        columns: &[String],
+        values: Vec<Value>,
+    ) -> Result<()> {
+        let quoted_table = Self::quote_ident(table_name);
+        let quoted_columns = columns
+            .iter()
+            .map(|column| Self::quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = std::iter::repeat_n("?", columns.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+            quoted_table, quoted_columns, placeholders
+        );
+        tx.execute(&sql, params_from_iter(values))?;
+        Ok(())
+    }
+
+    fn merge_row_exists(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        table: &PortableTable,
+        row: &[PortableValue],
+    ) -> Result<bool> {
+        let key_columns = Self::merge_key_columns(table_name);
+        if key_columns.is_empty() {
+            return Ok(false);
+        }
+        let mut columns = Vec::new();
+        for key in key_columns {
+            columns.push((*key).to_string());
+        }
+        let values = Self::row_values_for_columns(table, row, &columns)?;
+        Self::row_exists_by_values(tx, table_name, &columns, &values)
+    }
+
+    fn row_exists_by_values(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        columns: &[String],
+        values: &[Value],
+    ) -> Result<bool> {
+        let quoted_table = Self::quote_ident(table_name);
+        let where_clause = columns
+            .iter()
+            .map(|column| format!("{} IS ?", Self::quote_ident(column)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {}",
+            quoted_table, where_clause
+        );
+        let count: i64 = tx.query_row(&sql, params_from_iter(values.iter()), |row| row.get(0))?;
+        Ok(count > 0)
+    }
+
+    fn row_values_for_columns(
+        table: &PortableTable,
+        row: &[PortableValue],
+        columns: &[String],
+    ) -> Result<Vec<Value>> {
+        columns
+            .iter()
+            .map(|column| {
+                Self::portable_value(table, row, column)
+                    .ok_or_else(|| {
+                        StorageError::Init(format!(
+                            "Portable archive row in table '{}' is missing column '{}'",
+                            table.name, column
+                        ))
+                    })?
+                    .to_sql_value()
+                    .map_err(|e| StorageError::Init(format!("Invalid portable value: {}", e)))
+            })
+            .collect()
+    }
+
+    fn portable_value<'a>(
+        table: &PortableTable,
+        row: &'a [PortableValue],
+        column: &str,
+    ) -> Option<&'a PortableValue> {
+        table
+            .columns
+            .iter()
+            .position(|name| name == column)
+            .and_then(|idx| row.get(idx))
+    }
+
+    fn portable_text<'a>(
+        table: &PortableTable,
+        row: &'a [PortableValue],
+        column: &str,
+    ) -> Option<&'a str> {
+        match Self::portable_value(table, row, column) {
+            Some(PortableValue::Text(value)) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn portable_timestamp(
+        table: &PortableTable,
+        row: &[PortableValue],
+        column: &str,
+    ) -> Option<DateTime<Utc>> {
+        Self::portable_text(table, row, column).and_then(Self::parse_rfc3339_opt)
+    }
+
+    fn parse_rfc3339_opt(value: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(value)
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok()
+    }
+
+    fn tombstone_timestamp(
+        tx: &rusqlite::Transaction<'_>,
+        table_name: &str,
+        row_id: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let deleted_at: Option<String> = tx
+            .query_row(
+                "SELECT deleted_at FROM sync_tombstones WHERE table_name = ?1 AND row_id = ?2",
+                params![table_name, row_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(deleted_at.as_deref().and_then(Self::parse_rfc3339_opt))
+    }
+
+    fn current_schema_version(conn: &Connection) -> Result<u32> {
+        let version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(version as u32)
+    }
+
+    fn ensure_portable_import_target_empty(conn: &Connection) -> Result<()> {
+        for table_name in PORTABLE_USER_DATA_TABLES {
+            if Self::table_exists(conn, table_name)? {
+                let count = Self::table_row_count(conn, table_name)?;
+                if count > 0 {
+                    return Err(StorageError::Init(format!(
+                        "Portable import requires an empty target database; table '{}' has {} rows",
+                        table_name, count
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
+            params![table_name],
+            |row| row.get(0),
+        )?;
+        Ok(exists > 0)
+    }
+
+    fn table_row_count(conn: &Connection, table_name: &str) -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) FROM {}", Self::quote_ident(table_name));
+        Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+    }
+
+    fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
+        let sql = format!("PRAGMA table_info({})", Self::quote_ident(table_name));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+        let mut columns = Vec::new();
+        for row in rows {
+            columns.push(row?);
+        }
+        Ok(columns)
+    }
+
+    fn portable_value_from_ref(value: ValueRef<'_>) -> rusqlite::Result<PortableValue> {
+        Ok(match value {
+            ValueRef::Null => PortableValue::Null,
+            ValueRef::Integer(value) => PortableValue::Integer(value),
+            ValueRef::Real(value) => PortableValue::Real(value),
+            ValueRef::Text(value) => PortableValue::Text(
+                std::str::from_utf8(value)
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(e))
+                    })?
+                    .to_string(),
+            ),
+            ValueRef::Blob(value) => PortableValue::Blob(encode_hex(value)),
+        })
+    }
+
+    fn quote_ident(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn embedding_model_matches_active(stored_model: &str, active_model: &str) -> bool {
+        if stored_model == active_model {
+            return true;
+        }
+
+        let stored = stored_model.to_ascii_lowercase();
+        let active = active_model.to_ascii_lowercase();
+
+        if active.contains("qwen3") {
+            return stored.contains("qwen3");
+        }
+
+        if active.contains("nomic-embed-text-v1.5") {
+            return stored.contains("nomic") && stored.contains("v1.5");
+        }
+
+        false
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn embedding_model_supports_matryoshka(model_name: &str) -> bool {
+        let model = model_name.to_ascii_lowercase();
+        model.contains("nomic") || model.contains("qwen3")
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn embedding_vector_for_active_model(
+        embedding_bytes: &[u8],
+        stored_model: &str,
+        active_model: &str,
+    ) -> Option<Vec<f32>> {
+        if !Self::embedding_model_matches_active(stored_model, active_model) {
+            return None;
+        }
+
+        let embedding = Embedding::from_bytes(embedding_bytes)?;
+        if embedding.dimensions == EMBEDDING_DIMENSIONS {
+            Some(embedding.vector)
+        } else if Self::embedding_model_supports_matryoshka(stored_model) {
+            Some(matryoshka_truncate(embedding.vector))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn active_embedding_model_like_pattern(active_model: &str) -> String {
+        let active = active_model.to_ascii_lowercase();
+        if active.contains("qwen3") {
+            "%qwen3%".to_string()
+        } else if active.contains("nomic-embed-text-v1.5") {
+            "%nomic%v1.5%".to_string()
+        } else {
+            active_model.to_string()
+        }
     }
 
     // ========================================================================
@@ -3916,6 +5757,13 @@ impl Storage {
             .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
         // VACUUM INTO doesn't support parameterized queries; escape single quotes
         reader.execute_batch(&format!("VACUUM INTO '{}'", path_str.replace('\'', "''")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
         Ok(())
     }
 
@@ -4040,8 +5888,7 @@ impl Storage {
     pub fn gc_below_retention(&self, threshold: f64, min_age_days: i64) -> Result<i64> {
         let cutoff = (Utc::now() - Duration::days(min_age_days)).to_rfc3339();
 
-        // Collect IDs first for vector index cleanup
-        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        // Collect IDs first for sync tombstones and vector index cleanup.
         let doomed_ids: Vec<String> = {
             let reader = self
                 .reader
@@ -4059,6 +5906,9 @@ impl Storage {
             .writer
             .lock()
             .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        for id in &doomed_ids {
+            Self::record_sync_tombstone(&writer, "knowledge_nodes", id, "gc_below_retention")?;
+        }
         let deleted = writer.execute(
             "DELETE FROM knowledge_nodes WHERE retention_strength < ?1 AND created_at < ?2",
             params![threshold, cutoff],
@@ -4292,6 +6142,96 @@ mod tests {
         Storage::new(Some(db_path)).unwrap()
     }
 
+    fn create_test_storage_at(dir: &tempfile::TempDir, name: &str) -> Storage {
+        Storage::new(Some(dir.path().join(name))).unwrap()
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_embedding_model_family_matching() {
+        assert!(Storage::embedding_model_matches_active(
+            "nomic-embed-text-v1.5",
+            "nomic-ai/nomic-embed-text-v1.5",
+        ));
+        assert!(Storage::embedding_model_matches_active(
+            "Qwen/Qwen3-Embedding-0.6B",
+            "Qwen/Qwen3-Embedding-0.6B",
+        ));
+        assert!(!Storage::embedding_model_matches_active(
+            "nomic-ai/nomic-embed-text-v1.5",
+            "Qwen/Qwen3-Embedding-0.6B",
+        ));
+
+        let bytes = Embedding::new(vec![1.0; EMBEDDING_DIMENSIONS]).to_bytes();
+        assert!(
+            Storage::embedding_vector_for_active_model(
+                &bytes,
+                "nomic-ai/nomic-embed-text-v1.5",
+                "Qwen/Qwen3-Embedding-0.6B",
+            )
+            .is_none()
+        );
+        assert!(
+            Storage::embedding_vector_for_active_model(
+                &bytes,
+                "Qwen/Qwen3-Embedding-0.6B",
+                "Qwen/Qwen3-Embedding-0.6B",
+            )
+            .is_some()
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_embedding_regeneration_candidates_include_entire_mismatched_corpus() {
+        let storage = create_test_storage();
+        let stale_model = "all-MiniLM-L6-v2";
+        let stale_embedding = Embedding::new(vec![0.0; EMBEDDING_DIMENSIONS]).to_bytes();
+
+        for i in 0..125 {
+            let node = storage
+                .ingest(IngestInput {
+                    content: format!("legacy embedded memory {}", i),
+                    node_type: "fact".to_string(),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let writer = storage.writer.lock().unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO node_embeddings
+                     (node_id, embedding, dimensions, model, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        &node.id,
+                        &stale_embedding,
+                        EMBEDDING_DIMENSIONS as i32,
+                        stale_model,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes
+                     SET has_embedding = 1, embedding_model = ?2
+                     WHERE id = ?1",
+                    rusqlite::params![&node.id, stale_model],
+                )
+                .unwrap();
+        }
+
+        let stats = storage.get_stats().unwrap();
+        assert_eq!(stats.nodes_with_mismatched_embeddings, 125);
+        assert_eq!(stats.nodes_with_active_embeddings, 0);
+
+        let candidates = storage
+            .embedding_regeneration_candidates(None, false)
+            .unwrap();
+        assert_eq!(candidates.len(), 125);
+    }
+
     #[test]
     fn test_storage_creation() {
         let storage = create_test_storage();
@@ -4430,6 +6370,528 @@ mod tests {
         let future = Utc::now() + Duration::hours(1);
         let count_future = storage.count_memories_since(future).unwrap();
         assert_eq!(count_future, 0);
+    }
+
+    #[test]
+    fn test_portable_archive_exact_round_trip() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+
+        let first = source
+            .ingest(IngestInput {
+                content: "Portable archive alpha memory".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["portable".to_string()],
+                source: Some("test".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let second = source
+            .ingest(IngestInput {
+                content: "Portable archive beta memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        source.mark_reviewed(&first.id, Rating::Good).unwrap();
+        source
+            .save_connection(&ConnectionRecord {
+                source_id: first.id.clone(),
+                target_id: second.id.clone(),
+                strength: 0.75,
+                link_type: "semantic".to_string(),
+                created_at: Utc::now(),
+                last_activated: Utc::now(),
+                activation_count: 1,
+            })
+            .unwrap();
+
+        let archive = source.export_portable_archive().unwrap();
+        assert_eq!(archive.archive_format, PORTABLE_ARCHIVE_FORMAT);
+        assert!(archive.total_rows() >= 3);
+        assert!(
+            archive
+                .tables
+                .iter()
+                .any(|table| table.name == "knowledge_nodes" && table.rows.len() == 2)
+        );
+
+        let target = create_test_storage_at(&target_dir, "target.db");
+        let report = target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+        assert!(report.rows_imported >= 3);
+        assert!(report.fts_rebuilt);
+
+        let restored = target.get_node(&first.id).unwrap().unwrap();
+        assert_eq!(restored.id, first.id);
+        assert_eq!(restored.content, first.content);
+        assert_eq!(restored.tags, first.tags);
+        assert_eq!(restored.reps, 1);
+
+        let connections = target.get_connections_for_memory(&first.id).unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].target_id, second.id);
+
+        let results = target.search("alpha", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, first.id);
+    }
+
+    #[test]
+    fn test_portable_import_rejects_non_empty_target() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        source
+            .ingest(IngestInput {
+                content: "Source memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = source.export_portable_archive().unwrap();
+
+        let target = create_test_storage_at(&target_dir, "target.db");
+        target
+            .ingest(IngestInput {
+                content: "Existing target memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let err = target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires an empty target database")
+        );
+    }
+
+    #[test]
+    fn test_portable_import_rejects_unknown_mode() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        source
+            .ingest(IngestInput {
+                content: "Source memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut archive = source.export_portable_archive().unwrap();
+        archive.mode = "merge".to_string();
+
+        let target = create_test_storage_at(&target_dir, "target.db");
+        let err = target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported portable archive mode")
+        );
+    }
+
+    #[test]
+    fn test_portable_import_rejects_malformed_table_list() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        source
+            .ingest(IngestInput {
+                content: "Source memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut duplicate_archive = source.export_portable_archive().unwrap();
+        let duplicate_table = duplicate_archive
+            .tables
+            .iter()
+            .find(|table| table.name == "knowledge_nodes")
+            .unwrap()
+            .clone();
+        duplicate_archive.tables.push(duplicate_table);
+
+        let target = create_test_storage_at(&target_dir, "target-duplicate.db");
+        let err = target
+            .import_portable_archive(&duplicate_archive, PortableImportMode::EmptyOnly)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Portable archive contains duplicate table")
+        );
+
+        let mut unknown_archive = source.export_portable_archive().unwrap();
+        unknown_archive.tables.push(PortableTable {
+            name: "sqlite_sequence".to_string(),
+            columns: vec!["name".to_string(), "seq".to_string()],
+            rows: vec![],
+        });
+
+        let target = create_test_storage_at(&target_dir, "target-unknown.db");
+        let err = target
+            .import_portable_archive(&unknown_archive, PortableImportMode::EmptyOnly)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Portable archive contains unsupported table")
+        );
+    }
+
+    #[test]
+    fn test_portable_merge_import_combines_non_empty_databases() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let source_node = source
+            .ingest(IngestInput {
+                content: "Source sync memory".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sync".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let target_node = target
+            .ingest(IngestInput {
+                content: "Target local memory".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["local".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let archive = source.export_portable_archive().unwrap();
+        let report = target
+            .import_portable_archive(&archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.rows_inserted > 0);
+        assert!(target.get_node(&source_node.id).unwrap().is_some());
+        assert!(target.get_node(&target_node.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_portable_merge_import_keeps_newer_local_memory() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Original shared memory".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+
+        let newer = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        {
+            let writer = target.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params!["Newer local edit", newer, &node.id],
+                )
+                .unwrap();
+        }
+
+        let report = target
+            .import_portable_archive(&archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.conflicts_kept_local >= 1);
+        let restored = target.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(restored.content, "Newer local edit");
+    }
+
+    #[test]
+    fn test_portable_merge_import_keeps_children_for_newer_local_memory() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Shared parent with child rows".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let source_time = Utc::now().to_rfc3339();
+        {
+            let writer = source.writer.lock().unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO node_embeddings
+                     (node_id, embedding, dimensions, model, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, vec![1_u8, 2, 3, 4], 4, "test-model", &source_time],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO fsrs_cards
+                     (memory_id, difficulty, stability, state, reps, lapses)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![&node.id, 3.0_f64, 2.0_f64, "review", 2_i64, 0_i64],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO memory_states
+                     (memory_id, state, last_access, access_count, state_entered_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, "active", &source_time, 1_i64, &source_time],
+                )
+                .unwrap();
+        }
+
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+
+        let local_time = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        {
+            let writer = target.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params!["Newer local parent edit", &local_time, &node.id],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO node_embeddings
+                     (node_id, embedding, dimensions, model, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, vec![9_u8, 8, 7, 6], 4, "test-model", &local_time],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO fsrs_cards
+                     (memory_id, difficulty, stability, state, reps, lapses)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![&node.id, 9.0_f64, 8.0_f64, "review", 9_i64, 1_i64],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO memory_states
+                     (memory_id, state, last_access, access_count, state_entered_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&node.id, "silent", &local_time, 42_i64, &local_time],
+                )
+                .unwrap();
+        }
+
+        let report = target
+            .import_portable_archive(&archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.conflicts_kept_local >= 4);
+        let restored = target.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(restored.content, "Newer local parent edit");
+
+        let reader = target.reader.lock().unwrap();
+        let embedding: Vec<u8> = reader
+            .query_row(
+                "SELECT embedding FROM node_embeddings WHERE node_id = ?1",
+                params![&node.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedding, vec![9_u8, 8, 7, 6]);
+
+        let difficulty: f64 = reader
+            .query_row(
+                "SELECT difficulty FROM fsrs_cards WHERE memory_id = ?1",
+                params![&node.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(difficulty, 9.0);
+
+        let (state, access_count): (String, i64) = reader
+            .query_row(
+                "SELECT state, access_count FROM memory_states WHERE memory_id = ?1",
+                params![&node.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "silent");
+        assert_eq!(access_count, 42);
+    }
+
+    #[test]
+    fn test_portable_merge_import_applies_delete_tombstones() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Memory deleted on source".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+        assert!(target.get_node(&node.id).unwrap().is_some());
+
+        source.delete_node(&node.id).unwrap();
+        let delete_archive = source.export_portable_archive().unwrap();
+        let report = target
+            .import_portable_archive(&delete_archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.rows_deleted >= 1);
+        assert!(target.get_node(&node.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_portable_merge_import_preserves_purge_tombstones() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Memory purged on source".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sync".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+        assert!(target.get_node(&node.id).unwrap().is_some());
+
+        source
+            .purge_node(&node.id, Some("sync purge test"))
+            .unwrap();
+        let purge_archive = source.export_portable_archive().unwrap();
+        let report = target
+            .import_portable_archive(&purge_archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.rows_deleted >= 1);
+        assert!(target.get_node(&node.id).unwrap().is_none());
+
+        let writer = target.writer.lock().unwrap();
+        let tombstone_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_tombstones WHERE memory_id = ?1 AND reason = ?2",
+                params![node.id, "sync purge test"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstone_count, 1);
+    }
+
+    #[test]
+    fn test_portable_merge_import_purge_wins_over_newer_local_edit() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Memory that will be purged on source".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sync".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+
+        let newer = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        {
+            let writer = target.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params!["Newer local edit before purge arrives", newer, &node.id],
+                )
+                .unwrap();
+        }
+
+        source
+            .purge_node(&node.id, Some("hard purge wins sync conflict"))
+            .unwrap();
+        let purge_archive = source.export_portable_archive().unwrap();
+        let report = target
+            .import_portable_archive(&purge_archive, PortableImportMode::Merge)
+            .unwrap();
+
+        assert!(report.rows_deleted >= 1);
+        assert!(target.get_node(&node.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_file_portable_sync_round_trips_between_devices() {
+        let sync_dir = tempdir().unwrap();
+        let first_dir = tempdir().unwrap();
+        let second_dir = tempdir().unwrap();
+        let sync_path = sync_dir.path().join("vestige-sync.json");
+        let first = create_test_storage_at(&first_dir, "first.db");
+        let second = create_test_storage_at(&second_dir, "second.db");
+
+        let first_node = first
+            .ingest(IngestInput {
+                content: "First device memory".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sync".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let first_push = first.sync_portable_archive_file(&sync_path).unwrap();
+        assert!(!first_push.pulled);
+        assert!(sync_path.exists());
+
+        let second_node = second
+            .ingest(IngestInput {
+                content: "Second device memory".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sync".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let second_sync = second.sync_portable_archive_file(&sync_path).unwrap();
+        assert!(second_sync.pulled);
+        assert!(second.get_node(&first_node.id).unwrap().is_some());
+
+        let first_sync = first.sync_portable_archive_file(&sync_path).unwrap();
+        assert!(first_sync.pulled);
+        assert!(first.get_node(&second_node.id).unwrap().is_some());
+        assert!(first_sync.pushed_rows >= 2);
     }
 
     #[test]
@@ -4588,5 +7050,170 @@ mod tests {
         let results = storage.hybrid_search("neurons", 10, 0.3, 0.7).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].node.content.contains("Neurons"));
+    }
+
+    #[test]
+    fn test_concrete_search_literal_identifier_lands_first() {
+        let storage = create_test_storage();
+
+        storage
+            .ingest(IngestInput {
+                content: "General OpenAI API setup notes without the exact env var".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let target = storage
+            .ingest(IngestInput {
+                content: "Set OPENAI_API_KEY before running the release smoke tests".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .ingest(IngestInput {
+                content: "API keys should be handled carefully in shell profiles".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let results = storage
+            .concrete_search_filtered("OPENAI_API_KEY", 10, None, None)
+            .unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node.id, target.id);
+        assert_eq!(results[0].match_type, MatchType::Keyword);
+        assert!(results[0].semantic_score.is_none());
+    }
+
+    #[test]
+    fn test_purge_scrubs_insight_json_orphans_children_and_writes_tombstone() {
+        let storage = create_test_storage();
+        let doomed = storage
+            .ingest(IngestInput {
+                content: "Sensitive purge target memory".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["sensitive".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let other_a = storage
+            .ingest(IngestInput {
+                content: "Other source memory A".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let other_b = storage
+            .ingest(IngestInput {
+                content: "Other source memory B".to_string(),
+                node_type: "fact".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = storage
+            .ingest(IngestInput {
+                content: "Temporal summary child".to_string(),
+                node_type: "summary".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        {
+            let writer = storage.writer.lock().unwrap();
+            writer
+                .execute(
+                    "INSERT INTO memory_connections (
+                        source_id, target_id, strength, link_type, created_at, last_activated, activation_count
+                     ) VALUES (?1, ?2, 0.9, 'semantic', ?3, ?3, 0)",
+                    params![doomed.id, other_a.id, Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO insights (
+                        id, insight, source_memories, confidence, novelty_score, insight_type, generated_at
+                     ) VALUES (?1, 'drop me', ?2, 0.9, 0.2, 'synthesis', ?3)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        serde_json::to_string(&vec![doomed.id.clone(), other_a.id.clone()]).unwrap(),
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO insights (
+                        id, insight, source_memories, confidence, novelty_score, insight_type, generated_at
+                     ) VALUES (?1, 'rewrite me', ?2, 0.9, 0.2, 'synthesis', ?3)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        serde_json::to_string(&vec![
+                            doomed.id.clone(),
+                            other_a.id.clone(),
+                            other_b.id.clone()
+                        ])
+                        .unwrap(),
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET summary_parent_id = ?1 WHERE id = ?2",
+                    params![doomed.id, child.id],
+                )
+                .unwrap();
+        }
+
+        let report = storage
+            .purge_node(&doomed.id, Some("user requested hard purge"))
+            .unwrap();
+        assert!(report.deleted);
+        assert_eq!(report.edges_pruned, 1);
+        assert_eq!(report.insights_deleted, 1);
+        assert_eq!(report.insights_rewritten, 1);
+        assert_eq!(report.children_orphaned, 1);
+        assert!(storage.get_node(&doomed.id).unwrap().is_none());
+
+        let writer = storage.writer.lock().unwrap();
+        let remaining_refs: Vec<String> = writer
+            .prepare("SELECT source_memories FROM insights")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|row| row.ok())
+            .collect();
+        assert_eq!(remaining_refs.len(), 1);
+        assert!(!remaining_refs[0].contains(&doomed.id));
+
+        let child_parent: Option<String> = writer
+            .query_row(
+                "SELECT summary_parent_id FROM knowledge_nodes WHERE id = ?1",
+                params![child.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(child_parent.is_none());
+
+        let tombstone_count: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_tombstones WHERE memory_id = ?1 AND reason = ?2",
+                params![doomed.id, "user requested hard purge"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstone_count, 1);
+
+        let has_content_column: i64 = writer
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('deletion_tombstones') WHERE name = 'content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_content_column, 0);
     }
 }

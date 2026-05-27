@@ -5,15 +5,16 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
+const PACKAGE_VERSION = require('../package.json').version;
 const HOME = os.homedir();
 const PLATFORM = os.platform();
 
 // ─── Branding ───────────────────────────────────────────────────────────────
 
 const BANNER = `
-  vestige init v2.0
-  Give your AI a brain in 10 seconds.
-  Now with 3D dashboard at localhost:3927/dashboard
+  vestige init v${PACKAGE_VERSION}
+  Configure local Vestige memory for MCP-compatible agents.
+  Dashboard: localhost:3927/dashboard
 `;
 
 // ─── IDE Definitions ────────────────────────────────────────────────────────
@@ -172,11 +173,64 @@ function findBinary() {
   return null;
 }
 
+function stripJsonComments(input) {
+  let output = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const current = input[i];
+    const next = input[i + 1];
+
+    if (inString) {
+      output += current;
+      if (escaped) {
+        escaped = false;
+      } else if (current === '\\') {
+        escaped = true;
+      } else if (current === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (current === '"') {
+      inString = true;
+      output += current;
+      continue;
+    }
+
+    if (current === '/' && next === '/') {
+      while (i < input.length && input[i] !== '\n') i++;
+      output += '\n';
+      continue;
+    }
+
+    if (current === '/' && next === '*') {
+      i += 2;
+      while (i < input.length && !(input[i] === '*' && input[i + 1] === '/')) i++;
+      i++;
+      continue;
+    }
+
+    output += current;
+  }
+
+  return output;
+}
+
+function removeTrailingCommas(input) {
+  return input.replace(/,\s*([}\]])/g, '$1');
+}
+
 function readJsonSafe(filePath) {
   try {
     const content = fs.readFileSync(filePath, 'utf8');
-    return JSON.parse(content);
-  } catch {
+    return JSON.parse(removeTrailingCommas(stripJsonComments(content)));
+  } catch (err) {
+    if (fs.existsSync(filePath)) {
+      throw new Error(`Could not parse ${filePath}: ${err.message}`);
+    }
     return null;
   }
 }
@@ -185,6 +239,29 @@ function ensureDir(filePath) {
   const dir = path.dirname(filePath);
   if (!dir || dir === '.') return;
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function backupFile(filePath) {
+  if (!fs.existsSync(filePath)) return null;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = `${filePath}.bak.${stamp}`;
+  fs.copyFileSync(filePath, backupPath);
+  try {
+    fs.chmodSync(backupPath, 0o600);
+  } catch {}
+  return backupPath;
+}
+
+function writeJsonAtomic(filePath, value) {
+  ensureDir(filePath);
+  const backupPath = backupFile(filePath);
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tempPath, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+  fs.renameSync(tempPath, filePath);
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {}
+  return backupPath;
 }
 
 function buildVestigeConfig(binaryPath) {
@@ -209,7 +286,6 @@ function buildXcodeConfig(binaryPath) {
             },
           },
         },
-        hasTrustDialogAccepted: true,
       },
     },
   };
@@ -239,7 +315,6 @@ function injectConfig(ide, ideName, binaryPath) {
     if (!config.projects['*']) config.projects['*'] = {};
     if (!config.projects['*'].mcpServers) config.projects['*'].mcpServers = {};
     config.projects['*'].mcpServers.vestige = xcodeConfig.projects['*'].mcpServers.vestige;
-    config.projects['*'].hasTrustDialogAccepted = true;
   } else if (ide.format === 'vscode') {
     // VS Code uses "mcp" key in settings.json with "servers" subkey
     if (!config.mcp) config.mcp = {};
@@ -260,7 +335,10 @@ function injectConfig(ide, ideName, binaryPath) {
     config[key].vestige = buildVestigeConfig(binaryPath);
   }
 
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+  const backupPath = writeJsonAtomic(configPath, config);
+  if (backupPath) {
+    console.log(`  [backup] ${path.basename(backupPath)}`);
+  }
   return true;
 }
 
@@ -279,12 +357,7 @@ function main() {
     console.log('');
     console.log('Install manually:');
     console.log('');
-    console.log('  # macOS (Apple Silicon)');
-    console.log('  curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz');
-    console.log('  sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/');
-    console.log('');
-    console.log('  # Or via npm');
-    console.log('  npm install -g vestige-mcp-server');
+    console.log('  npm install -g vestige-mcp-server@latest');
     console.log('');
     console.log('Then run: npx @vestige/init');
     process.exit(1);

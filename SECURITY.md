@@ -4,7 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 2.0.x   | :white_check_mark: |
+| 2.1.x   | :white_check_mark: |
+| 2.0.x   | Critical fixes only |
 | 1.x     | :x:                |
 
 ## Reporting a Vulnerability
@@ -27,13 +28,13 @@ You can expect a response within 48 hours.
 
 Vestige is a **local MCP server** designed to run on your machine with your user permissions:
 
-- **Trusted**: The MCP client (Claude Code/Desktop) that connects via stdio
+- **Trusted**: The MCP client or local agent that connects via stdio
 - **Untrusted**: Content passed through MCP tool arguments (validated before use)
 
 ### What Vestige Does NOT Do
 
-- ❌ Make network requests (except first-run model download from Hugging Face)
-- ❌ Execute shell commands
+- ❌ Make network requests during normal memory use, except first-run model download from Hugging Face
+- ❌ Require telemetry, hosted memory storage, or a cloud account
 - ❌ Access files outside its data directory
 - ❌ Send telemetry or analytics
 - ❌ Phone home to any server

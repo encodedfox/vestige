@@ -20,8 +20,7 @@ It speaks MCP (Model Context Protocol), the same protocol Xcode 26.3 uses for to
 
 **Step 1:** Install Vestige
 ```bash
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz
-sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/
+npm install -g vestige-mcp-server
 ```
 
 **Step 2:** Drop one file in your project root
@@ -110,8 +109,7 @@ The full setup takes 30 seconds:
 
 ```bash
 # Install Vestige
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz
-sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/
+npm install -g vestige-mcp-server
 
 # Add to your project (run from project root)
 cat > .mcp.json << 'EOF'

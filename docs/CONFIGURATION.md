@@ -6,7 +6,7 @@
 
 ## First-Run Network Requirement
 
-Vestige downloads the **Nomic Embed Text v1.5** model (~130MB) from Hugging Face on first use.
+Vestige downloads the **Nomic Embed Text v1.5** model (~130MB) from Hugging Face on first use. Qwen3 embeddings are opt-in and download their own Hugging Face model when selected.
 
 **All subsequent runs are fully offline.**
 
@@ -16,7 +16,7 @@ The embedding model is cached in platform-specific directories:
 
 | Platform | Cache Location |
 |----------|----------------|
-| macOS | `~/Library/Caches/com.vestige.core/fastembed` |
+| macOS | `~/Library/Caches/vestige/fastembed` |
 | Linux | `~/.cache/vestige/fastembed` |
 | Windows | `%LOCALAPPDATA%\vestige\cache\fastembed` |
 
@@ -25,16 +25,28 @@ Override with environment variable:
 export FASTEMBED_CACHE_PATH="/custom/path"
 ```
 
+Qwen3 currently uses Hugging Face Hub's Candle loader directly, so use the standard Hugging Face cache environment such as `HF_HOME` if you need to relocate that larger model cache.
+
 ---
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VESTIGE_DATA_DIR` | Platform default | Custom database location |
-| `VESTIGE_LOG_LEVEL` | `info` | Logging verbosity |
-| `RUST_LOG` | - | Detailed tracing output |
-| `FASTEMBED_CACHE_PATH` | `./.fastembed_cache` | Embedding model cache location |
+| `VESTIGE_DATA_DIR` | OS per-user data directory | Storage directory fallback; overridden by `--data-dir`; database lives at `<dir>/vestige.db` |
+| `VESTIGE_EMBEDDING_MODEL` | `nomic-v1.5` | Embedding backend selector. Use `qwen3-0.6b` with a build that enables `qwen3-embeddings` |
+| `RUST_LOG` | `info` (via tracing-subscriber) | Log verbosity + per-module filtering |
+| `FASTEMBED_CACHE_PATH` | Platform cache directory; `./.fastembed_cache` fallback | Embedding model cache location |
+| `VESTIGE_DASHBOARD_PORT` | `3927` | Dashboard HTTP + WebSocket port |
+| `VESTIGE_HTTP_ENABLED` | `false` | Set `true` or `1` to enable optional MCP-over-HTTP |
+| `VESTIGE_HTTP_PORT` | `3928` | Optional MCP-over-HTTP port; `--http-port` also enables HTTP |
+| `VESTIGE_HTTP_BIND` | `127.0.0.1` | HTTP bind address |
+| `VESTIGE_HTTP_ALLOWED_ORIGINS` | localhost origins for the HTTP port | Comma-separated browser origins allowed to call MCP-over-HTTP |
+| `VESTIGE_AUTH_TOKEN` | auto-generated | Dashboard + MCP HTTP bearer auth |
+| `VESTIGE_DASHBOARD_ENABLED` | `false` | Set `true` or `1` to enable the web dashboard |
+| `VESTIGE_CONSOLIDATION_INTERVAL_HOURS` | `6` | FSRS-6 decay cycle cadence |
+
+> **Storage location precedence:** `--data-dir <path>` wins over `VESTIGE_DATA_DIR`; if neither is set, Vestige uses your OS's per-user data directory: `~/Library/Application Support/com.vestige.core/` on macOS, `~/.local/share/vestige/core/` on Linux, `%APPDATA%\vestige\core\` on Windows. Custom paths are directories, are created if missing, expand a leading `~`, and store the database at `<dir>/vestige.db`.
 
 ---
 
@@ -42,6 +54,8 @@ export FASTEMBED_CACHE_PATH="/custom/path"
 
 ```bash
 vestige-mcp --data-dir /custom/path   # Custom storage location
+VESTIGE_DATA_DIR=~/.vestige vestige-mcp # Env fallback storage location
+VESTIGE_DATA_DIR=./.vestige vestige stats # Point the CLI at the same custom DB
 vestige-mcp --help                     # Show all options
 ```
 
@@ -58,6 +72,10 @@ vestige stats --states     # Cognitive state distribution
 vestige health             # System health check
 vestige consolidate        # Run memory maintenance
 vestige restore <file>     # Restore from backup
+vestige portable-export <file>         # Exact Vestige-to-Vestige archive
+vestige portable-import <file>         # Import exact archive into an empty database
+vestige portable-import <file> --merge # Merge exact archive into this database
+vestige sync <file>                    # Pull/merge/push through a file backend
 ```
 
 ---
@@ -140,6 +158,14 @@ For per-project or custom storage:
 }
 ```
 
+For a shell-level default:
+
+```bash
+export VESTIGE_DATA_DIR="/path/to/custom/dir"
+```
+
+`--data-dir` takes precedence over `VESTIGE_DATA_DIR`, so you can keep a global env default and still isolate one client or project with an explicit CLI argument.
+
 See [Storage Modes](STORAGE.md) for more options.
 
 ---
@@ -148,16 +174,27 @@ See [Storage Modes](STORAGE.md) for more options.
 
 **Latest version:**
 ```bash
-cd vestige
-git pull
-cargo build --release
-sudo cp target/release/vestige-mcp /usr/local/bin/
+vestige update
+```
+
+This updates `vestige`, `vestige-mcp`, and `vestige-restore`. It does not mutate
+Claude Code Cognitive Sandwich companion files unless you explicitly request it.
+
+**Also refresh optional Claude Code companion files:**
+```bash
+vestige update --sandwich-companion
 ```
 
 **Pin to specific version:**
 ```bash
-git checkout v1.1.2
-cargo build --release
+vestige update --version v2.1.21
+```
+
+**Manage the optional Cognitive Sandwich layer without updating binaries:**
+```bash
+vestige sandwich install
+vestige sandwich install --enable-preflight
+vestige sandwich install --enable-sanhedrin --sanhedrin-endpoint=http://127.0.0.1:11434/v1/chat/completions
 ```
 
 **Check your version:**

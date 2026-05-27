@@ -38,40 +38,29 @@ pub mod graph;
 pub mod health;
 
 // v2.1: Cross-reference (connect the dots)
+pub mod contradictions;
 pub mod cross_reference;
 
 // v2.0.5: Active Forgetting — Anderson 2025 + Davis Rac1
 pub mod suppress;
 
-// Deprecated/internal tools — not advertised in the public MCP tools/list,
-// but some functions are actively dispatched for backwards compatibility
-// and internal cognitive operations. #[allow(dead_code)] suppresses warnings
-// for the unused schema/struct items within these modules.
-#[allow(dead_code)]
-pub mod checkpoint;
-#[allow(dead_code)]
-pub mod codebase;
-#[allow(dead_code)]
-pub mod consolidate;
+// Internal/backwards-compat tools still dispatched by server.rs for specific
+// tool names. Each module below has live callers via string dispatch in
+// `server.rs` (match arms on request.name). The #[allow(dead_code)]
+// suppresses warnings for the per-module schema/struct items that aren't
+// yet consumed.
+//
+// The nine legacy siblings here pre-v2.0.8 (checkpoint, codebase, consolidate,
+// ingest, intentions, knowledge, recall, search, stats) were removed in the
+// post-v2.0.8 dead-code sweep — all nine had zero callers after the
+// unification work landed `*_unified` + `maintenance::*` replacements.
 #[allow(dead_code)]
 pub mod context;
 #[allow(dead_code)]
 pub mod feedback;
 #[allow(dead_code)]
-pub mod ingest;
-#[allow(dead_code)]
-pub mod intentions;
-#[allow(dead_code)]
-pub mod knowledge;
-#[allow(dead_code)]
 pub mod memory_states;
 #[allow(dead_code)]
-pub mod recall;
-#[allow(dead_code)]
 pub mod review;
-#[allow(dead_code)]
-pub mod search;
-#[allow(dead_code)]
-pub mod stats;
 #[allow(dead_code)]
 pub mod tagging;

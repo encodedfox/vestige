@@ -12,12 +12,23 @@ npm install -g vestige-mcp-server
 
 This automatically downloads the correct binary for your platform (macOS, Linux, Windows) from GitHub releases.
 
+Already installed? Update without copying release URLs:
+
+```bash
+vestige update
+```
+
+This refreshes the binaries only. Optional Claude Code Cognitive Sandwich
+companion files are refreshed with `vestige update --sandwich-companion` or
+`vestige sandwich install`.
+
 ### What gets installed
 
 | Command | Description |
 |---------|-------------|
-| `vestige-mcp` | MCP server for Claude integration |
+| `vestige-mcp` | MCP server for local agent memory |
 | `vestige` | CLI for stats, health checks, and maintenance |
+| `vestige-restore` | Restore helper for backup recovery |
 
 ### Verify installation
 
@@ -25,13 +36,23 @@ This automatically downloads the correct binary for your platform (macOS, Linux,
 vestige health
 ```
 
-## Usage with Claude Code
+## Usage with MCP Clients
+
+Vestige works with any client that can register a stdio MCP server.
+
+**Claude Code**
 
 ```bash
 claude mcp add vestige vestige-mcp -s user
 ```
 
-Then restart Claude.
+**Codex**
+
+```bash
+codex mcp add vestige -- vestige-mcp
+```
+
+Then restart your MCP client.
 
 ## Usage with Claude Desktop
 
@@ -57,6 +78,9 @@ vestige stats          # Memory statistics
 vestige stats --states # Cognitive state distribution
 vestige health         # System health check
 vestige consolidate    # Run memory maintenance cycle
+vestige update         # Update binaries
+vestige update --sandwich-companion # Also refresh optional Claude Code files
+vestige sandwich install # Manage optional Claude Code hook files
 ```
 
 ## Features
@@ -81,7 +105,7 @@ You'll never run out of space. A heavy user creating 100 memories/day would use 
 
 On first use, Vestige downloads the nomic-embed-text-v1.5 model (~130MB). This is a one-time download and all subsequent operations are fully offline.
 
-The model is stored in `.fastembed_cache/` in your working directory, or you can set a global location:
+The model is stored in Vestige's OS cache directory, or you can set a global location:
 
 ```bash
 export FASTEMBED_CACHE_PATH="$HOME/.fastembed_cache"
@@ -91,9 +115,13 @@ export FASTEMBED_CACHE_PATH="$HOME/.fastembed_cache"
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `VESTIGE_DATA_DIR` | Data storage directory | `~/.vestige` |
-| `VESTIGE_LOG_LEVEL` | Log verbosity | `info` |
-| `FASTEMBED_CACHE_PATH` | Embeddings model location | `./.fastembed_cache` |
+| `RUST_LOG` | Log verbosity + per-module filter | `info` |
+| `FASTEMBED_CACHE_PATH` | Embeddings model cache override | OS cache dir |
+| `VESTIGE_DATA_DIR` | Storage directory fallback; database lives at `<dir>/vestige.db` | OS data dir |
+| `VESTIGE_DASHBOARD_PORT` | Dashboard port | `3927` |
+| `VESTIGE_AUTH_TOKEN` | Bearer auth for dashboard + HTTP MCP | auto-generated |
+
+Storage precedence is `--data-dir <path>`, then `VESTIGE_DATA_DIR`, then your OS's per-user data directory.
 
 ## Troubleshooting
 
@@ -101,7 +129,7 @@ export FASTEMBED_CACHE_PATH="$HOME/.fastembed_cache"
 
 1. Verify binary exists: `which vestige-mcp`
 2. Test directly: `vestige-mcp` (should wait for stdio input)
-3. Check Claude logs: `~/Library/Logs/Claude/` (macOS)
+3. Check your MCP client's server logs.
 
 ### "vestige: command not found"
 
@@ -112,7 +140,9 @@ npm install -g vestige-mcp-server
 
 ### Embeddings not downloading
 
-The model downloads on first `ingest` or `search` operation. If Claude can't connect to the MCP server, no memory operations happen and no model downloads.
+The model downloads on first memory ingest or search operation. If your MCP
+client cannot connect to the MCP server, no memory operations happen and no
+model downloads.
 
 Fix the MCP connection first, then the model will download automatically.
 

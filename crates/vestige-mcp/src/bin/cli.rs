@@ -2,15 +2,20 @@
 //!
 //! Command-line interface for managing cognitive memory system.
 
+use std::collections::HashSet;
+use std::env;
+use std::fs;
 use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
+use anyhow::Context;
 use chrono::{NaiveDate, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
-use directories::ProjectDirs;
-use vestige_core::{IngestInput, Storage};
+use vestige_core::{IngestInput, PortableImportMode, Storage};
 
 /// Vestige - Cognitive Memory System CLI
 #[derive(Parser)]
@@ -22,8 +27,66 @@ use vestige_core::{IngestInput, Storage};
     long_about = "Vestige is a cognitive memory system based on 130 years of memory research.\n\nIt implements FSRS-6, spreading activation, synaptic tagging, and more."
 )]
 struct Cli {
+    /// Use a specific Vestige data directory for this command.
+    #[arg(long, global = true, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+static CLI_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+#[derive(Debug, Clone, Default, Args)]
+struct SandwichInstallOptions {
+    /// Overwrite existing staged Vestige hook and agent files.
+    #[arg(long)]
+    force: bool,
+
+    /// Wire optional UserPromptSubmit preflight hooks.
+    #[arg(long)]
+    enable_preflight: bool,
+
+    /// Wire both optional preflight hooks and the optional Sanhedrin verifier.
+    #[arg(long)]
+    enable_sandwich: bool,
+
+    /// Wire optional Sanhedrin Stop hook.
+    #[arg(long)]
+    enable_sanhedrin: bool,
+
+    /// On Apple Silicon, auto-start the local MLX Sanhedrin backend.
+    #[arg(long)]
+    with_launchd: bool,
+
+    /// Also stage the large memory-loader hook file.
+    #[arg(long)]
+    include_memory_loader: bool,
+
+    /// OpenAI-compatible chat completions endpoint for optional Sanhedrin.
+    #[arg(long, value_name = "URL")]
+    sanhedrin_endpoint: Option<String>,
+
+    /// Model name passed to the optional Sanhedrin endpoint.
+    #[arg(long, value_name = "MODEL")]
+    sanhedrin_model: Option<String>,
+
+    /// Use a local checkout/release root containing hooks/ and agents/.
+    #[arg(long, value_name = "DIR", hide = true)]
+    src: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum SandwichCommands {
+    /// Install/update Cognitive Sandwich companion files without enabling hooks by default.
+    Install {
+        /// Install files from a specific release tag instead of latest.
+        #[arg(long)]
+        version: Option<String>,
+
+        #[command(flatten)]
+        options: SandwichInstallOptions,
+    },
 }
 
 #[derive(Subcommand)]
@@ -44,6 +107,38 @@ enum Commands {
 
     /// Run memory consolidation cycle
     Consolidate,
+
+    /// Update Vestige binaries from the latest GitHub release
+    Update {
+        /// Install a specific release tag instead of latest (example: v2.1.21)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Override install directory (defaults to the current vestige binary's directory)
+        #[arg(long)]
+        install_dir: Option<PathBuf>,
+
+        /// Print what would be updated without changing files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Deprecated: companion updates are skipped by default.
+        #[arg(long)]
+        no_sandwich: bool,
+
+        /// Also refresh optional Claude Code Cognitive Sandwich companion files.
+        #[arg(long)]
+        sandwich_companion: bool,
+
+        #[command(flatten)]
+        sandwich: SandwichInstallOptions,
+    },
+
+    /// Manage optional Claude Code Cognitive Sandwich companion files.
+    Sandwich {
+        #[command(subcommand)]
+        command: SandwichCommands,
+    },
 
     /// Restore memories from backup file
     Restore {
@@ -70,6 +165,27 @@ enum Commands {
         /// Only export memories created after this date (YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
+    },
+
+    /// Export an exact portable archive for Vestige-to-Vestige transfer
+    PortableExport {
+        /// Output archive path
+        output: PathBuf,
+    },
+
+    /// Import an exact portable archive
+    PortableImport {
+        /// Input archive path
+        input: PathBuf,
+        /// Merge into the current database instead of requiring an empty target
+        #[arg(long)]
+        merge: bool,
+    },
+
+    /// Two-way sync with a file-backed portable archive
+    Sync {
+        /// Sync archive path, often in Dropbox/iCloud/Syncthing/Git
+        archive: PathBuf,
     },
 
     /// Garbage collect stale memories below retention threshold
@@ -130,10 +246,37 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if let Some(data_dir) = cli.data_dir {
+        let db_path = Storage::db_path_for_data_dir(data_dir)?;
+        CLI_DB_PATH
+            .set(db_path)
+            .map_err(|_| anyhow::anyhow!("data directory was initialized more than once"))?;
+    }
+
     match cli.command {
         Commands::Stats { tagging, states } => run_stats(tagging, states),
         Commands::Health => run_health(),
         Commands::Consolidate => run_consolidate(),
+        Commands::Update {
+            version,
+            install_dir,
+            dry_run,
+            no_sandwich,
+            sandwich_companion,
+            sandwich,
+        } => run_update(
+            version,
+            install_dir,
+            dry_run,
+            no_sandwich,
+            sandwich_companion,
+            sandwich,
+        ),
+        Commands::Sandwich { command } => match command {
+            SandwichCommands::Install { version, options } => {
+                run_sandwich_install(version.as_deref(), &options)
+            }
+        },
         Commands::Restore { file } => run_restore(file),
         Commands::Backup { output } => run_backup(output),
         Commands::Export {
@@ -142,6 +285,9 @@ fn main() -> anyhow::Result<()> {
             tags,
             since,
         } => run_export(output, format, tags, since),
+        Commands::PortableExport { output } => run_portable_export(output),
+        Commands::PortableImport { input, merge } => run_portable_import(input, merge),
+        Commands::Sync { archive } => run_sync(archive),
         Commands::Gc {
             min_retention,
             max_age_days,
@@ -163,9 +309,1005 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReleaseAsset {
+    target: &'static str,
+    archive_ext: &'static str,
+    binary_suffix: &'static str,
+}
+
+struct UpdateTempDir {
+    path: PathBuf,
+}
+
+impl UpdateTempDir {
+    fn create() -> anyhow::Result<Self> {
+        let path = env::temp_dir().join(format!(
+            "vestige-update-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        fs::create_dir_all(&path)
+            .with_context(|| format!("failed to create temp directory {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for UpdateTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn release_asset_for(os: &str, arch: &str) -> anyhow::Result<ReleaseAsset> {
+    match (os, arch) {
+        ("macos", "aarch64") => Ok(ReleaseAsset {
+            target: "aarch64-apple-darwin",
+            archive_ext: "tar.gz",
+            binary_suffix: "",
+        }),
+        ("macos", "x86_64") => Ok(ReleaseAsset {
+            target: "x86_64-apple-darwin",
+            archive_ext: "tar.gz",
+            binary_suffix: "",
+        }),
+        ("linux", "x86_64") => Ok(ReleaseAsset {
+            target: "x86_64-unknown-linux-gnu",
+            archive_ext: "tar.gz",
+            binary_suffix: "",
+        }),
+        ("windows", "x86_64") => Ok(ReleaseAsset {
+            target: "x86_64-pc-windows-msvc",
+            archive_ext: "zip",
+            binary_suffix: ".exe",
+        }),
+        _ => anyhow::bail!(
+            "unsupported platform for vestige update: {}-{}. Download manually from https://github.com/samvallad33/vestige/releases",
+            os,
+            arch
+        ),
+    }
+}
+
+fn current_release_asset() -> anyhow::Result<ReleaseAsset> {
+    release_asset_for(env::consts::OS, env::consts::ARCH)
+}
+
+fn release_download_url(asset: ReleaseAsset, version: Option<&str>) -> String {
+    let archive_name = format!("vestige-mcp-{}.{}", asset.target, asset.archive_ext);
+    match version {
+        Some(version) => {
+            let tag = normalize_release_tag(version);
+            format!(
+                "https://github.com/samvallad33/vestige/releases/download/{}/{}",
+                tag, archive_name
+            )
+        }
+        None => format!(
+            "https://github.com/samvallad33/vestige/releases/latest/download/{}",
+            archive_name
+        ),
+    }
+}
+
+fn normalize_release_tag(version: &str) -> String {
+    if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{}", version)
+    }
+}
+
+fn source_archive_url(tag: &str) -> String {
+    format!(
+        "https://github.com/samvallad33/vestige/archive/refs/tags/{}.tar.gz",
+        tag
+    )
+}
+
+fn download_file(url: &str, output: &Path, action: &str) -> anyhow::Result<()> {
+    run_command(
+        Command::new("curl")
+            .arg("-fsSL")
+            .arg("-A")
+            .arg("vestige-cli")
+            .arg(url)
+            .arg("-o")
+            .arg(output),
+        action,
+    )
+}
+
+fn parse_sha256(text: &str) -> anyhow::Result<String> {
+    let hash = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("checksum file is empty"))?
+        .to_ascii_lowercase();
+    if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("checksum file does not contain a valid SHA-256 hash");
+    }
+    Ok(hash)
+}
+
+fn sha256_from_command(command: &mut Command) -> anyhow::Result<Option<String>> {
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(Some(parse_sha256(&text)?))
+        }
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).context("failed to run checksum command"),
+    }
+}
+
+fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    {
+        if let Some(hash) = sha256_from_command(
+            Command::new("powershell")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("(Get-FileHash -Algorithm SHA256 -LiteralPath $args[0]).Hash.ToLowerInvariant()")
+                .arg(path),
+        )? {
+            return Ok(hash);
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(hash) =
+            sha256_from_command(Command::new("shasum").arg("-a").arg("256").arg(path))?
+        {
+            return Ok(hash);
+        }
+        if let Some(hash) = sha256_from_command(Command::new("sha256sum").arg(path))? {
+            return Ok(hash);
+        }
+    }
+
+    anyhow::bail!("no SHA-256 command available to verify release archive");
+}
+
+fn verify_release_checksum(archive_path: &Path, checksum_path: &Path) -> anyhow::Result<()> {
+    let expected = parse_sha256(&fs::read_to_string(checksum_path).with_context(|| {
+        format!(
+            "failed to read release checksum file {}",
+            checksum_path.display()
+        )
+    })?)?;
+    let actual = compute_sha256(archive_path)?;
+    if actual != expected {
+        anyhow::bail!(
+            "release archive checksum mismatch for {}",
+            archive_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn latest_release_tag() -> anyhow::Result<String> {
+    let temp_dir = UpdateTempDir::create()?;
+    let metadata_path = temp_dir.path.join("latest-release.json");
+    download_file(
+        "https://api.github.com/repos/samvallad33/vestige/releases/latest",
+        &metadata_path,
+        "checking latest Vestige release",
+    )?;
+    let file = fs::File::open(&metadata_path)?;
+    let metadata: serde_json::Value =
+        serde_json::from_reader(file).context("failed to parse latest Vestige release metadata")?;
+    metadata
+        .get("tag_name")
+        .and_then(|tag| tag.as_str())
+        .map(|tag| tag.to_string())
+        .ok_or_else(|| anyhow::anyhow!("latest Vestige release metadata did not include tag_name"))
+}
+
+fn release_tag_for_source(version: Option<&str>) -> anyhow::Result<String> {
+    match version {
+        Some(version) => Ok(normalize_release_tag(version)),
+        None => latest_release_tag(),
+    }
+}
+
+fn find_sandwich_source_root(root: &Path) -> Option<PathBuf> {
+    if root.join("hooks").is_dir() && root.join("agents").is_dir() {
+        return Some(root.to_path_buf());
+    }
+
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path.join("hooks").is_dir() && path.join("agents").is_dir() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn download_sandwich_source(version: Option<&str>, output_dir: &Path) -> anyhow::Result<PathBuf> {
+    let tag = release_tag_for_source(version)?;
+    let archive_path = output_dir.join(format!("vestige-source-{}.tar.gz", tag));
+    let url = source_archive_url(&tag);
+
+    println!("{}: {}", "Sandwich source".white().bold(), tag);
+    download_file(&url, &archive_path, "downloading Vestige source archive")?;
+    extract_source_archive(&archive_path, output_dir)?;
+    find_sandwich_source_root(output_dir).ok_or_else(|| {
+        anyhow::anyhow!("Vestige source archive did not contain hooks/ and agents/ directories")
+    })
+}
+
+fn home_dir() -> anyhow::Result<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .ok_or_else(|| anyhow::anyhow!("failed to locate home directory"))
+}
+
+fn is_vestige_hook_command(command: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "synthesis-preflight.sh",
+        "cwd-state-injector.sh",
+        "vestige-pulse-daemon.sh",
+        "preflight-swarm.sh",
+        "load-all-memory.sh",
+        "veto-detector.sh",
+        "sanhedrin.sh",
+        "synthesis-stop-validator.sh",
+        "synthesis-gate.sh",
+    ];
+    NEEDLES.iter().any(|needle| command.contains(needle))
+}
+
+fn scrub_vestige_hooks(settings: &mut serde_json::Value) {
+    let Some(hooks) = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.as_object_mut())
+    else {
+        return;
+    };
+
+    for event_name in ["UserPromptSubmit", "Stop"] {
+        let Some(groups) = hooks
+            .get_mut(event_name)
+            .and_then(|groups| groups.as_array_mut())
+        else {
+            continue;
+        };
+
+        for group in groups.iter_mut() {
+            if let Some(commands) = group
+                .get_mut("hooks")
+                .and_then(|hooks| hooks.as_array_mut())
+            {
+                commands.retain(|hook| {
+                    !hook
+                        .get("command")
+                        .and_then(|command| command.as_str())
+                        .is_some_and(is_vestige_hook_command)
+                });
+            }
+        }
+
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(|hooks| hooks.as_array())
+                .is_some_and(|hooks| !hooks.is_empty())
+        });
+    }
+
+    hooks.retain(|_, value| match value {
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(items) => !items.is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
+    });
+
+    if hooks.is_empty()
+        && let Some(root) = settings.as_object_mut()
+    {
+        root.remove("hooks");
+    }
+}
+
+fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn merge_settings_fragment(
+    settings: &mut serde_json::Value,
+    fragment_path: &Path,
+) -> anyhow::Result<()> {
+    let file = fs::File::open(fragment_path)
+        .with_context(|| format!("failed to open {}", fragment_path.display()))?;
+    let fragment: serde_json::Value = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse {}", fragment_path.display()))?;
+    merge_json(settings, fragment);
+    Ok(())
+}
+
+fn copy_companion_files(
+    source_dir: &Path,
+    destination_dir: &Path,
+    allowed_extensions: &[&str],
+    _mode: u32,
+    options: &SandwichInstallOptions,
+) -> anyhow::Result<(usize, usize)> {
+    fs::create_dir_all(destination_dir)?;
+    let mut copied = 0;
+    let mut skipped = 0;
+
+    for entry in fs::read_dir(source_dir)
+        .with_context(|| format!("failed to read {}", source_dir.display()))?
+    {
+        let entry = entry?;
+        let source = entry.path();
+        if !source.is_file() {
+            continue;
+        }
+
+        let extension = source
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        if !allowed_extensions.contains(&extension) {
+            continue;
+        }
+
+        let Some(file_name) = source.file_name() else {
+            continue;
+        };
+        if file_name.to_string_lossy() == "load-all-memory.sh" && !options.include_memory_loader {
+            continue;
+        }
+
+        let destination = destination_dir.join(file_name);
+        if destination.exists() && !options.force {
+            skipped += 1;
+            continue;
+        }
+
+        fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&destination)?.permissions();
+            perms.set_mode(_mode);
+            fs::set_permissions(&destination, perms)?;
+        }
+
+        copied += 1;
+    }
+
+    Ok((copied, skipped))
+}
+
+fn quote_shell_env(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn write_sanhedrin_env(
+    hooks_dir: &Path,
+    endpoint: &str,
+    model: &str,
+    dashboard_port: &str,
+) -> anyhow::Result<()> {
+    let env_path = hooks_dir.join("vestige-sanhedrin.env");
+    let contents = format!(
+        "VESTIGE_SANHEDRIN_ENABLED=1\nVESTIGE_SANHEDRIN_ENDPOINT={}\nVESTIGE_SANHEDRIN_MODEL={}\nVESTIGE_DASHBOARD_PORT={}\nVESTIGE_SANHEDRIN_CLAIM_MODE=1\nVESTIGE_SANHEDRIN_OUTPUT=json\n",
+        quote_shell_env(endpoint),
+        quote_shell_env(model),
+        quote_shell_env(dashboard_port)
+    );
+    fs::write(&env_path, contents)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&env_path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&env_path, perms)?;
+    }
+
+    println!("{}: {}", "Sanhedrin env".white().bold(), env_path.display());
+    Ok(())
+}
+
+fn install_launchd_job(source_root: &Path, home: &Path, model: &str) -> anyhow::Result<()> {
+    let launchd_dir = home.join("Library").join("LaunchAgents");
+    fs::create_dir_all(&launchd_dir)?;
+
+    let template_path = source_root
+        .join("launchd")
+        .join("com.vestige.mlx-server.plist.template");
+    let template = fs::read_to_string(&template_path)
+        .with_context(|| format!("failed to read {}", template_path.display()))?;
+    let rendered = template
+        .replace("__HOME__", &home.display().to_string())
+        .replace("__MODEL__", model);
+
+    let plist = launchd_dir.join("com.vestige.mlx-server.plist");
+    fs::write(&plist, rendered)?;
+    let _ = Command::new("launchctl").arg("unload").arg(&plist).status();
+    run_command(
+        Command::new("launchctl").arg("load").arg(&plist),
+        "loading Vestige MLX launchd job",
+    )?;
+    println!("{}: {}", "launchd".white().bold(), plist.display());
+    Ok(())
+}
+
+fn remove_legacy_launchd_job(home: &Path) {
+    if env::consts::OS != "macos" {
+        return;
+    }
+
+    let plist = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join("com.vestige.mlx-server.plist");
+    if plist.exists() {
+        let _ = Command::new("launchctl").arg("unload").arg(&plist).status();
+        if fs::remove_file(&plist).is_ok() {
+            println!(
+                "{}: removed old Sanhedrin launchd job",
+                "launchd".white().bold()
+            );
+        }
+    }
+}
+
+fn install_sandwich_from_source(
+    source_root: &Path,
+    options: &SandwichInstallOptions,
+) -> anyhow::Result<()> {
+    let home = home_dir()?;
+    let claude_dir = home.join(".claude");
+    let hooks_dir = claude_dir.join("hooks");
+    let agents_dir = claude_dir.join("agents");
+    let settings_path = claude_dir.join("settings.json");
+    let source_root =
+        find_sandwich_source_root(source_root).unwrap_or_else(|| source_root.to_path_buf());
+
+    if !source_root.join("hooks").is_dir() || !source_root.join("agents").is_dir() {
+        anyhow::bail!(
+            "Cognitive Sandwich source missing hooks/ or agents/: {}",
+            source_root.display()
+        );
+    }
+
+    let enable_preflight = options.enable_preflight || options.enable_sandwich;
+    let mut enable_sanhedrin =
+        options.enable_sanhedrin || options.enable_sandwich || options.with_launchd;
+    let mut with_launchd = options.with_launchd;
+
+    if with_launchd && (env::consts::OS != "macos" || env::consts::ARCH != "aarch64") {
+        println!(
+            "{}",
+            "--with-launchd is Apple Silicon only; using endpoint-backed Sanhedrin instead."
+                .yellow()
+        );
+        with_launchd = false;
+        enable_sanhedrin = true;
+    }
+
+    fs::create_dir_all(&claude_dir)?;
+    let (hooks_copied, hooks_skipped) = copy_companion_files(
+        &source_root.join("hooks"),
+        &hooks_dir,
+        &["sh", "py"],
+        0o755,
+        options,
+    )?;
+    let (agents_copied, agents_skipped) = copy_companion_files(
+        &source_root.join("agents"),
+        &agents_dir,
+        &["md"],
+        0o644,
+        options,
+    )?;
+
+    println!(
+        "{}: {} installed, {} skipped",
+        "Hooks".white().bold(),
+        hooks_copied,
+        hooks_skipped
+    );
+    println!(
+        "{}: {} installed, {} skipped",
+        "Agents".white().bold(),
+        agents_copied,
+        agents_skipped
+    );
+
+    if !with_launchd {
+        remove_legacy_launchd_job(&home);
+    }
+
+    let dashboard_port = env::var("VESTIGE_DASHBOARD_PORT").unwrap_or_else(|_| "3927".to_string());
+    let endpoint = options
+        .sanhedrin_endpoint
+        .clone()
+        .or_else(|| env::var("VESTIGE_SANHEDRIN_ENDPOINT").ok())
+        .or_else(|| env::var("MLX_ENDPOINT").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080/v1/chat/completions".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let model = options
+        .sanhedrin_model
+        .clone()
+        .or_else(|| env::var("VESTIGE_SANHEDRIN_MODEL").ok())
+        .or_else(|| env::var("VESTIGE_SANDWICH_MODEL").ok())
+        .unwrap_or_else(|| "mlx-community/Qwen3.6-35B-A3B-4bit".to_string());
+
+    if enable_sanhedrin {
+        write_sanhedrin_env(&hooks_dir, &endpoint, &model, &dashboard_port)?;
+    }
+    if with_launchd {
+        install_launchd_job(&source_root, &home, &model)?;
+    }
+
+    if !settings_path.exists() {
+        fs::write(&settings_path, "{}\n")?;
+    }
+    let backup_path = claude_dir.join("settings.json.bak.pre-sandwich");
+    if !backup_path.exists() {
+        fs::copy(&settings_path, &backup_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&backup_path)?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&backup_path, perms)?;
+        }
+    }
+
+    let settings_file = fs::File::open(&settings_path)?;
+    let mut settings: serde_json::Value =
+        serde_json::from_reader(settings_file).unwrap_or_else(|_| serde_json::json!({}));
+    scrub_vestige_hooks(&mut settings);
+
+    if enable_preflight {
+        merge_settings_fragment(
+            &mut settings,
+            &source_root
+                .join("hooks")
+                .join("settings.preflight.fragment.json"),
+        )?;
+    }
+    if enable_sanhedrin {
+        merge_settings_fragment(
+            &mut settings,
+            &source_root
+                .join("hooks")
+                .join("settings.sanhedrin.fragment.json"),
+        )?;
+    }
+
+    let mut settings_file = fs::File::create(&settings_path)?;
+    serde_json::to_writer_pretty(&mut settings_file, &settings)?;
+    writeln!(settings_file)?;
+
+    if enable_preflight || enable_sanhedrin {
+        let mut layers = Vec::new();
+        if enable_preflight {
+            layers.push("preflight");
+        }
+        if enable_sanhedrin {
+            layers.push("sanhedrin");
+        }
+        println!(
+            "{}: enabled optional layer(s): {}",
+            "Settings".white().bold(),
+            layers.join(", ")
+        );
+    } else {
+        println!(
+            "{}: no Vestige Claude Code hooks enabled by default",
+            "Settings".white().bold()
+        );
+    }
+
+    Ok(())
+}
+
+fn run_sandwich_install(
+    version: Option<&str>,
+    options: &SandwichInstallOptions,
+) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        "=== Vestige Cognitive Sandwich Install ===".cyan().bold()
+    );
+    println!();
+
+    if let Some(source_root) = &options.src {
+        install_sandwich_from_source(source_root, options)?;
+    } else {
+        let temp_dir = UpdateTempDir::create()?;
+        let source_root = download_sandwich_source(version, &temp_dir.path)?;
+        install_sandwich_from_source(&source_root, options)?;
+    }
+
+    println!();
+    let optional_layers_enabled = options.enable_preflight
+        || options.enable_sandwich
+        || options.enable_sanhedrin
+        || options.with_launchd;
+    let message = if optional_layers_enabled {
+        "Cognitive Sandwich files updated. Restart Claude Code to use enabled optional hooks."
+    } else {
+        "Cognitive Sandwich files updated. No hooks enabled; no automatic model calls."
+    };
+    println!("{}", message.green().bold());
+    Ok(())
+}
+
+fn run_command(command: &mut Command, action: &str) -> anyhow::Result<()> {
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start {}", action))?;
+    if !status.success() {
+        anyhow::bail!("{} failed with status {}", action, status);
+    }
+    Ok(())
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path)
+    }
+}
+
+fn command_output(command: &mut Command, action: &str) -> anyhow::Result<String> {
+    let output = command
+        .output()
+        .with_context(|| format!("failed to start {}", action))?;
+    if !output.status.success() {
+        anyhow::bail!("{} failed with status {}", action, output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn powershell_quote(value: &Path) -> String {
+    format!("'{}'", value.display().to_string().replace('\'', "''"))
+}
+
+fn normalize_archive_entry(entry: &str) -> anyhow::Result<String> {
+    let normalized = entry.trim().replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.get(1..2) == Some(":")
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "..")
+    {
+        anyhow::bail!("archive contains unsafe entry: {}", entry);
+    }
+    Ok(normalized.to_string())
+}
+
+fn archive_listing(archive_path: &Path, archive_ext: &str) -> anyhow::Result<String> {
+    let listing = match archive_ext {
+        "tar.gz" => command_output(
+            Command::new("tar").arg("-tzf").arg(archive_path),
+            "listing Vestige archive with tar",
+        )?,
+        "zip" => {
+            let script = format!(
+                "Add-Type -AssemblyName System.IO.Compression.FileSystem; \
+                 $zip = [System.IO.Compression.ZipFile]::OpenRead({}); \
+                 try {{ $zip.Entries | ForEach-Object {{ $_.FullName }} }} finally {{ $zip.Dispose() }}",
+                powershell_quote(archive_path)
+            );
+            command_output(
+                Command::new("powershell")
+                    .arg("-NoProfile")
+                    .arg("-Command")
+                    .arg(script),
+                "listing Vestige archive with PowerShell",
+            )?
+        }
+        other => anyhow::bail!("unsupported release archive extension: {}", other),
+    };
+    Ok(listing)
+}
+
+fn validate_archive_safety(archive_path: &Path, archive_ext: &str) -> anyhow::Result<()> {
+    let listing = archive_listing(archive_path, archive_ext)?;
+    for entry in listing.lines().filter(|line| !line.trim().is_empty()) {
+        normalize_archive_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_archive_entries(
+    archive_path: &Path,
+    archive_ext: &str,
+    expected_members: &[String],
+) -> anyhow::Result<()> {
+    let listing = archive_listing(archive_path, archive_ext)?;
+
+    let expected: HashSet<&str> = expected_members.iter().map(String::as_str).collect();
+    for entry in listing.lines().filter(|line| !line.trim().is_empty()) {
+        let normalized = normalize_archive_entry(entry)?;
+        if !expected.contains(normalized.as_str()) {
+            anyhow::bail!("release archive contains unexpected entry: {}", entry);
+        }
+    }
+    Ok(())
+}
+
+fn extract_source_archive(archive_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
+    validate_archive_safety(archive_path, "tar.gz")?;
+    run_command(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(output_dir),
+        "extracting Vestige source archive with tar",
+    )
+}
+
+fn extract_archive(
+    archive_path: &Path,
+    output_dir: &Path,
+    archive_ext: &str,
+    expected_members: &[String],
+) -> anyhow::Result<()> {
+    validate_archive_entries(archive_path, archive_ext, expected_members)?;
+    match archive_ext {
+        "tar.gz" => run_command(
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(archive_path)
+                .arg("-C")
+                .arg(output_dir),
+            "extracting Vestige release archive with tar",
+        ),
+        "zip" => run_command(
+            Command::new("powershell")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg(format!(
+                    "Expand-Archive -LiteralPath {} -DestinationPath {} -Force",
+                    powershell_quote(archive_path),
+                    powershell_quote(output_dir)
+                )),
+            "extracting Vestige release archive with PowerShell",
+        ),
+        other => anyhow::bail!("unsupported release archive extension: {}", other),
+    }
+}
+
+fn replace_binary(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid destination path {}", destination.display()))?;
+    let temp_destination = destination.with_file_name(format!(
+        ".{}.vestige-update-{}",
+        file_name,
+        std::process::id()
+    ));
+
+    fs::copy(source, &temp_destination).with_context(|| {
+        format!(
+            "failed to stage {} for install at {}",
+            source.display(),
+            temp_destination.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&temp_destination)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&temp_destination, perms)?;
+    }
+
+    #[cfg(windows)]
+    if destination.exists() {
+        fs::remove_file(destination).with_context(|| {
+            format!(
+                "failed to replace {}. Close running Vestige processes and retry",
+                destination.display()
+            )
+        })?;
+    }
+
+    fs::rename(&temp_destination, destination).with_context(|| {
+        let _ = fs::remove_file(&temp_destination);
+        format!(
+            "failed to install {}. If this is a system directory, retry with: sudo vestige update",
+            destination.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn run_update(
+    version: Option<String>,
+    install_dir: Option<PathBuf>,
+    dry_run: bool,
+    no_sandwich: bool,
+    sandwich_companion: bool,
+    sandwich: SandwichInstallOptions,
+) -> anyhow::Result<()> {
+    println!("{}", "=== Vestige Update ===".cyan().bold());
+    println!();
+
+    let asset = current_release_asset()?;
+    let current_exe = env::current_exe().context("failed to locate current vestige executable")?;
+    let install_dir = match install_dir {
+        Some(path) => path,
+        None => current_exe
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("current executable has no parent directory"))?
+            .to_path_buf(),
+    };
+
+    let url = release_download_url(asset, version.as_deref());
+    let archive_name = format!("vestige-mcp-{}.{}", asset.target, asset.archive_ext);
+
+    println!(
+        "{}: {}",
+        "Current version".white().bold(),
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "{}: {}",
+        "Release".white().bold(),
+        version.as_deref().unwrap_or("latest")
+    );
+    println!("{}: {}", "Target".white().bold(), asset.target);
+    println!(
+        "{}: {}",
+        "Install dir".white().bold(),
+        install_dir.display()
+    );
+    println!("{}: {}", "Download".white().bold(), url);
+
+    if dry_run {
+        println!();
+        println!("{}", "Dry run: no files changed.".yellow().bold());
+        return Ok(());
+    }
+
+    fs::create_dir_all(&install_dir).with_context(|| {
+        format!(
+            "failed to create install directory {}",
+            install_dir.display()
+        )
+    })?;
+
+    let temp_dir = UpdateTempDir::create()?;
+    let archive_path = temp_dir.path.join(&archive_name);
+    let checksum_path = temp_dir.path.join(format!("{}.sha256", archive_name));
+
+    println!();
+    println!("{}", "Downloading release archive...".cyan());
+    download_file(&url, &archive_path, "downloading Vestige release archive")?;
+    download_file(
+        &format!("{}.sha256", url),
+        &checksum_path,
+        "downloading Vestige release checksum",
+    )?;
+    verify_release_checksum(&archive_path, &checksum_path)?;
+
+    let binaries = ["vestige", "vestige-mcp", "vestige-restore"];
+    let mut expected_members = binaries
+        .iter()
+        .map(|binary| format!("{}{}", binary, asset.binary_suffix))
+        .collect::<Vec<_>>();
+    if asset.target == "x86_64-apple-darwin" {
+        expected_members.push("INSTALL-INTEL-MAC.md".to_string());
+    }
+
+    println!("{}", "Extracting release archive...".cyan());
+    extract_archive(
+        &archive_path,
+        &temp_dir.path,
+        asset.archive_ext,
+        &expected_members,
+    )?;
+
+    for binary in binaries {
+        let filename = format!("{}{}", binary, asset.binary_suffix);
+        let source = temp_dir.path.join(&filename);
+        if !source.exists() {
+            anyhow::bail!("release archive is missing expected binary: {}", filename);
+        }
+
+        let destination = install_dir.join(&filename);
+        println!("  {} {}", "install".dimmed(), destination.display());
+        replace_binary(&source, &destination)?;
+    }
+
+    println!();
+    let installed_mcp = install_dir.join(format!("vestige-mcp{}", asset.binary_suffix));
+    if let Ok(output) = Command::new(&installed_mcp).arg("--version").output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            println!("{}: {}", "Installed".white().bold(), version.green());
+        }
+    }
+
+    println!(
+        "{}",
+        "Binary update complete. Restart your MCP client to pick up the new binary."
+            .green()
+            .bold()
+    );
+
+    if sandwich_companion && !no_sandwich {
+        println!();
+        println!(
+            "{}",
+            "Updating Cognitive Sandwich companion files...".cyan()
+        );
+        run_sandwich_install(version.as_deref(), &sandwich)?;
+    } else if no_sandwich {
+        println!(
+            "{}",
+            "Skipped Cognitive Sandwich companion update (--no-sandwich).".yellow()
+        );
+    } else {
+        println!(
+            "{}",
+            "Skipped Cognitive Sandwich companion update (default). Pass --sandwich-companion to refresh Claude Code companion files."
+                .yellow()
+        );
+    }
+
+    Ok(())
+}
+
 /// Run stats command
 fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
     let stats = storage.get_stats()?;
 
     println!("{}", "=== Vestige Memory Statistics ===".cyan().bold());
@@ -199,8 +1341,20 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
         stats.nodes_with_embeddings
     );
 
+    if let Some(model) = &stats.active_embedding_model {
+        println!("{}: {}", "Active Embedding Model".white().bold(), model);
+    }
+
     if let Some(model) = &stats.embedding_model {
-        println!("{}: {}", "Embedding Model".white().bold(), model);
+        println!("{}: {}", "Stored Embedding Model".white().bold(), model);
+    }
+
+    if stats.nodes_with_mismatched_embeddings > 0 {
+        println!(
+            "{}: {}",
+            "Mismatched Embeddings".white().bold(),
+            stats.nodes_with_mismatched_embeddings
+        );
     }
 
     if let Some(oldest) = stats.oldest_memory {
@@ -220,13 +1374,13 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
 
     // Embedding coverage
     let embedding_coverage = if stats.total_nodes > 0 {
-        (stats.nodes_with_embeddings as f64 / stats.total_nodes as f64) * 100.0
+        (stats.nodes_with_active_embeddings as f64 / stats.total_nodes as f64) * 100.0
     } else {
         0.0
     };
     println!(
         "{}: {:.1}%",
-        "Embedding Coverage".white().bold(),
+        "Active Embedding Coverage".white().bold(),
         embedding_coverage
     );
 
@@ -351,7 +1505,7 @@ fn print_distribution_bar(label: &str, count: usize, total: usize, color: &str) 
 
 /// Run health check
 fn run_health() -> anyhow::Result<()> {
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
     let stats = storage.get_stats()?;
 
     println!("{}", "=== Vestige Health Check ===".cyan().bold());
@@ -390,13 +1544,13 @@ fn run_health() -> anyhow::Result<()> {
 
     // Embedding coverage
     let embedding_coverage = if stats.total_nodes > 0 {
-        (stats.nodes_with_embeddings as f64 / stats.total_nodes as f64) * 100.0
+        (stats.nodes_with_active_embeddings as f64 / stats.total_nodes as f64) * 100.0
     } else {
         0.0
     };
     println!(
         "{}: {:.1}%",
-        "Embedding Coverage".white(),
+        "Active Embedding Coverage".white(),
         embedding_coverage
     );
     println!(
@@ -421,12 +1575,16 @@ fn run_health() -> anyhow::Result<()> {
         warnings.push("Many memories are due for review");
     }
 
-    if stats.total_nodes > 0 && stats.nodes_with_embeddings == 0 {
-        warnings.push("No embeddings generated - semantic search unavailable");
+    if stats.total_nodes > 0 && stats.nodes_with_active_embeddings == 0 {
+        warnings.push("No active-model embeddings generated - semantic search unavailable");
     }
 
     if embedding_coverage < 50.0 && stats.total_nodes > 10 {
         warnings.push("Low embedding coverage - run consolidation to improve semantic search");
+    }
+
+    if stats.nodes_with_mismatched_embeddings > 0 {
+        warnings.push("Stored embeddings from another model are present - run consolidation after changing embedding models");
     }
 
     if !warnings.is_empty() {
@@ -449,9 +1607,9 @@ fn run_health() -> anyhow::Result<()> {
         recommendations.push("Review due memories to strengthen retention.");
     }
 
-    if stats.nodes_with_embeddings < stats.total_nodes {
+    if stats.nodes_with_active_embeddings < stats.total_nodes {
         recommendations
-            .push("Run 'vestige consolidate' to generate embeddings for better semantic search.");
+            .push("Run 'vestige consolidate' to generate active-model embeddings for better semantic search.");
     }
 
     if stats.total_nodes > 100 && stats.average_retention < 0.7 {
@@ -488,7 +1646,7 @@ fn run_consolidate() -> anyhow::Result<()> {
     println!("Running memory consolidation cycle...");
     println!();
 
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
     let result = storage.run_consolidation()?;
 
     println!(
@@ -534,7 +1692,49 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
     println!("Loading backup from: {}", backup_path.display());
 
     // Read and parse backup
-    let backup_content = std::fs::read_to_string(&backup_path)?;
+    let backup_bytes = std::fs::read(&backup_path)?;
+    if backup_bytes.starts_with(b"SQLite format 3\0") {
+        anyhow::bail!(
+            "{} is a raw SQLite database backup, not a JSON restore file. Use portable-export/portable-import for cross-device transfer, or replace the database file manually while Vestige is stopped.",
+            backup_path.display()
+        );
+    }
+    let backup_content = String::from_utf8(backup_bytes)
+        .with_context(|| format!("{} is not UTF-8 JSON", backup_path.display()))?;
+
+    if let Ok(archive) = serde_json::from_str::<vestige_core::PortableArchive>(&backup_content)
+        && archive.archive_format == vestige_core::PORTABLE_ARCHIVE_FORMAT
+    {
+        println!("Detected portable archive.");
+        println!("{}: {}", "Format".white().bold(), archive.archive_format);
+        println!("{}: {}", "Schema".white().bold(), archive.schema_version);
+        println!("{}: {}", "Tables".white().bold(), archive.tables.len());
+        println!("{}: {}", "Rows".white().bold(), archive.total_rows());
+        println!();
+
+        let storage = open_storage()?;
+        let report = storage.import_portable_archive(&archive, PortableImportMode::EmptyOnly)?;
+
+        println!(
+            "{}: {}",
+            "Tables imported".white().bold(),
+            report.tables_imported
+        );
+        println!(
+            "{}: {}",
+            "Rows imported".white().bold(),
+            report.rows_imported
+        );
+        println!(
+            "{}: {}",
+            "Tables skipped".white().bold(),
+            report.tables_skipped
+        );
+        println!("{}: {}", "FTS rebuilt".white().bold(), report.fts_rebuilt);
+        println!();
+        println!("{}", "Portable restore complete.".green().bold());
+        return Ok(());
+    }
 
     #[derive(serde::Deserialize)]
     struct BackupWrapper {
@@ -557,16 +1757,27 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
         source: Option<String>,
     }
 
-    let wrapper: Vec<BackupWrapper> = serde_json::from_str(&backup_content)?;
-    let recall_result: RecallResult = serde_json::from_str(&wrapper[0].text)?;
-    let memories = recall_result.results;
+    let memories = if let Ok(wrapper) = serde_json::from_str::<Vec<BackupWrapper>>(&backup_content)
+    {
+        let first = wrapper.first().context("backup wrapper is empty")?;
+        let recall_result: RecallResult = serde_json::from_str(&first.text)?;
+        recall_result.results
+    } else if let Ok(recall_result) = serde_json::from_str::<RecallResult>(&backup_content) {
+        recall_result.results
+    } else if let Ok(memories) = serde_json::from_str::<Vec<MemoryBackup>>(&backup_content) {
+        memories
+    } else {
+        anyhow::bail!(
+            "Unrecognized backup format. Expected portable archive, MCP wrapper, RecallResult, or array of memories."
+        );
+    };
 
     println!("Found {} memories to restore", memories.len());
     println!();
 
     // Initialize storage
     println!("Initializing storage...");
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
 
     println!("Generating embeddings and ingesting memories...");
     println!();
@@ -616,8 +1827,8 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
     println!("{}: {}", "Total Nodes".white(), stats.total_nodes);
     println!(
         "{}: {}",
-        "With Embeddings".white(),
-        stats.nodes_with_embeddings
+        "Active Embeddings".white(),
+        stats.nodes_with_active_embeddings
     );
 
     Ok(())
@@ -625,9 +1836,20 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
 
 /// Get the default database path
 fn get_default_db_path() -> anyhow::Result<PathBuf> {
-    let proj_dirs = ProjectDirs::from("com", "vestige", "core")
-        .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
-    Ok(proj_dirs.data_dir().join("vestige.db"))
+    if let Some(path) = CLI_DB_PATH.get() {
+        Ok(path.clone())
+    } else {
+        Ok(Storage::default_db_path()?)
+    }
+}
+
+/// Open storage using the CLI-selected data directory, if one was provided.
+fn open_storage() -> anyhow::Result<Storage> {
+    if let Some(path) = CLI_DB_PATH.get() {
+        Ok(Storage::new(Some(path.clone()))?)
+    } else {
+        Ok(Storage::new(None)?)
+    }
 }
 
 /// Fetch all nodes from storage using pagination
@@ -663,7 +1885,7 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     // Open storage to flush WAL before copying
     println!("Flushing WAL checkpoint...");
     {
-        let storage = Storage::new(None)?;
+        let storage = open_storage()?;
         // get_stats triggers a read so the connection is active, then drop flushes
         let _ = storage.get_stats()?;
     }
@@ -687,6 +1909,13 @@ fn run_backup(output: PathBuf) -> anyhow::Result<()> {
     println!("  {}   {}", "To:".dimmed(), output.display());
 
     std::fs::copy(&db_path, &output)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&output)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&output, perms)?;
+    }
 
     let file_size = std::fs::metadata(&output)?.len();
     let size_display = if file_size >= 1024 * 1024 {
@@ -750,7 +1979,7 @@ fn run_export(
         })
         .unwrap_or_default();
 
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
     let all_nodes = fetch_all_nodes(&storage)?;
 
     // Apply filters
@@ -797,7 +2026,7 @@ fn run_export(
         std::fs::create_dir_all(parent)?;
     }
 
-    let file = std::fs::File::create(&output)?;
+    let file = create_private_file(&output)?;
     let mut writer = BufWriter::new(file);
 
     match format.as_str() {
@@ -841,6 +2070,145 @@ fn run_export(
     Ok(())
 }
 
+/// Run exact portable archive export.
+fn run_portable_export(output: PathBuf) -> anyhow::Result<()> {
+    println!("{}", "=== Vestige Portable Export ===".cyan().bold());
+    println!();
+
+    if let Some(parent) = output.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let storage = open_storage()?;
+    let archive = storage.export_portable_archive_to_path(&output)?;
+
+    let file_size = std::fs::metadata(&output)?.len();
+    let size_display = if file_size >= 1024 * 1024 {
+        format!("{:.2} MB", file_size as f64 / (1024.0 * 1024.0))
+    } else if file_size >= 1024 {
+        format!("{:.1} KB", file_size as f64 / 1024.0)
+    } else {
+        format!("{} bytes", file_size)
+    };
+
+    println!("{}: {}", "Archive".white().bold(), output.display());
+    println!("{}: {}", "Format".white().bold(), archive.archive_format);
+    println!("{}: {}", "Schema".white().bold(), archive.schema_version);
+    println!("{}: {}", "Tables".white().bold(), archive.tables.len());
+    println!("{}: {}", "Rows".white().bold(), archive.total_rows());
+    println!();
+    println!(
+        "{}",
+        format!(
+            "Portable export complete: {} ({})",
+            output.display(),
+            size_display
+        )
+        .green()
+        .bold()
+    );
+
+    Ok(())
+}
+
+/// Run exact portable archive import.
+fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
+    println!("{}", "=== Vestige Portable Import ===".cyan().bold());
+    println!();
+    println!("{}: {}", "Archive".white().bold(), input.display());
+    let mode = if merge {
+        PortableImportMode::Merge
+    } else {
+        PortableImportMode::EmptyOnly
+    };
+    println!(
+        "{}",
+        if merge {
+            "Mode: merge into existing database".yellow()
+        } else {
+            "Mode: empty database only".yellow()
+        }
+    );
+    println!();
+
+    let storage = open_storage()?;
+    let report = storage.import_portable_archive_from_path(&input, mode)?;
+
+    println!(
+        "{}: {}",
+        "Tables imported".white().bold(),
+        report.tables_imported
+    );
+    println!(
+        "{}: {}",
+        "Rows imported".white().bold(),
+        report.rows_imported
+    );
+    println!(
+        "{}: {}",
+        "Tables skipped".white().bold(),
+        report.tables_skipped
+    );
+    println!("{}: {}", "FTS rebuilt".white().bold(), report.fts_rebuilt);
+    if merge {
+        println!(
+            "{}: {} inserted, {} updated, {} deleted, {} skipped, {} kept local",
+            "Merge".white().bold(),
+            report.rows_inserted,
+            report.rows_updated,
+            report.rows_deleted,
+            report.rows_skipped,
+            report.conflicts_kept_local
+        );
+    }
+    println!();
+    println!("{}", "Portable import complete.".green().bold());
+
+    Ok(())
+}
+
+/// Run file-backed two-way sync.
+fn run_sync(archive: PathBuf) -> anyhow::Result<()> {
+    println!("{}", "=== Vestige File Sync ===".cyan().bold());
+    println!();
+    println!("{}: {}", "Archive".white().bold(), archive.display());
+
+    let storage = open_storage()?;
+    let report = storage.sync_portable_archive_file(&archive)?;
+
+    if let Some(pull) = &report.pull {
+        println!("{}", "Pull: merged remote archive".yellow());
+        println!(
+            "  {} inserted, {} updated, {} deleted, {} skipped, {} kept local",
+            pull.rows_inserted,
+            pull.rows_updated,
+            pull.rows_deleted,
+            pull.rows_skipped,
+            pull.conflicts_kept_local
+        );
+    } else {
+        println!(
+            "{}",
+            "Pull: archive does not exist yet; creating it".yellow()
+        );
+    }
+
+    println!("{}", "Push: wrote merged local state".yellow());
+    println!(
+        "{}",
+        format!(
+            "Sync complete: {} tables, {} rows",
+            report.pushed_tables, report.pushed_rows
+        )
+        .green()
+        .bold()
+    );
+
+    Ok(())
+}
+
 /// Run garbage collection command
 fn run_gc(
     min_retention: f64,
@@ -851,7 +2219,7 @@ fn run_gc(
     println!("{}", "=== Vestige Garbage Collection ===".cyan().bold());
     println!();
 
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
     let all_nodes = fetch_all_nodes(&storage)?;
     let now = Utc::now();
 
@@ -1027,7 +2395,7 @@ fn run_ingest(
         valid_until: None,
     };
 
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
 
     // Try smart_ingest (PE Gating) if available, otherwise regular ingest
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
@@ -1081,7 +2449,7 @@ fn run_dashboard(port: u16, open_browser: bool) -> anyhow::Result<()> {
         format!("http://127.0.0.1:{}", port).cyan()
     );
 
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
 
     // Try to initialize embeddings for search support
     #[cfg(feature = "embeddings")]
@@ -1112,7 +2480,7 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
     println!("{}", "=== Vestige HTTP Server ===".cyan().bold());
     println!();
 
-    let storage = Storage::new(None)?;
+    let storage = open_storage()?;
 
     #[cfg(feature = "embeddings")]
     {
@@ -1173,7 +2541,9 @@ fn run_serve(port: u16, with_dashboard: bool, dashboard_port: u16) -> anyhow::Re
             bind,
             port
         );
-        println!("  {} Auth token: {}...", ">".cyan(), &token[..8]);
+        if let Ok(path) = vestige_mcp::protocol::auth::token_path() {
+            println!("  {} Auth token file: {}", ">".cyan(), path.display());
+        }
         println!();
         println!("{}", "Press Ctrl+C to stop.".dimmed());
 
@@ -1205,5 +2575,88 @@ fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{}...", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_asset_mapping_matches_release_names() {
+        let mac_arm = release_asset_for("macos", "aarch64").unwrap();
+        assert_eq!(mac_arm.target, "aarch64-apple-darwin");
+        assert_eq!(mac_arm.archive_ext, "tar.gz");
+        assert_eq!(mac_arm.binary_suffix, "");
+
+        let linux = release_asset_for("linux", "x86_64").unwrap();
+        assert_eq!(linux.target, "x86_64-unknown-linux-gnu");
+        assert_eq!(linux.archive_ext, "tar.gz");
+
+        let windows = release_asset_for("windows", "x86_64").unwrap();
+        assert_eq!(windows.target, "x86_64-pc-windows-msvc");
+        assert_eq!(windows.archive_ext, "zip");
+        assert_eq!(windows.binary_suffix, ".exe");
+    }
+
+    #[test]
+    fn update_url_uses_latest_or_normalized_tag() {
+        let asset = release_asset_for("macos", "aarch64").unwrap();
+        assert_eq!(
+            release_download_url(asset, None),
+            "https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            release_download_url(asset, Some("2.1.0")),
+            "https://github.com/samvallad33/vestige/releases/download/v2.1.0/vestige-mcp-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            release_download_url(asset, Some("v2.1.0")),
+            "https://github.com/samvallad33/vestige/releases/download/v2.1.0/vestige-mcp-aarch64-apple-darwin.tar.gz"
+        );
+    }
+
+    #[test]
+    fn source_archive_url_uses_normalized_tag() {
+        assert_eq!(normalize_release_tag("2.1.1"), "v2.1.1");
+        assert_eq!(normalize_release_tag("v2.1.1"), "v2.1.1");
+        assert_eq!(
+            source_archive_url("v2.1.1"),
+            "https://github.com/samvallad33/vestige/archive/refs/tags/v2.1.1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn scrub_vestige_hooks_removes_only_vestige_commands() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "/tmp/synthesis-preflight.sh" },
+                            { "type": "command", "command": "/tmp/custom-user-hook.sh" }
+                        ]
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "/tmp/sanhedrin.sh" }
+                        ]
+                    }
+                ]
+            },
+            "other": true
+        });
+
+        scrub_vestige_hooks(&mut settings);
+
+        let user_hooks = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(user_hooks.len(), 1);
+        assert_eq!(user_hooks[0]["command"], "/tmp/custom-user-hook.sh");
+        assert!(settings["hooks"].get("Stop").is_none());
+        assert_eq!(settings["other"], true);
     }
 }

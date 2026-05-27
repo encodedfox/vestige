@@ -6,11 +6,30 @@
 use chrono::{NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::cognitive::CognitiveEngine;
 use vestige_core::{FSRSScheduler, Storage};
+
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)
+    }
+}
 
 // ============================================================================
 // SCHEMAS
@@ -36,8 +55,8 @@ pub fn export_schema() -> Value {
         "properties": {
             "format": {
                 "type": "string",
-                "description": "Export format: 'json' (default) or 'jsonl'",
-                "enum": ["json", "jsonl"],
+                "description": "Export format: 'json' (default), 'jsonl', or 'portable' for exact Vestige-to-Vestige transfer",
+                "enum": ["json", "jsonl", "portable"],
                 "default": "json"
             },
             "tags": {
@@ -51,7 +70,7 @@ pub fn export_schema() -> Value {
             },
             "path": {
                 "type": "string",
-                "description": "Custom filename (not path). File is saved in ~/.vestige/exports/. Default: memories-{timestamp}.{format}"
+                "description": "Custom filename (not path). File is saved in the active Vestige data directory's exports/ folder. Default: memories-{timestamp}.{format}"
             }
         }
     })
@@ -117,7 +136,7 @@ pub async fn execute_system_status(
     };
 
     let embedding_coverage = if stats.total_nodes > 0 {
-        (stats.nodes_with_embeddings as f64 / stats.total_nodes as f64) * 100.0
+        (stats.nodes_with_active_embeddings as f64 / stats.total_nodes as f64) * 100.0
     } else {
         0.0
     };
@@ -131,11 +150,16 @@ pub async fn execute_system_status(
     if stats.nodes_due_for_review > 10 {
         warnings.push("Many memories are due for review");
     }
-    if stats.total_nodes > 0 && stats.nodes_with_embeddings == 0 {
-        warnings.push("No embeddings generated - semantic search unavailable");
+    if stats.total_nodes > 0 && stats.nodes_with_active_embeddings == 0 {
+        warnings.push("No active-model embeddings generated - semantic search unavailable");
     }
     if embedding_coverage < 50.0 && stats.total_nodes > 10 {
         warnings.push("Low embedding coverage - run consolidate to improve semantic search");
+    }
+    if stats.nodes_with_mismatched_embeddings > 0 {
+        warnings.push(
+            "Stored embeddings from another model are present - run consolidate after changing embedding models",
+        );
     }
 
     let mut recommendations = Vec::new();
@@ -146,8 +170,8 @@ pub async fn execute_system_status(
     if stats.nodes_due_for_review > 5 {
         recommendations.push("Review due memories to strengthen retention.");
     }
-    if stats.nodes_with_embeddings < stats.total_nodes {
-        recommendations.push("Run 'consolidate' to generate missing embeddings.");
+    if stats.nodes_with_active_embeddings < stats.total_nodes {
+        recommendations.push("Run 'consolidate' to generate active-model embeddings.");
     }
     if stats.total_nodes > 100 && stats.average_retention < 0.7 {
         recommendations.push("Consider running periodic consolidation.");
@@ -233,7 +257,7 @@ pub async fn execute_system_status(
         Some(dt) => storage.count_memories_since(*dt).unwrap_or(0),
         None => stats.total_nodes,
     };
-    let last_backup = Storage::get_last_backup_timestamp();
+    let last_backup = storage.last_backup_timestamp();
 
     Ok(serde_json::json!({
         "tool": "system_status",
@@ -249,8 +273,11 @@ pub async fn execute_system_status(
         "averageStorageStrength": stats.average_storage_strength,
         "averageRetrievalStrength": stats.average_retrieval_strength,
         "withEmbeddings": stats.nodes_with_embeddings,
+        "withActiveEmbeddings": stats.nodes_with_active_embeddings,
+        "mismatchedEmbeddings": stats.nodes_with_mismatched_embeddings,
         "embeddingCoverage": format!("{:.1}%", embedding_coverage),
         "embeddingModel": stats.embedding_model,
+        "activeEmbeddingModel": stats.active_embedding_model,
         "oldestMemory": stats.oldest_memory.map(|dt| dt.to_rfc3339()),
         "newestMemory": stats.newest_memory.map(|dt| dt.to_rfc3339()),
         // Distribution
@@ -299,13 +326,7 @@ pub async fn execute_consolidate(
 /// Backup tool
 pub async fn execute_backup(storage: &Arc<Storage>, _args: Option<Value>) -> Result<Value, String> {
     // Determine backup path
-    let vestige_dir = directories::ProjectDirs::from("com", "vestige", "core")
-        .ok_or("Could not determine data directory")?;
-    let backup_dir = vestige_dir
-        .data_dir()
-        .parent()
-        .unwrap_or(vestige_dir.data_dir())
-        .join("backups");
+    let backup_dir = storage.sidecar_dir("backups");
 
     std::fs::create_dir_all(&backup_dir)
         .map_err(|e| format!("Failed to create backup directory: {}", e))?;
@@ -354,11 +375,58 @@ pub async fn execute_export(storage: &Arc<Storage>, args: Option<Value>) -> Resu
     };
 
     let format = args.format.unwrap_or_else(|| "json".to_string());
-    if format != "json" && format != "jsonl" {
+    if format != "json" && format != "jsonl" && format != "portable" {
         return Err(format!(
-            "Invalid format '{}'. Must be 'json' or 'jsonl'.",
+            "Invalid format '{}'. Must be 'json', 'jsonl', or 'portable'.",
             format
         ));
+    }
+
+    if format == "portable" {
+        if args.tags.as_ref().is_some_and(|tags| !tags.is_empty()) || args.since.is_some() {
+            return Err(
+                "Portable export is exact and does not support tags or since filters.".to_string(),
+            );
+        }
+
+        let export_dir = storage.sidecar_dir("exports");
+        std::fs::create_dir_all(&export_dir)
+            .map_err(|e| format!("Failed to create export directory: {}", e))?;
+
+        let export_path = match args.path {
+            Some(ref p) => {
+                let filename = std::path::Path::new(p)
+                    .file_name()
+                    .ok_or("Invalid export filename: must be a simple filename, not a path")?;
+                let name_str = filename.to_str().ok_or("Invalid filename encoding")?;
+                if name_str.contains("..") {
+                    return Err("Invalid export filename: '..' not allowed".to_string());
+                }
+                export_dir.join(filename)
+            }
+            None => {
+                let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+                export_dir.join(format!("vestige-portable-{}.json", timestamp))
+            }
+        };
+
+        let archive = storage
+            .export_portable_archive_to_path(&export_path)
+            .map_err(|e| e.to_string())?;
+        let file_size = std::fs::metadata(&export_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        return Ok(serde_json::json!({
+            "tool": "export",
+            "path": export_path.display().to_string(),
+            "format": "portable",
+            "archiveFormat": archive.archive_format,
+            "schemaVersion": archive.schema_version,
+            "tablesExported": archive.tables.len(),
+            "rowsExported": archive.total_rows(),
+            "sizeBytes": file_size,
+        }));
     }
 
     // Parse since date
@@ -412,13 +480,7 @@ pub async fn execute_export(storage: &Arc<Storage>, args: Option<Value>) -> Resu
         .collect();
 
     // Determine export path — always constrained to vestige exports directory
-    let vestige_dir = directories::ProjectDirs::from("com", "vestige", "core")
-        .ok_or("Could not determine data directory")?;
-    let export_dir = vestige_dir
-        .data_dir()
-        .parent()
-        .unwrap_or(vestige_dir.data_dir())
-        .join("exports");
+    let export_dir = storage.sidecar_dir("exports");
     std::fs::create_dir_all(&export_dir)
         .map_err(|e| format!("Failed to create export directory: {}", e))?;
 
@@ -441,7 +503,7 @@ pub async fn execute_export(storage: &Arc<Storage>, args: Option<Value>) -> Resu
     };
 
     // Write export
-    let file = std::fs::File::create(&export_path)
+    let file = create_private_file(&export_path)
         .map_err(|e| format!("Failed to create export file: {}", e))?;
     let mut writer = std::io::BufWriter::new(file);
 
@@ -728,5 +790,42 @@ mod tests {
         // No dream ever → savesSinceLastDream == totalMemories
         assert_eq!(triggers["savesSinceLastDream"], 3);
         assert!(triggers["lastDreamTimestamp"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_portable_export_writes_archive_to_storage_exports_dir() {
+        let (storage, _dir) = test_storage().await;
+        storage
+            .ingest(vestige_core::IngestInput {
+                content: "Portable MCP export test memory".to_string(),
+                node_type: "fact".to_string(),
+                source: None,
+                sentiment_score: 0.0,
+                sentiment_magnitude: 0.0,
+                tags: vec!["portable".to_string()],
+                valid_from: None,
+                valid_until: None,
+            })
+            .unwrap();
+
+        let result = execute_export(
+            &storage,
+            Some(serde_json::json!({
+                "format": "portable",
+                "path": "portable-test.json"
+            })),
+        )
+        .await
+        .unwrap();
+
+        let path = result["path"].as_str().unwrap();
+        assert_eq!(result["format"], "portable");
+        assert!(path.ends_with("exports/portable-test.json"));
+        assert!(std::path::Path::new(path).exists());
+        assert_eq!(
+            result["archiveFormat"],
+            vestige_core::PORTABLE_ARCHIVE_FORMAT
+        );
+        assert!(result["rowsExported"].as_u64().unwrap() > 0);
     }
 }

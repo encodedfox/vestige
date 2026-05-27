@@ -7,7 +7,13 @@
 //! - **Default**: Nomic Embed Text v1.5 (ONNX, 768d → 256d Matryoshka, 8192 context)
 //! - **Optional**: Nomic Embed Text v2 MoE (Candle, 475M params, 305M active, 8 experts)
 //!   Enable with `nomic-v2` feature flag + `metal` for Apple Silicon acceleration.
+//! - **Optional**: Qwen3 Embedding 0.6B (Candle, 1024d → 256d Matryoshka)
+//!   Enable with `qwen3-embeddings` and `VESTIGE_EMBEDDING_MODEL=qwen3-0.6b`.
 
+#[cfg(feature = "qwen3-embeddings")]
+use candle_core::{DType, Device};
+#[cfg(feature = "qwen3-embeddings")]
+use fastembed::Qwen3TextEmbedding;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use std::sync::{Mutex, OnceLock};
 
@@ -31,7 +37,82 @@ pub const BATCH_SIZE: usize = 32;
 // ============================================================================
 
 /// Result type for model initialization
-static EMBEDDING_MODEL_RESULT: OnceLock<Result<Mutex<TextEmbedding>, String>> = OnceLock::new();
+static EMBEDDING_BACKEND_RESULT: OnceLock<Result<Mutex<EmbeddingBackend>, String>> =
+    OnceLock::new();
+
+const NOMIC_V15_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
+#[cfg(feature = "qwen3-embeddings")]
+const QWEN3_06B_MODEL_ID: &str = "Qwen/Qwen3-Embedding-0.6B";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingModelSpec {
+    NomicV15,
+    #[cfg(feature = "qwen3-embeddings")]
+    Qwen3Embedding06B,
+}
+
+impl EmbeddingModelSpec {
+    fn selected() -> Result<Self, String> {
+        let requested = std::env::var("VESTIGE_EMBEDDING_MODEL")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "nomic-v1.5".to_string());
+
+        match requested.as_str() {
+            "nomic" | "nomic-v1.5" | "nomic-embed-text-v1.5" | NOMIC_V15_MODEL_ID => {
+                Ok(Self::NomicV15)
+            }
+            "qwen3" | "qwen3-0.6b" | "qwen3-embedding-0.6b" | "qwen/qwen3-embedding-0.6b" => {
+                #[cfg(feature = "qwen3-embeddings")]
+                {
+                    Ok(Self::Qwen3Embedding06B)
+                }
+                #[cfg(not(feature = "qwen3-embeddings"))]
+                {
+                    Err(
+                        "VESTIGE_EMBEDDING_MODEL requests Qwen3, but vestige-core was not built with the qwen3-embeddings feature"
+                            .to_string(),
+                    )
+                }
+            }
+            other => Err(format!(
+                "Unsupported VESTIGE_EMBEDDING_MODEL '{}'. Expected 'nomic-v1.5' or 'qwen3-0.6b'.",
+                other
+            )),
+        }
+    }
+
+    fn model_name(self) -> &'static str {
+        match self {
+            Self::NomicV15 => NOMIC_V15_MODEL_ID,
+            #[cfg(feature = "qwen3-embeddings")]
+            Self::Qwen3Embedding06B => QWEN3_06B_MODEL_ID,
+        }
+    }
+}
+
+enum EmbeddingBackend {
+    NomicV15(TextEmbedding),
+    #[cfg(feature = "qwen3-embeddings")]
+    Qwen3Embedding06B(Qwen3TextEmbedding),
+}
+
+impl EmbeddingBackend {
+    fn model_name(&self) -> &'static str {
+        match self {
+            Self::NomicV15(_) => NOMIC_V15_MODEL_ID,
+            #[cfg(feature = "qwen3-embeddings")]
+            Self::Qwen3Embedding06B(_) => QWEN3_06B_MODEL_ID,
+        }
+    }
+}
+
+fn qwen3_format_query(query: &str) -> String {
+    format!(
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: {query}"
+    )
+}
 
 /// Get the default cache directory for fastembed models.
 ///
@@ -65,10 +146,10 @@ pub(crate) fn get_cache_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(".fastembed_cache")
 }
 
-/// Initialize the global embedding model
-/// Using nomic-embed-text-v1.5 (768d) - 8192 token context, Matryoshka support
-fn get_model() -> Result<std::sync::MutexGuard<'static, TextEmbedding>, EmbeddingError> {
-    let result = EMBEDDING_MODEL_RESULT.get_or_init(|| {
+/// Initialize the global embedding backend selected by `VESTIGE_EMBEDDING_MODEL`.
+fn get_backend() -> Result<std::sync::MutexGuard<'static, EmbeddingBackend>, EmbeddingError> {
+    let result = EMBEDDING_BACKEND_RESULT.get_or_init(|| {
+        let spec = EmbeddingModelSpec::selected()?;
         // Get cache directory (respects FASTEMBED_CACHE_PATH env var)
         let cache_dir = get_cache_dir();
 
@@ -77,29 +158,64 @@ fn get_model() -> Result<std::sync::MutexGuard<'static, TextEmbedding>, Embeddin
             tracing::warn!("Failed to create cache directory {:?}: {}", cache_dir, e);
         }
 
-        // nomic-embed-text-v1.5: 768 dimensions, 8192 token context
-        // Matryoshka representation learning, fully open source
-        let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
-            .with_show_download_progress(true)
-            .with_cache_dir(cache_dir);
+        match spec {
+            EmbeddingModelSpec::NomicV15 => {
+                let options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15)
+                    .with_show_download_progress(true)
+                    .with_cache_dir(cache_dir);
 
-        TextEmbedding::try_new(options)
-            .map(Mutex::new)
-            .map_err(|e| {
-                format!(
-                    "Failed to initialize nomic-embed-text-v1.5 embedding model: {}. \
-                    Ensure ONNX runtime is available and model files can be downloaded.",
-                    e
+                TextEmbedding::try_new(options)
+                    .map(EmbeddingBackend::NomicV15)
+                    .map(Mutex::new)
+                    .map_err(|e| {
+                        format!(
+                            "Failed to initialize {} embedding model: {}. \
+                            Ensure ONNX runtime is available and model files can be downloaded.",
+                            spec.model_name(),
+                            e
+                        )
+                    })
+            }
+            #[cfg(feature = "qwen3-embeddings")]
+            EmbeddingModelSpec::Qwen3Embedding06B => {
+                let device = qwen3_device();
+                Qwen3TextEmbedding::from_hf(
+                    QWEN3_06B_MODEL_ID,
+                    &device,
+                    DType::F32,
+                    MAX_TEXT_LENGTH,
                 )
-            })
+                .map(EmbeddingBackend::Qwen3Embedding06B)
+                .map(Mutex::new)
+                .map_err(|e| {
+                    format!(
+                        "Failed to initialize {} embedding model: {}. \
+                        Ensure Hugging Face model files can be downloaded.",
+                        spec.model_name(),
+                        e
+                    )
+                })
+            }
+        }
     });
 
     match result {
-        Ok(model) => model
+        Ok(backend) => backend
             .lock()
             .map_err(|e| EmbeddingError::ModelInit(format!("Lock poisoned: {}", e))),
         Err(err) => Err(EmbeddingError::ModelInit(err.clone())),
     }
+}
+
+#[cfg(feature = "qwen3-embeddings")]
+fn qwen3_device() -> Device {
+    #[cfg(feature = "metal")]
+    {
+        if let Ok(device) = Device::new_metal(0) {
+            return device;
+        }
+    }
+    Device::Cpu
 }
 
 // ============================================================================
@@ -223,7 +339,7 @@ impl EmbeddingService {
 
     /// Check if the model is ready
     pub fn is_ready(&self) -> bool {
-        match get_model() {
+        match get_backend() {
             Ok(_) => true,
             Err(e) => {
                 tracing::warn!("Embedding model not ready: {}", e);
@@ -234,25 +350,26 @@ impl EmbeddingService {
 
     /// Check if the model is ready and return the error if not
     pub fn check_ready(&self) -> Result<(), EmbeddingError> {
-        get_model().map(|_| ())
+        get_backend().map(|_| ())
     }
 
     /// Initialize the model (downloads if necessary)
     pub fn init(&self) -> Result<(), EmbeddingError> {
-        let _model = get_model()?; // Ensures model is loaded and returns any init errors
+        let _model = get_backend()?; // Ensures model is loaded and returns any init errors
         Ok(())
     }
 
     /// Get the model name
     pub fn model_name(&self) -> &'static str {
-        #[cfg(feature = "nomic-v2")]
+        if let Some(Ok(backend)) = EMBEDDING_BACKEND_RESULT.get()
+            && let Ok(backend) = backend.lock()
         {
-            "nomic-ai/nomic-embed-text-v2-moe"
+            return backend.model_name();
         }
-        #[cfg(not(feature = "nomic-v2"))]
-        {
-            "nomic-ai/nomic-embed-text-v1.5"
-        }
+
+        EmbeddingModelSpec::selected()
+            .unwrap_or(EmbeddingModelSpec::NomicV15)
+            .model_name()
     }
 
     /// Get the embedding dimensions
@@ -268,7 +385,7 @@ impl EmbeddingService {
             ));
         }
 
-        let mut model = get_model()?;
+        let mut backend = get_backend()?;
 
         // Truncate if too long (char-boundary safe)
         let text = if text.len() > MAX_TEXT_LENGTH {
@@ -281,9 +398,15 @@ impl EmbeddingService {
             text
         };
 
-        let embeddings = model
-            .embed(vec![text], None)
-            .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
+        let embeddings = match &mut *backend {
+            EmbeddingBackend::NomicV15(model) => model
+                .embed(vec![text], None)
+                .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?,
+            #[cfg(feature = "qwen3-embeddings")]
+            EmbeddingBackend::Qwen3Embedding06B(model) => model
+                .embed(&[text])
+                .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?,
+        };
 
         if embeddings.is_empty() {
             return Err(EmbeddingError::EmbeddingFailed(
@@ -294,13 +417,26 @@ impl EmbeddingService {
         Ok(Embedding::new(matryoshka_truncate(embeddings[0].clone())))
     }
 
+    /// Generate an embedding for retrieval queries.
+    ///
+    /// Qwen3 uses instruction-formatted queries against raw document embeddings;
+    /// Nomic remains symmetric and receives the query unchanged.
+    pub fn embed_query(&self, query: &str) -> Result<Embedding, EmbeddingError> {
+        if self.model_name().to_ascii_lowercase().contains("qwen3") {
+            let formatted = qwen3_format_query(query);
+            self.embed(&formatted)
+        } else {
+            self.embed(query)
+        }
+    }
+
     /// Generate embeddings for multiple texts (batch processing)
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut model = get_model()?;
+        let mut backend = get_backend()?;
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
         // Process in batches for efficiency
@@ -320,9 +456,15 @@ impl EmbeddingService {
                 })
                 .collect();
 
-            let embeddings = model
-                .embed(truncated, None)
-                .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?;
+            let embeddings = match &mut *backend {
+                EmbeddingBackend::NomicV15(model) => model
+                    .embed(truncated, None)
+                    .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?,
+                #[cfg(feature = "qwen3-embeddings")]
+                EmbeddingBackend::Qwen3Embedding06B(model) => model
+                    .embed(&truncated)
+                    .map_err(|e| EmbeddingError::EmbeddingFailed(e.to_string()))?,
+            };
 
             for emb in embeddings {
                 all_embeddings.push(Embedding::new(matryoshka_truncate(emb)));
@@ -479,6 +621,14 @@ mod tests {
         for (a, b) in original.vector.iter().zip(restored.vector.iter()) {
             assert!((a - b).abs() < 0.0001);
         }
+    }
+
+    #[test]
+    fn test_qwen3_query_format() {
+        let formatted = qwen3_format_query("rust memory portability");
+        assert!(formatted.starts_with("Instruct:"));
+        assert!(formatted.contains("retrieve relevant passages"));
+        assert!(formatted.ends_with("Query: rust memory portability"));
     }
 
     #[test]

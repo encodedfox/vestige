@@ -1,10 +1,9 @@
 //! stdio Transport for MCP
 //!
 //! Handles JSON-RPC communication over stdin/stdout.
-//! v1.9.2: Async tokio I/O with heartbeat and error resilience.
+//! v1.9.2: Async tokio I/O with error resilience.
 
 use std::io;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info, warn};
 
@@ -14,9 +13,6 @@ use crate::server::McpServer;
 /// Maximum consecutive I/O errors before giving up
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
-/// Heartbeat interval — sends a ping notification to keep the connection alive
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
 /// stdio Transport for MCP server
 pub struct StdioTransport;
 
@@ -25,7 +21,7 @@ impl StdioTransport {
         Self
     }
 
-    /// Run the MCP server over stdio with heartbeat and error resilience
+    /// Run the MCP server over stdio with error resilience.
     pub async fn run(self, mut server: McpServer) -> Result<(), io::Error> {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
@@ -111,23 +107,8 @@ impl StdioTransport {
                                 break;
                             }
                             // Brief pause before retrying
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                    }
-                }
-                _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
-                    // Send a heartbeat ping notification to keep the connection alive
-                    let ping = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}\n";
-                    if let Err(e) = stdout.write_all(ping.as_bytes()).await {
-                        warn!("Failed to send heartbeat ping: {}", e);
-                        consecutive_errors += 1;
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                            error!("Too many consecutive errors, shutting down");
-                            break;
-                        }
-                    } else {
-                        let _ = stdout.flush().await;
-                        debug!("Heartbeat ping sent");
                     }
                 }
             }

@@ -4,8 +4,10 @@
 //! cosine similarity on stored embeddings. Uses union-find for
 //! efficient clustering.
 
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use serde::Deserialize;
 use serde_json::Value;
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,6 +45,7 @@ pub fn schema() -> Value {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 struct DedupArgs {
     #[serde(alias = "similarity_threshold")]
     similarity_threshold: Option<f64>,
@@ -51,11 +54,13 @@ struct DedupArgs {
 }
 
 /// Simple union-find for clustering
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<usize>,
 }
 
+#[cfg(all(feature = "embeddings", feature = "vector-search"))]
 impl UnionFind {
     fn new(n: usize) -> Self {
         Self {
@@ -89,21 +94,22 @@ impl UnionFind {
 }
 
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
-    let args: DedupArgs = match args {
-        Some(v) => serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {}", e))?,
-        None => DedupArgs {
-            similarity_threshold: None,
-            limit: None,
-            tags: None,
-        },
-    };
-
-    let threshold = args.similarity_threshold.unwrap_or(0.80) as f32;
-    let limit = args.limit.unwrap_or(20);
-    let tag_filter = args.tags.unwrap_or_default();
-
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     {
+        let args: DedupArgs = match args {
+            Some(v) => {
+                serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {}", e))?
+            }
+            None => DedupArgs {
+                similarity_threshold: None,
+                limit: None,
+                tags: None,
+            },
+        };
+        let threshold = args.similarity_threshold.unwrap_or(0.80) as f32;
+        let limit = args.limit.unwrap_or(20);
+        let tag_filter = args.tags.unwrap_or_default();
+
         // Load all embeddings
         let all_embeddings = storage
             .get_all_embeddings()
@@ -261,6 +267,8 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
 
     #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
     {
+        let _ = storage;
+        let _ = args;
         Ok(serde_json::json!({
             "error": "Embeddings feature not enabled. Cannot compute similarities.",
             "clusters": []
@@ -280,6 +288,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn test_union_find() {
         let mut uf = UnionFind::new(5);
         uf.union(0, 1);

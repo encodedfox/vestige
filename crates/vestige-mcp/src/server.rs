@@ -31,11 +31,9 @@ use vestige_core::Storage;
 /// Vestige without imposing one maintainer's workflow on strangers.
 ///
 /// The "full" variant is the composition mandate that enforces the
-/// Composing / Never-composed / Recommendation response shape, names the
-/// AIMO3 36/50 case study as the origin, and includes the "Vestige is
-/// blocking this:" refusal phrase. It is load-bearing for Sam's own
-/// decision-adjacent work but would misfire on trivial retrievals for a
-/// general audience, so it is opt-in via `VESTIGE_SYSTEM_PROMPT_MODE=full`.
+/// Composing / Never-composed / Recommendation response shape. It can misfire
+/// on trivial retrievals for a general audience, so it is opt-in via
+/// `VESTIGE_SYSTEM_PROMPT_MODE=full`.
 ///
 /// Anything other than `full` falls back to minimal.
 fn build_instructions() -> String {
@@ -45,7 +43,7 @@ fn build_instructions() -> String {
          Every retrieval MUST be composed into a recommendation, never summarized.\
          \n\nCOMPOSITION MANDATE: When you receive memories from search, deep_reference, \
          cross_reference, or explore_connections, your response MUST follow this shape. \
-         (a) Composing: [memory IDs], followed by your composition logic (your chain-of-thought \
+         (a) Composing: [memory IDs], followed by a brief composition rationale \
          about how the memories relate, NOT a restatement of their contents). \
          (b) Never-composed detected: list combinations of retrieved memories that share \
          tags/topics but have never been referenced together, or write 'None.' \
@@ -64,6 +62,10 @@ fn build_instructions() -> String {
          memory(action='demote') for wrong ones — do not ask permission, just act."
             .to_string()
     }
+}
+
+fn supported_protocol_versions() -> &'static [&'static str] {
+    &["2024-11-05", "2025-03-26", "2025-06-18", MCP_VERSION]
 }
 
 /// MCP Server implementation
@@ -115,6 +117,13 @@ impl McpServer {
     pub async fn handle_request(&mut self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         debug!("Handling request: {}", request.method);
 
+        if request.id.is_none() {
+            if request.method != "notifications/initialized" {
+                debug!("Dropping JSON-RPC notification '{}'", request.method);
+            }
+            return None;
+        }
+
         // Check initialization for non-initialize requests
         if !self.initialized
             && request.method != "initialize"
@@ -132,10 +141,9 @@ impl McpServer {
 
         let result = match request.method.as_str() {
             "initialize" => self.handle_initialize(request.params).await,
-            "notifications/initialized" => {
-                // Notification, no response needed
-                return None;
-            }
+            "notifications/initialized" => Err(JsonRpcError::invalid_request(
+                "notifications/initialized must be sent without an id",
+            )),
             "tools/list" => self.handle_tools_list().await,
             "tools/call" => self.handle_tools_call(request.params).await,
             "resources/list" => self.handle_resources_list().await,
@@ -161,20 +169,27 @@ impl McpServer {
         let request: InitializeRequest = match params {
             Some(p) => serde_json::from_value(p)
                 .map_err(|e| JsonRpcError::invalid_params(&e.to_string()))?,
-            None => InitializeRequest::default(),
+            None => {
+                return Err(JsonRpcError::invalid_params(
+                    "initialize params are required",
+                ));
+            }
         };
 
-        // Version negotiation: use client's version if older than server's
-        // Claude Desktop rejects servers with newer protocol versions
-        let negotiated_version = if request.protocol_version.as_str() < MCP_VERSION {
-            info!(
-                "Client requested older protocol version {}, using it",
-                request.protocol_version
-            );
-            request.protocol_version.clone()
-        } else {
-            MCP_VERSION.to_string()
-        };
+        let negotiated_version =
+            if supported_protocol_versions().contains(&request.protocol_version.as_str()) {
+                info!(
+                    "Client requested supported protocol version {}, using it",
+                    request.protocol_version
+                );
+                request.protocol_version.clone()
+            } else {
+                info!(
+                    "Client requested unsupported protocol version {}, using {}",
+                    request.protocol_version, MCP_VERSION
+                );
+                MCP_VERSION.to_string()
+            };
 
         self.initialized = true;
         info!(
@@ -209,10 +224,10 @@ impl McpServer {
 
     /// Handle tools/list request
     async fn handle_tools_list(&self) -> Result<serde_json::Value, JsonRpcError> {
-        // v2.0.5+: 24 tools (verified by the `tools.len() == 24` assertion in the
+        // v2.1.21: 25 tools (verified by the `tools.len() == 25` assertion in the
         // handle_tools_list test below — the `suppress` tool landed in v2.0.5).
         // Deprecated tools still work via redirects in handle_tools_call.
-        let tools = vec![
+        let mut tools = vec![
             // ================================================================
             // UNIFIED TOOLS (v1.1+)
             // ================================================================
@@ -220,21 +235,25 @@ impl McpServer {
                 name: "search".to_string(),
                 description: Some("Unified search tool. Uses hybrid search (keyword + semantic + convex combination fusion) internally. Auto-strengthens memories on access (Testing Effect).".to_string()),
                 input_schema: tools::search_unified::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "memory".to_string(),
-                description: Some("Unified memory management tool. Actions: 'get' (retrieve full node), 'delete' (remove memory), 'state' (get accessibility state), 'promote' (thumbs up — increases retrieval strength), 'demote' (thumbs down — decreases retrieval strength, does NOT delete), 'edit' (update content in-place, preserves FSRS state).".to_string()),
+                description: Some("Unified memory management tool. Actions: 'get' (retrieve full node), 'purge' (irreversibly remove content/embeddings with confirm=true), 'delete' (legacy alias for purge), 'state' (get accessibility state), 'promote' (thumbs up — increases retrieval strength), 'demote' (thumbs down — decreases retrieval strength, does NOT delete), 'edit' (update content in-place, preserves FSRS state).".to_string()),
                 input_schema: tools::memory_unified::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "codebase".to_string(),
                 description: Some("Unified codebase tool. Actions: 'remember_pattern' (store code pattern), 'remember_decision' (store architectural decision), 'get_context' (retrieve patterns and decisions).".to_string()),
                 input_schema: tools::codebase_unified::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "intention".to_string(),
                 description: Some("Unified intention management tool. Actions: 'set' (create), 'check' (find triggered), 'update' (complete/snooze/cancel), 'list' (show intentions).".to_string()),
                 input_schema: tools::intention_unified::schema(),
+                ..Default::default()
             },
             // ================================================================
             // CORE MEMORY (v1.7: smart_ingest absorbs ingest + checkpoint)
@@ -243,6 +262,7 @@ impl McpServer {
                 name: "smart_ingest".to_string(),
                 description: Some("INTELLIGENT memory ingestion with Prediction Error Gating. Single mode: provide 'content' to auto-decide CREATE/UPDATE/SUPERSEDE. Batch mode: provide 'items' array (max 20) for session-end saves — each item runs the full cognitive pipeline (importance scoring, intent detection, synaptic tagging).".to_string()),
                 input_schema: tools::smart_ingest::schema(),
+                ..Default::default()
             },
             // ================================================================
             // TEMPORAL TOOLS (v1.2+)
@@ -251,11 +271,13 @@ impl McpServer {
                 name: "memory_timeline".to_string(),
                 description: Some("Browse memories chronologically. Returns memories in a time range, grouped by day. Defaults to last 7 days.".to_string()),
                 input_schema: tools::timeline::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "memory_changelog".to_string(),
                 description: Some("View audit trail of memory changes. Per-memory: state transitions. System-wide: consolidations + recent state changes.".to_string()),
                 input_schema: tools::changelog::schema(),
+                ..Default::default()
             },
             // ================================================================
             // MAINTENANCE TOOLS (v1.7: system_status replaces health_check + stats)
@@ -264,26 +286,31 @@ impl McpServer {
                 name: "system_status".to_string(),
                 description: Some("Combined system health and statistics. Returns status (healthy/degraded/critical/empty), full stats, FSRS preview, cognitive module health, state distribution, warnings, and recommendations.".to_string()),
                 input_schema: tools::maintenance::system_status_schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "consolidate".to_string(),
                 description: Some("Run FSRS-6 memory consolidation cycle. Applies decay, generates embeddings, and performs maintenance. Use when memories seem stale.".to_string()),
                 input_schema: tools::maintenance::consolidate_schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "backup".to_string(),
                 description: Some("Create a SQLite database backup. Returns the backup file path.".to_string()),
                 input_schema: tools::maintenance::backup_schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "export".to_string(),
                 description: Some("Export memories as JSON or JSONL. Supports tag and date filters.".to_string()),
                 input_schema: tools::maintenance::export_schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "gc".to_string(),
                 description: Some("Garbage collect stale memories below retention threshold. Defaults to dry_run=true for safety.".to_string()),
                 input_schema: tools::maintenance::gc_schema(),
+                ..Default::default()
             },
             // ================================================================
             // AUTO-SAVE & DEDUP TOOLS (v1.3+)
@@ -292,11 +319,13 @@ impl McpServer {
                 name: "importance_score".to_string(),
                 description: Some("Score content importance using 4-channel neuroscience model (novelty/arousal/reward/attention). Returns composite score, channel breakdown, encoding boost, and explanations.".to_string()),
                 input_schema: tools::importance::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "find_duplicates".to_string(),
                 description: Some("Find duplicate and near-duplicate memory clusters using cosine similarity on embeddings. Returns clusters with suggested actions (merge/review). Use to clean up redundant memories.".to_string()),
                 input_schema: tools::dedup::schema(),
+                ..Default::default()
             },
             // ================================================================
             // COGNITIVE TOOLS (v1.5+)
@@ -305,16 +334,19 @@ impl McpServer {
                 name: "dream".to_string(),
                 description: Some("Trigger memory dreaming — replays recent memories to discover hidden connections, synthesize insights, and strengthen important patterns. Returns insights, connections, and dream stats.".to_string()),
                 input_schema: tools::dream::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "explore_connections".to_string(),
                 description: Some("Graph exploration tool for memory connections. Actions: 'chain' (build reasoning path between memories), 'associations' (find related memories via spreading activation + hippocampal index), 'bridges' (find connecting memories between two nodes).".to_string()),
                 input_schema: tools::explore::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "predict".to_string(),
                 description: Some("Proactive memory prediction — predicts what memories you'll need next based on context, recent activity, and learned patterns. Returns predictions, suggestions, and speculative retrievals.".to_string()),
                 input_schema: tools::predict::schema(),
+                ..Default::default()
             },
             // ================================================================
             // RESTORE TOOL (v1.5+)
@@ -323,6 +355,7 @@ impl McpServer {
                 name: "restore".to_string(),
                 description: Some("Restore memories from a JSON backup file. Supports MCP wrapper format, RecallResult format, and direct memory array format.".to_string()),
                 input_schema: tools::restore::schema(),
+                ..Default::default()
             },
             // ================================================================
             // CONTEXT PACKETS (v1.8+)
@@ -331,6 +364,7 @@ impl McpServer {
                 name: "session_context".to_string(),
                 description: Some("One-call session initialization. Combines search, intentions, status, predictions, and codebase context into a single token-budgeted response. Replaces 5 separate calls at session start.".to_string()),
                 input_schema: tools::session_context::schema(),
+                ..Default::default()
             },
             // ================================================================
             // AUTONOMIC TOOLS (v1.9+)
@@ -339,11 +373,13 @@ impl McpServer {
                 name: "memory_health".to_string(),
                 description: Some("Retention dashboard. Returns avg retention, retention distribution (buckets: 0-20%, 20-40%, etc.), trend (improving/declining/stable), and recommendation. Lightweight alternative to full system_status focused on memory quality.".to_string()),
                 input_schema: tools::health::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "memory_graph".to_string(),
                 description: Some("Subgraph export for visualization. Input: center_id or query, depth (1-3), max_nodes. Returns nodes with force-directed layout positions and edges with weights. Powers memory graph visualization.".to_string()),
                 input_schema: tools::graph::schema(),
+                ..Default::default()
             },
             // ================================================================
             // DEEP REFERENCE (v2.0.4+) — replaces cross_reference
@@ -352,11 +388,19 @@ impl McpServer {
                 name: "deep_reference".to_string(),
                 description: Some("Deep cognitive reasoning across memories. Combines FSRS-6 trust scoring, spreading activation, temporal supersession, dream insights, and contradiction analysis to build a complete understanding of a topic. Returns trust-scored evidence, fact evolution timeline, and a recommended answer. Use this when accuracy matters.".to_string()),
                 input_schema: tools::cross_reference::schema(),
+                ..Default::default()
             },
             ToolDescription {
                 name: "cross_reference".to_string(),
                 description: Some("Alias for deep_reference. Connect the dots across memories with cognitive reasoning.".to_string()),
                 input_schema: tools::cross_reference::schema(),
+                ..Default::default()
+            },
+            ToolDescription {
+                name: "contradictions".to_string(),
+                description: Some("Inspect memory disagreements directly. Scans a topic or recent memories for trust-weighted contradiction pairs using the same local logic as deep_reference.".to_string()),
+                input_schema: tools::contradictions::schema(),
+                ..Default::default()
             },
             // ================================================================
             // ACTIVE FORGETTING (v2.0.5) — top-down suppression
@@ -366,8 +410,46 @@ impl McpServer {
                 name: "suppress".to_string(),
                 description: Some("Actively suppress a memory via top-down inhibitory control (Anderson 2025 SIF + Davis Rac1). Distinct from delete: the memory persists but is inhibited from retrieval and actively decays. Each call compounds. A background Rac1 worker cascades decay to co-activated neighbors. Reversible within 24 hours via reverse=true.".to_string()),
                 input_schema: tools::suppress::schema(),
+                ..Default::default()
             },
         ];
+
+        // Per-tool result-size annotation `_meta["anthropic/maxResultSizeChars"]`.
+        //
+        // Claude Code v2.1.91+ honors this annotation to override its 50K default
+        // `CallToolResult` truncation. Without it, large Vestige payloads
+        // (`search` with `detail_level="full"` at `limit=20` has been observed
+        // at ~135K chars; `memory_timeline` at `limit=30` at ~84K chars) are
+        // silently truncated and spilled to disk, forcing the parent agent to
+        // chunk-read them.
+        //
+        // Per-tool caps below are sized at ~2× observed peak with growth
+        // headroom; max permitted by Anthropic is 500_000. Only the four
+        // empirically-measured high-payload tools carry the annotation today;
+        // the remaining 21 tools deliberately do NOT (cargo-cult prevention —
+        // annotating a small-payload tool dilutes the signal).
+        //
+        // Other tools that COULD plausibly grow into the annotated set with
+        // future workload (`deep_reference`, `cross_reference`, `memory_graph`,
+        // `explore_connections`, `session_context`) are left unannotated until
+        // empirical measurement shows truncation under realistic use.
+        for tool in tools.iter_mut() {
+            let max_chars: Option<u64> = match tool.name.as_str() {
+                "search" => Some(300_000),
+                "memory_timeline" => Some(200_000),
+                "memory" => Some(100_000),
+                "codebase" => Some(100_000),
+                _ => None,
+            };
+            if let Some(n) = max_chars {
+                let mut meta = serde_json::Map::new();
+                meta.insert(
+                    "anthropic/maxResultSizeChars".to_string(),
+                    serde_json::Value::from(n),
+                );
+                tool.meta = Some(serde_json::Value::Object(meta));
+            }
+        }
 
         let result = ListToolsResult { tools };
         serde_json::to_value(result).map_err(|e| JsonRpcError::internal_error(&e.to_string()))
@@ -383,6 +465,13 @@ impl McpServer {
                 .map_err(|e| JsonRpcError::invalid_params(&e.to_string()))?,
             None => return Err(JsonRpcError::invalid_params("Missing tool call parameters")),
         };
+        if let Some(arguments) = &request.arguments
+            && !arguments.is_object()
+        {
+            return Err(JsonRpcError::invalid_params(
+                "tools/call arguments must be an object",
+            ));
+        }
 
         // Record activity on every tool call (non-blocking)
         if let Ok(mut cog) = self.cognitive.try_lock() {
@@ -551,14 +640,19 @@ impl McpServer {
             }
             "delete_knowledge" => {
                 warn!(
-                    "Tool 'delete_knowledge' is deprecated. Use 'memory' with action='delete' instead."
+                    "Tool 'delete_knowledge' is deprecated. Use 'memory' with action='purge', confirm=true instead."
                 );
                 let unified_args = match request.arguments {
                     Some(ref args) => {
                         let id = args.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        let confirm = args
+                            .get("confirm")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Bool(false));
                         Some(serde_json::json!({
                             "action": "delete",
-                            "id": id
+                            "id": id,
+                            "confirm": confirm
                         }))
                     }
                     None => None,
@@ -832,6 +926,9 @@ impl McpServer {
                 tools::cross_reference::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
+            "contradictions" => {
+                tools::contradictions::execute(&self.storage, request.arguments).await
+            }
 
             // ================================================================
             // ACTIVE FORGETTING (v2.0.5) — top-down suppression
@@ -839,7 +936,7 @@ impl McpServer {
             "suppress" => tools::suppress::execute(&self.storage, request.arguments).await,
 
             name => {
-                return Err(JsonRpcError::method_not_found_with_message(&format!(
+                return Err(JsonRpcError::invalid_params(&format!(
                     "Unknown tool: {}",
                     name
                 )));
@@ -862,17 +959,20 @@ impl McpServer {
                         text: serde_json::to_string_pretty(&content)
                             .unwrap_or_else(|_| content.to_string()),
                     }],
+                    structured_content: Some(content),
                     is_error: Some(false),
                 };
                 serde_json::to_value(call_result)
                     .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
             }
             Err(e) => {
+                let error_content = serde_json::json!({ "error": e });
                 let call_result = CallToolResult {
                     content: vec![crate::protocol::messages::ToolResultContent {
                         content_type: "text".to_string(),
-                        text: serde_json::json!({ "error": e }).to_string(),
+                        text: error_content.to_string(),
                     }],
+                    structured_content: Some(error_content),
                     is_error: Some(true),
                 };
                 serde_json::to_value(call_result)
@@ -1037,7 +1137,15 @@ impl McpServer {
                 serde_json::to_value(result)
                     .map_err(|e| JsonRpcError::internal_error(&e.to_string()))
             }
-            Err(e) => Err(JsonRpcError::internal_error(&e)),
+            Err(e) => {
+                if e.to_ascii_lowercase().contains("unknown")
+                    || e.to_ascii_lowercase().contains("not found")
+                {
+                    Err(JsonRpcError::resource_not_found(uri))
+                } else {
+                    Err(JsonRpcError::internal_error(&e))
+                }
+            }
         }
     }
 
@@ -1164,8 +1272,21 @@ impl McpServer {
                     .unwrap_or("")
                     .to_string();
                 match action {
-                    "delete" => {
-                        self.emit(VestigeEvent::MemoryDeleted { id, timestamp: now });
+                    "delete" | "purge"
+                        if result
+                            .get("success")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false) =>
+                    {
+                        let node_id = result
+                            .get("nodeId")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(&id)
+                            .to_string();
+                        self.emit(VestigeEvent::MemoryDeleted {
+                            id: node_id,
+                            timestamp: now,
+                        });
                     }
                     "promote" => {
                         let retention = result
@@ -1328,6 +1449,7 @@ impl McpServer {
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
                 self.emit(VestigeEvent::ImportanceScored {
+                    memory_id: None, // importance_score tool runs on arbitrary content
                     content_preview: preview,
                     composite_score: composite,
                     novelty,
@@ -1376,6 +1498,26 @@ mod tests {
             method: method.to_string(),
             params,
         }
+    }
+
+    fn make_notification(method: &str, params: Option<serde_json::Value>) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    fn init_params() -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": MCP_VERSION,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "test-client",
+                "version": "1.0.0"
+            }
+        })
     }
 
     // ========================================================================
@@ -1429,13 +1571,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initialize_with_default_params() {
+    async fn test_initialize_unsupported_protocol_falls_back_to_latest() {
+        let (mut server, _dir) = test_server().await;
+        let params = serde_json::json!({
+            "protocolVersion": "1.0.0",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        });
+        let request = make_request("initialize", Some(params));
+
+        let response = server.handle_request(request).await.unwrap();
+        let result = response.result.unwrap();
+
+        assert_eq!(result["protocolVersion"], MCP_VERSION);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_missing_params_returns_error() {
         let (mut server, _dir) = test_server().await;
         let request = make_request("initialize", None);
 
         let response = server.handle_request(request).await.unwrap();
-        assert!(response.result.is_some());
-        assert!(response.error.is_none());
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+        assert!(!server.initialized);
     }
 
     // ========================================================================
@@ -1475,15 +1635,37 @@ mod tests {
         let (mut server, _dir) = test_server().await;
 
         // First initialize
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         // Send initialized notification
-        let notification = make_request("notifications/initialized", None);
+        let notification = make_notification("notifications/initialized", None);
         let response = server.handle_request(notification).await;
 
         // Notifications should return None
         assert!(response.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_initialized_notification_with_id_returns_invalid_request() {
+        let (mut server, _dir) = test_server().await;
+
+        let request = make_request("notifications/initialized", None);
+        let response = server.handle_request(request).await.unwrap();
+
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32600);
+    }
+
+    #[tokio::test]
+    async fn test_notification_does_not_emit_response_or_side_effect() {
+        let (mut server, _dir) = test_server().await;
+
+        let notification = make_notification("initialize", None);
+        let response = server.handle_request(notification).await;
+
+        assert!(response.is_none());
+        assert!(!server.initialized);
     }
 
     // ========================================================================
@@ -1495,7 +1677,7 @@ mod tests {
         let (mut server, _dir) = test_server().await;
 
         // Initialize first
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("tools/list", None);
@@ -1504,8 +1686,8 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // v2.0.5: 24 tools (4 unified + 1 core + 2 temporal + 5 maintenance + 2 auto-save + 3 cognitive + 1 restore + 1 session_context + 2 autonomic + 1 deep_reference + 1 cross_reference alias + 1 suppress)
-        assert_eq!(tools.len(), 24, "Expected exactly 24 tools in v2.0.5+");
+        // v2.1.21: 25 tools (includes first-class contradictions surface)
+        assert_eq!(tools.len(), 25, "Expected exactly 25 tools in v2.1.21");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -1575,6 +1757,7 @@ mod tests {
         // Deep reference + cross_reference alias (v2.0.4)
         assert!(tool_names.contains(&"deep_reference"));
         assert!(tool_names.contains(&"cross_reference"));
+        assert!(tool_names.contains(&"contradictions"));
 
         // Active forgetting (v2.0.5) — Anderson 2025 + Davis Rac1
         assert!(tool_names.contains(&"suppress"));
@@ -1584,7 +1767,7 @@ mod tests {
     async fn test_tools_have_descriptions_and_schemas() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("tools/list", None);
@@ -1614,7 +1797,7 @@ mod tests {
     async fn test_resources_list_returns_all_resources() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("resources/list", None);
@@ -1643,7 +1826,7 @@ mod tests {
     async fn test_resources_have_descriptions() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("resources/list", None);
@@ -1671,7 +1854,7 @@ mod tests {
         let (mut server, _dir) = test_server().await;
 
         // Initialize first
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("unknown/method", None);
@@ -1687,7 +1870,7 @@ mod tests {
     async fn test_unknown_tool_returns_error() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request(
@@ -1700,7 +1883,7 @@ mod tests {
 
         let response = server.handle_request(request).await.unwrap();
         assert!(response.error.is_some());
-        assert_eq!(response.error.unwrap().code, -32601);
+        assert_eq!(response.error.unwrap().code, -32602);
     }
 
     // ========================================================================
@@ -1711,7 +1894,7 @@ mod tests {
     async fn test_ping_returns_empty_object() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("ping", None);
@@ -1730,7 +1913,7 @@ mod tests {
     async fn test_tools_call_missing_params_returns_error() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request("tools/call", None);
@@ -1744,7 +1927,7 @@ mod tests {
     async fn test_tools_call_invalid_params_returns_error() {
         let (mut server, _dir) = test_server().await;
 
-        let init_request = make_request("initialize", None);
+        let init_request = make_request("initialize", Some(init_params()));
         server.handle_request(init_request).await;
 
         let request = make_request(
@@ -1757,5 +1940,163 @@ mod tests {
         let response = server.handle_request(request).await.unwrap();
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_rejects_non_object_arguments() {
+        let (mut server, _dir) = test_server().await;
+
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let request = make_request(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "search",
+                "arguments": "not-an-object"
+            })),
+        );
+
+        let response = server.handle_request(request).await.unwrap();
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    // ========================================================================
+    // Per-tool result-size annotation tests
+    // (`_meta["anthropic/maxResultSizeChars"]`, CC v2.1.91+)
+    //
+    // The annotation lives on the Tool definition in `tools/list`, so CC reads
+    // it once when the MCP session opens and applies the override to every
+    // invocation of that tool. These tests pin the wire-form so a future
+    // refactor of `ToolDescription` cannot silently drop the annotation.
+    // ========================================================================
+
+    /// Expected per-tool caps. Returns `Some(cap)` for tools the discipline
+    /// annotates, `None` for tools that MUST NOT carry the annotation
+    /// (cargo-cult prevention).
+    fn expected_max_result_size(name: &str) -> Option<u64> {
+        match name {
+            "search" => Some(300_000),
+            "memory_timeline" => Some(200_000),
+            "memory" => Some(100_000),
+            "codebase" => Some(100_000),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_high_payload_tools_have_max_result_size_annotation() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let request = make_request("tools/list", None);
+        let response = server.handle_request(request).await.unwrap();
+        let result = response.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+
+        for name in ["search", "memory_timeline", "memory", "codebase"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("Tool '{}' missing from tools/list", name));
+
+            let expected = expected_max_result_size(name).unwrap();
+            let meta = tool.get("_meta").unwrap_or_else(|| {
+                panic!("Tool '{}' is missing the `_meta` field on the wire", name)
+            });
+            let actual = meta
+                .get("anthropic/maxResultSizeChars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Tool '{}' _meta lacks integer 'anthropic/maxResultSizeChars'",
+                        name
+                    )
+                });
+            assert_eq!(
+                actual, expected,
+                "Tool '{}' cap drift: expected {} got {}",
+                name, expected, actual
+            );
+            assert!(
+                actual <= 500_000,
+                "Tool '{}' cap {} exceeds Anthropic 500K ceiling",
+                name,
+                actual
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_other_tools_do_not_carry_max_result_size_annotation() {
+        // Cargo-cult prevention. Dynamically derived from tools/list so this
+        // test is robust to new tools being added: any tool that is NOT in
+        // the discipline-prescribed set MUST NOT carry the annotation.
+        // Adding the annotation to a small-payload tool dilutes the signal
+        // and trains future maintainers that the value is arbitrary.
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let request = make_request("tools/list", None);
+        let response = server.handle_request(request).await.unwrap();
+        let result = response.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            if expected_max_result_size(name).is_some() {
+                continue; // covered by the annotated-tools test
+            }
+
+            // Either the `_meta` key is absent OR it is an object without the
+            // anthropic key — both are acceptable. The forbidden case is the
+            // anthropic key present on this tool.
+            let has_max_size = tool
+                .get("_meta")
+                .and_then(|m| m.get("anthropic/maxResultSizeChars"))
+                .is_some();
+            assert!(
+                !has_max_size,
+                "Tool '{}' should NOT carry maxResultSizeChars annotation \
+                 (not in the discipline-prescribed set: search, memory_timeline, \
+                 memory, codebase). If this tool's realistic max-payload now \
+                 routinely exceeds 50K, update expected_max_result_size() + the \
+                 annotation loop in handle_tools_list together.",
+                name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_meta_wire_shape_uses_underscore_meta_field() {
+        // Anthropic's MCP spec is explicit: the field on the wire is `_meta`,
+        // NOT `meta`. The Rust struct uses `meta: Option<Value>` with
+        // `#[serde(rename = "_meta")]` — assert the rename actually fired.
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let request = make_request("tools/list", None);
+        let response = server.handle_request(request).await.unwrap();
+        let result = response.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+
+        let search_tool = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("search"))
+            .expect("'search' tool present");
+
+        // Wire-form: `_meta` must exist; `meta` (un-renamed) must NOT exist.
+        assert!(
+            search_tool.get("_meta").is_some(),
+            "search tool missing `_meta` key (serde rename to _meta did not apply)"
+        );
+        assert!(
+            search_tool.get("meta").is_none(),
+            "search tool has un-renamed `meta` key (regression — serde rename broke)"
+        );
     }
 }

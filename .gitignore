@@ -60,6 +60,8 @@ pnpm-debug.log*
 coverage/
 .nyc_output/
 *.lcov
+__pycache__/
+*.py[cod]
 apps/dashboard/test-results/
 apps/dashboard/playwright-report/
 apps/dashboard/e2e/screenshots/

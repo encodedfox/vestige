@@ -6,6 +6,7 @@
 
 use vestige_core::neuroscience::predictive_retrieval::PredictiveMemory;
 use vestige_core::neuroscience::prospective_memory::{IntentionParser, ProspectiveMemory};
+#[cfg(feature = "vector-search")]
 use vestige_core::search::TemporalSearcher;
 use vestige_core::{
     AccessibilityCalculator,
@@ -31,9 +32,6 @@ use vestige_core::{
     MemoryDreamer,
     NoveltySignal,
     ReconsolidationManager,
-    // Search modules
-    Reranker,
-    RerankerConfig,
     RewardSignal,
     SpeculativeRetriever,
     StateUpdateService,
@@ -41,6 +39,8 @@ use vestige_core::{
     Storage,
     SynapticTaggingSystem,
 };
+#[cfg(feature = "vector-search")]
+use vestige_core::{Reranker, RerankerConfig};
 
 /// Stateful cognitive engine holding all neuroscience modules.
 ///
@@ -80,7 +80,9 @@ pub struct CognitiveEngine {
     pub consolidation_scheduler: ConsolidationScheduler,
 
     // -- Search --
+    #[cfg(feature = "vector-search")]
     pub reranker: Reranker,
+    #[cfg(feature = "vector-search")]
     pub temporal_searcher: TemporalSearcher,
 }
 
@@ -161,7 +163,9 @@ impl CognitiveEngine {
             consolidation_scheduler: ConsolidationScheduler::new(),
 
             // Search
+            #[cfg(feature = "vector-search")]
             reranker: Reranker::new(RerankerConfig::default()),
+            #[cfg(feature = "vector-search")]
             temporal_searcher: TemporalSearcher::new(),
         }
     }

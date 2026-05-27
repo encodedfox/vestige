@@ -2,23 +2,106 @@
 
 # Vestige
 
-### The cognitive engine that gives AI agents a brain.
+### Local cognitive memory for MCP-compatible AI agents.
 
 [![GitHub stars](https://img.shields.io/github/stars/samvallad33/vestige?style=social)](https://github.com/samvallad33/vestige)
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige)](https://github.com/samvallad33/vestige/releases/latest)
-[![Tests](https://img.shields.io/badge/tests-1284%20passing-brightgreen)](https://github.com/samvallad33/vestige/actions)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)](https://github.com/samvallad33/vestige/actions)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![MCP Compatible](https://img.shields.io/badge/MCP-compatible-green)](https://modelcontextprotocol.io)
 
-**Your Agent forgets everything between sessions. Vestige fixes that.**
+**Your agent forgets project decisions between sessions. Vestige gives it local, inspectable memory.**
 
-Built on 130 years of memory research — FSRS-6 spaced repetition, prediction error gating, synaptic tagging, spreading activation, memory dreaming — all running in a single Rust binary with a 3D neural visualization dashboard. 100% local. Zero cloud.
+Built on proven memory and retrieval ideas — FSRS-6 spaced repetition, prediction error gating, synaptic tagging, spreading activation, and memory consolidation — all running in a single Rust binary with a local dashboard. 100% local. Zero cloud.
 
-[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-24-mcp-tools) | [Docs](docs/)
+[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-25-mcp-tools) | [Docs](docs/)
 
 </div>
 
 ---
+
+## What's New in v2.1.22 "Sanhedrin Receipts"
+
+v2.1.22 makes the optional Sanhedrin hook accountable enough to trust in daily
+agent work. Vetoes now leave local receipts, verification claims need real
+command evidence, and users can appeal stale or over-strict blocks from the
+dashboard.
+
+- **Receipt Lock.** Claims like "tests passed", "build is green", or "lint is clean" are blocked unless the current transcript contains a matching successful command receipt.
+- **Screenshotable veto receipts.** Sanhedrin writes `~/.vestige/sanhedrin/latest.json` and `latest.html` with Claim -> Verdict -> Precedent -> Fix -> Appeal.
+- **Dashboard Verdict Bar.** The dashboard shows PASS, NOTE, CAUTION, VETO, or APPEALED globally, expands into the receipt, and records stale/wrong/too-strict appeals.
+- **Claim ledger.** Claim-mode Sanhedrin output now maps every extracted claim into structured JSON instead of treating the whole draft as one blob.
+- **Appeal training.** Appeals are saved to `appeals.jsonl` and suppress future vetoes for the same claim fingerprint.
+
+## What's New in v2.1.21 "Agent-Neutral Hardening"
+
+v2.1.21 tightens Vestige for normal use across MCP-compatible agents, without
+making Claude Code companion tooling part of the default path.
+
+- **Agent-neutral default.** Stdio MCP remains the default transport; optional HTTP MCP is explicit with `--http`, `--http-port`, or `VESTIGE_HTTP_ENABLED=1`.
+- **Safer destructive actions.** `memory(action="delete")` now requires `confirm=true`, matching `purge`, and the legacy `delete_knowledge` shim forwards that confirmation instead of bypassing it.
+- **Portable sync repair.** Merge imports preserve purge tombstones, avoid `INSERT OR REPLACE` cascades, rebuild the vector index from a clean state, and write portable archive temp files with private Unix permissions.
+- **Release/package cleanup.** Release builds check the embedded dashboard before packaging, publish checksums, and the npm installer rejects targets that do not have release assets.
+- **Any-agent memory protocol.** The setup docs now include a short agent-agnostic memory protocol for Claude Code, Codex, Cursor, VS Code, Xcode, JetBrains, Windsurf, and other MCP clients.
+
+## What's New in v2.1.2 "Honest Memory"
+
+v2.1.2 makes Vestige easier to trust in everyday work: literal lookups stay literal, purge really removes content, contradictions are inspectable, and updates no longer require a curl reinstall flow.
+
+- **Concrete search mode.** Quoted strings, env vars, UUIDs, paths, and code identifiers now take a keyword/literal path that skips HyDE, semantic fusion, FSRS reweighting, competition, and spreading activation. Exact things like `OPENAI_API_KEY`, `mlx_lm.server`, and migration IDs land first.
+- **Irreversible purge.** `memory(action="purge", confirm=true)` permanently removes memory content and embeddings, scrubs insight JSON references, detaches temporal-summary children, prunes graph edges, and keeps only a non-content deletion tombstone for sync/audit.
+- **First-class contradiction inspection.** New `contradictions` MCP tool surfaces trust-weighted disagreements directly instead of hiding them inside `deep_reference`.
+- **Simple update flow.** `vestige update` refreshes binaries. Claude Code Cognitive Sandwich companion files are opt-in with `vestige update --sandwich-companion` or `vestige sandwich install`.
+- **Pro waitlist preview.** `/dashboard/waitlist` adds a local-first Solo Pro and Team Pro early-access surface. `VITE_WAITLIST_ENDPOINT` and `VITE_SUPPORT_BOT_ENDPOINT` are opt-in dashboard env vars, so no signup data is captured unless endpoints are configured.
+
+## What's New in v2.1.1 "Portable Sync"
+
+v2.1.1 focuses on the biggest post-launch ask: move memories between machines without losing cognitive state. It also adds opt-in Qwen3 embeddings for higher-recall local retrieval.
+
+- **Exact portable archives.** `vestige portable-export` / `vestige portable-import` preserve IDs, FSRS state, graph edges, suppression state, audit rows, and embedding blobs for Vestige-to-Vestige device transfer.
+- **Sync-safe merge storage.** `vestige portable-import --merge` and `vestige sync <archive>` merge non-empty databases, apply delete tombstones, keep newer local memories, rebuild FTS, and push through a pluggable portable-sync backend. v2.1.1 ships the file backend for Dropbox, iCloud, Syncthing, Git, and shared folders.
+- **Qwen3 embeddings.** Build with `qwen3-embeddings`, set `VESTIGE_EMBEDDING_MODEL=qwen3-0.6b`, and run `vestige consolidate` to re-embed existing memories. `vestige health` reports mixed-model stores before search quality is affected.
+- **Model-aware retrieval.** Vestige now avoids comparing Qwen and Nomic vectors in the same search/dedup path.
+
+## What's New in v2.1.0 "Cognitive Sandwich Goes Local"
+
+v2.1.0 adds an opt-in Claude Code hook harness around the existing Vestige MCP server. The MCP tool surface and database schema stay backward compatible, while preflight hooks can inject trusted memory context before Claude answers. The heavyweight Sanhedrin verifier is optional and can be enabled separately.
+
+- **Optional Sanhedrin Executioner.** The post-response verifier is off by default. Users can enable it with an OpenAI-compatible endpoint on x86/Linux/Intel Mac, or add `--with-launchd` on Apple Silicon to run the local MLX Qwen backend.
+- **One-command Cognitive Sandwich installer.** `vestige sandwich install` stages hook files and agents by default, removes old Vestige hook wiring, and leaves all Claude Code hook layers plus the 19 GB model path opt-in.
+- **Pulse hook backed by `/api/changelog`.** Fresh dream and connection events can be injected into the next Claude Code prompt context without blocking the prompt.
+- **`VESTIGE_DATA_DIR` support.** `--data-dir` now has an env-var fallback, tilde expansion, secure directory creation, and clear precedence docs.
+- **NPM release wrapper fixed.** `vestige-mcp-server@2.1.0` now downloads binaries from the matching `v2.1.0` GitHub release tag instead of an old hardcoded release.
+
+## What's New in v2.0.9 "Autopilot"
+
+Autopilot flips Vestige from passive memory library to **self-managing cognitive surface**. Same 24 MCP tools, zero schema changes — but the moment you upgrade, 14 previously dormant cognitive primitives start firing on live events without any tool call from your client.
+
+- **One supervised backend task subscribes to the 20-event WebSocket bus** and routes six event classes into the cognitive engine: `MemoryCreated` triggers synaptic-tagging PRP + predictive-access records, `SearchPerformed` warms the speculative-retrieval model, `MemoryPromoted` fires activation spread, `MemorySuppressed` emits the Rac1 cascade wave, high-importance `ImportanceScored` (>0.85) auto-promotes, and `Heartbeat` rate-limit-fires `find_duplicates` on large DBs. **The engine mutex is never held across `.await`, so MCP dispatch is never starved.**
+- **Panic-resilient supervisors.** Both background tasks run inside an outer supervisor loop — if one handler panics on a bad memory, the supervisor respawns it in 5 s instead of losing every future event.
+- **Fully backward compatible.** No new MCP tools. No schema migration. Existing v2.0.8 databases open without a single step. Opt out with `VESTIGE_AUTOPILOT_ENABLED=0` if you want the passive-library contract back.
+- **3,091 LOC of orphan v1.0 tool code removed** — nine superseded modules (`checkpoint`, `codebase`, `consolidate`, `ingest`, `intentions`, `knowledge`, `recall`, plus helpers) verified zero non-test callers before deletion. Tool surface unchanged.
+
+## What's New in v2.0.8 "Pulse"
+
+v2.0.8 wires the dashboard through to the cognitive engine. Eight new surfaces expose the reasoning stack visually — every one was MCP-only before.
+
+- **Reasoning Theater (`/reasoning`)** — `Cmd+K` Ask palette over the 8-stage `deep_reference` pipeline (hybrid retrieval → cross-encoder rerank → spreading activation → FSRS-6 trust → temporal supersession → contradiction analysis → relation assessment → template reasoning chain). Evidence cards, confidence meter, contradiction geodesic arcs, superseded-memory lineage, evolution timeline. **Zero LLM calls, 100% local.**
+- **Pulse InsightToast** — real-time toasts for `DreamCompleted`, `ConsolidationCompleted`, `ConnectionDiscovered`, promote/demote/suppress/unsuppress, `Rac1CascadeSwept`. Rate-limited, auto-dismiss, click-to-dismiss.
+- **Memory Birth Ritual (Terrarium)** — new memories materialize in the 3D graph on every `MemoryCreated`: elastic scale-in, quadratic Bezier flight path, glow sprite fade-in, Newton's Cradle docking recoil. 60-frame sequence, zero-alloc math.
+- **7 more dashboard surfaces** — `/duplicates`, `/dreams`, `/schedule`, `/importance`, `/activation`, `/contradictions`, `/patterns`. Left nav expanded 8 → 16 with single-key shortcuts.
+- **Intel Mac (`x86_64-apple-darwin`) support restored** via the `ort-dynamic` Cargo feature + Homebrew `onnxruntime`. Microsoft deprecated x86_64 macOS prebuilts; the dynamic-link path sidesteps that permanently. **Closes #41.**
+- **Contradiction-detection false positives eliminated** — four thresholds tightened so adjacent-domain memories no longer flag as conflicts. On an FSRS-6 query this collapses false contradictions 12 → 0 without regressing legitimate test cases.
+
+## What's New in v2.0.7 "Visible"
+
+Hygiene release closing two UI gaps and finishing schema cleanup. No breaking changes, no user-data migrations.
+
+- **`POST /api/memories/{id}/suppress` + `/unsuppress` HTTP endpoints** — dashboard can trigger Anderson 2025 SIF + Rac1 cascade without dropping to raw MCP. `suppressionCount`, `retrievalPenalty`, `reversibleUntil`, `labileWindowHours` all in response. Suppress button joins Promote / Demote / Delete on the Memories page.
+- **Uptime in the sidebar footer** — the `Heartbeat` event has carried `uptime_secs` since v2.0.5 but was never rendered. Now shows as `up 3d 4h` / `up 18m` / `up 47s`.
+- **`execute_export` panic fix** — unreachable match arm replaced with a clean "unsupported export format" error instead of unwinding through the MCP dispatcher.
+- **`predict` surfaces `predict_degraded: true`** on lock poisoning instead of silently returning empty vecs. `memory_changelog` honors `start` / `end` bounds. `intention` check honors `include_snoozed`.
+- **Migration V11** — drops dead `knowledge_edges` + `compressed_memories` tables (added speculatively in V4, never used).
 
 ## What's New in v2.0.6 "Composer"
 
@@ -34,7 +117,7 @@ v2.0.6 is a polish release that makes the existing cognitive stack finally *feel
 
 Ebbinghaus 1885 models what happens to memories you don't touch. Anderson 2025 models what happens when you actively want to stop thinking about one. Every other AI memory system implements the first. Vestige is the first to ship the second.
 
-Based on [Anderson et al. 2025](https://www.nature.com/articles/s41583-025-00929-y) (Suppression-Induced Forgetting, *Nat Rev Neurosci*) and [Cervantes-Sandoval et al. 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/) (Rac1 synaptic cascade). **24 tools · 29 cognitive modules · 1,292 tests.**
+Based on [Anderson et al. 2025](https://www.nature.com/articles/s41583-025-00929-y) (Suppression-Induced Forgetting, *Nat Rev Neurosci*) and [Cervantes-Sandoval et al. 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/) (Rac1 synaptic cascade).
 
 <details>
 <summary>Earlier releases (v2.0 "Cognitive Leap" → v2.0.4 "Deep Reference")</summary>
@@ -54,15 +137,15 @@ Based on [Anderson et al. 2025](https://www.nature.com/articles/s41583-025-00929
 ## Quick Start
 
 ```bash
-# 1. Install (macOS Apple Silicon)
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz
-sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/
+# 1. Install
+npm install -g vestige-mcp-server@latest
 
-# 2. Connect to Claude Code
+# 2. Connect to any MCP-compatible agent
+# Claude Code
 claude mcp add vestige vestige-mcp -s user
 
-# Or connect to Codex
-codex mcp add vestige -- /usr/local/bin/vestige-mcp
+# Codex
+codex mcp add vestige -- vestige-mcp
 
 # 3. Test it
 # "Remember that I prefer TypeScript over JavaScript"
@@ -74,18 +157,60 @@ codex mcp add vestige -- /usr/local/bin/vestige-mcp
 <details>
 <summary>Other platforms & install methods</summary>
 
-**Linux (x86_64):**
+**Updating an existing install:**
 ```bash
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-x86_64-unknown-linux-gnu.tar.gz | tar -xz
-sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/
+vestige update
 ```
 
-**macOS (Intel) and Windows:** Prebuilt binaries aren't currently shipped for these targets because of upstream toolchain gaps (`ort-sys` lacks Intel Mac prebuilts in the 2.0.0-rc.11 release that `fastembed 5.13.2` is pinned to; `usearch 2.24.0` hit a Windows MSVC compile break tracked as [usearch#746](https://github.com/unum-cloud/usearch/issues/746)). Both build fine from source in the meantime:
+`vestige update` updates only the Vestige binaries by default. Use
+`vestige update --sandwich-companion` if you also want to refresh optional Claude
+Code Cognitive Sandwich companion files.
+
+**macOS/Linux manual binary install:**
+```bash
+vestige update --install-dir /usr/local/bin
+```
+
+**macOS (Intel):** Microsoft is discontinuing x86_64 macOS prebuilts after ONNX Runtime v1.23.0, so Vestige's Intel Mac build links dynamically against a Homebrew-installed ONNX Runtime via the `ort-dynamic` feature. Install with:
+
+```bash
+brew install onnxruntime
+npm install -g vestige-mcp-server@latest
+echo 'export ORT_DYLIB_PATH="'"$(brew --prefix onnxruntime)"'/lib/libonnxruntime.dylib"' >> ~/.zshrc
+source ~/.zshrc
+claude mcp add vestige vestige-mcp -s user
+```
+
+Full Intel Mac guide (build-from-source + troubleshooting): [`docs/INSTALL-INTEL-MAC.md`](docs/INSTALL-INTEL-MAC.md).
+
+**Windows + Claude Desktop (recommended):**
+
+Fully quit Claude Desktop from the system tray, then install or update Vestige from PowerShell:
+
+```powershell
+npm install -g vestige-mcp-server@latest
+vestige-mcp --version
+```
+
+Open `%APPDATA%\Claude\claude_desktop_config.json` and point Claude Desktop at the installed MCP command:
+
+```json
+{
+  "mcpServers": {
+    "vestige": {
+      "command": "vestige-mcp"
+    }
+  }
+}
+```
+
+If Claude Desktop cannot find `vestige-mcp`, run `where vestige-mcp` in PowerShell and use the exact `.cmd` path it prints as `command`. Example: `"C:\\Users\\you\\AppData\\Roaming\\npm\\vestige-mcp.cmd"`. Reopen Claude Desktop after saving. Future binary updates use `vestige update`; optional Claude Code companion files require `vestige update --sandwich-companion`.
+
+**Windows source build:** Prebuilt binaries ship but `usearch 2.24.0` hit an MSVC compile break ([usearch#746](https://github.com/unum-cloud/usearch/issues/746)); we've pinned `=2.23.0` until upstream fixes it. Source builds work with:
 
 ```bash
 git clone https://github.com/samvallad33/vestige && cd vestige
 cargo build --release -p vestige-mcp
-# Binary lands at target/release/vestige-mcp
 ```
 
 **npm:**
@@ -106,7 +231,7 @@ cargo build --release -p vestige-mcp --features metal
 
 ## Works Everywhere
 
-Vestige speaks MCP — the universal protocol for AI tools. One brain, every IDE.
+Vestige speaks MCP, so any client that can register a stdio MCP server can use it.
 
 | IDE | Setup |
 |-----|-------|
@@ -136,7 +261,7 @@ Vestige v2.0 ships with a real-time 3D visualization of your AI's memory. Every 
 
 **Tech:** SvelteKit 2 + Svelte 5 + Three.js + Tailwind CSS 4 + WebSocket
 
-The dashboard runs automatically at `http://localhost:3927/dashboard` when the MCP server starts.
+Run `vestige dashboard` to open `http://localhost:3927/dashboard`, or set `VESTIGE_DASHBOARD_ENABLED=true` to start it with the MCP server.
 
 ---
 
@@ -151,7 +276,7 @@ The dashboard runs automatically at `http://localhost:3927/dashboard` when the M
 │  15 REST endpoints · WS event broadcast              │
 ├─────────────────────────────────────────────────────┤
 │  MCP Server (stdio JSON-RPC)                         │
-│  24 tools · 29 cognitive modules                     │
+│  25 tools · 30 cognitive modules                     │
 ├─────────────────────────────────────────────────────┤
 │  Cognitive Engine                                    │
 │  ┌──────────┐ ┌──────────┐ ┌───────────────┐       │
@@ -218,7 +343,7 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 
 ---
 
-## 🛠 24 MCP Tools
+## 🛠 25 MCP Tools
 
 ### Context Packets
 | Tool | What It Does |
@@ -228,9 +353,9 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 ### Core Memory
 | Tool | What It Does |
 |------|-------------|
-| `search` | 7-stage cognitive search — HyDE expansion + keyword + semantic + reranking + temporal + competition + spreading activation |
+| `search` | Concrete literal search for exact identifiers, or 7-stage cognitive search — HyDE expansion + keyword + semantic + reranking + temporal + competition + spreading activation |
 | `smart_ingest` | Intelligent storage with CREATE/UPDATE/SUPERSEDE via Prediction Error Gating. Batch mode for session-end saves |
-| `memory` | Get, delete, check state, promote (thumbs up), demote (thumbs down) |
+| `memory` | Get, purge content/embeddings, check state, promote (thumbs up), demote (thumbs down), edit |
 | `codebase` | Remember code patterns and architectural decisions per-project |
 | `intention` | Prospective memory — "remind me to X when Y happens" |
 
@@ -260,34 +385,28 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 | `consolidate` | Run FSRS-6 decay cycle (also auto-runs every 6 hours) |
 | `memory_timeline` | Browse chronologically, grouped by day |
 | `memory_changelog` | Audit trail of state transitions |
-| `backup` / `export` / `gc` | Database backup, JSON export, garbage collection |
-| `restore` | Restore from JSON backup |
+| `backup` / `export` / `gc` | Database backup, JSON/JSONL/portable export, garbage collection |
+| `restore` | Restore from JSON backup or portable archive |
 
 ### Deep Reference (v2.0.4)
 | Tool | What It Does |
 |------|-------------|
 | `deep_reference` | **Cognitive reasoning across memories.** 8-stage pipeline: FSRS-6 trust scoring, intent classification, spreading activation, temporal supersession, contradiction analysis, relation assessment, dream insight integration, and algorithmic reasoning chain generation. Returns trust-scored evidence with a pre-built reasoning scaffold. |
 | `cross_reference` | Backward-compatible alias for `deep_reference`. |
+| `contradictions` | **Honest memory inspection.** Scans a topic or recent memories for trust-weighted disagreements using the same local contradiction logic as `deep_reference`. |
 
 ### Active Forgetting (v2.0.5)
 | Tool | What It Does |
 |------|-------------|
-| `suppress` | **Top-down active forgetting** — neuroscience-grounded inhibitory control over retrieval. Distinct from `memory.delete` (destroys the row) and `memory.demote` (one-shot ranking hit). Each call **compounds** a retrieval-score penalty (Anderson 2025 SIF), and a background Rac1 cascade worker fades co-activated neighbors over 72h (Davis 2020). Reversible within a 24-hour labile window via `reverse: true`. **The memory persists** — it is inhibited, not erased. |
+| `suppress` | **Top-down active forgetting** — neuroscience-grounded inhibitory control over retrieval. Distinct from `memory(action="purge")`, which permanently removes content/embeddings. Each suppression compounds a retrieval-score penalty (Anderson 2025 SIF), and a background Rac1 cascade worker fades co-activated neighbors over 72h (Davis 2020). Reversible within a 24-hour labile window via `reverse: true`. **The memory persists** — it is inhibited, not erased. |
 
 ---
 
 ## Make Your AI Use Vestige Automatically
 
-Add this to your `CLAUDE.md`:
-
-```markdown
-## Memory
-
-At the start of every session:
-1. Search Vestige for user preferences and project context
-2. Save bug fixes, decisions, and patterns without being asked
-3. Create reminders when the user mentions deadlines
-```
+Registering the MCP server exposes tools; the agent still needs an instruction
+that tells it when to call memory. Use the agent-neutral protocol, then adapt it
+to your client-specific instruction file.
 
 | You Say | AI Does |
 |---------|---------|
@@ -296,7 +415,7 @@ At the start of every session:
 | "Remind me..." | Creates a future trigger |
 | "This is important" | Saves + promotes |
 
-[Full CLAUDE.md templates ->](docs/CLAUDE-SETUP.md)
+[Agent memory protocol ->](docs/AGENT-MEMORY-PROTOCOL.md) · [Claude Code template ->](docs/CLAUDE-SETUP.md)
 
 ---
 
@@ -305,9 +424,9 @@ At the start of every session:
 | Metric | Value |
 |--------|-------|
 | **Language** | Rust 2024 edition (MSRV 1.91) |
-| **Codebase** | 80,000+ lines, 1,292 tests (366 core + 425 mcp + 497 e2e + 4 doctests) |
+| **Codebase** | 80,000+ lines with Rust core/MCP/e2e, dashboard, and hook coverage |
 | **Binary size** | ~20MB |
-| **Embeddings** | Nomic Embed Text v1.5 (768d → 256d Matryoshka, 8192 context) |
+| **Embeddings** | Nomic Embed Text v1.5 by default (768d -> 256d Matryoshka, 8192 context); Qwen3 0.6B optional |
 | **Vector search** | USearch HNSW (20x faster than FAISS) |
 | **Reranker** | Jina Reranker v1 Turbo (38M params, +15-20% precision) |
 | **Storage** | SQLite + FTS5 (optional SQLCipher encryption) |
@@ -315,22 +434,14 @@ At the start of every session:
 | **Transport** | MCP stdio (JSON-RPC 2.0) + WebSocket |
 | **Cognitive modules** | 30 stateful (17 neuroscience, 11 advanced, 2 search) |
 | **First run** | Downloads embedding model (~130MB), then fully offline |
-| **Platforms** | macOS ARM + Linux x86_64 (prebuilt). macOS Intel + Windows build from source (upstream toolchain gaps, see install notes). |
+| **Platforms** | macOS ARM + Intel + Linux x86_64 + Windows x86_64 (all prebuilt). Intel Mac needs `brew install onnxruntime` — see [install guide](docs/INSTALL-INTEL-MAC.md). |
 
 ### Optional Features
 
 ```bash
-# Metal GPU acceleration (Apple Silicon — faster embedding inference)
-cargo build --release -p vestige-mcp --features metal
-
-# Nomic Embed Text v2 MoE (475M params, 305M active, 8 experts)
-cargo build --release -p vestige-mcp --features nomic-v2
-
-# Qwen3 Reranker (Candle backend, high-precision cross-encoder)
-cargo build --release -p vestige-mcp --features qwen3-reranker
-
-# SQLCipher encryption
-cargo build --release -p vestige-mcp --no-default-features --features encryption,embeddings,vector-search
+# Qwen3 embeddings (Candle backend; add metal on Apple Silicon)
+cargo build --release -p vestige-mcp --features qwen3-embeddings,metal
+VESTIGE_EMBEDDING_MODEL=qwen3-0.6b vestige consolidate
 ```
 
 ---
@@ -344,6 +455,10 @@ vestige stats --states           # Cognitive state breakdown
 vestige health                   # System health check
 vestige consolidate              # Run memory maintenance
 vestige restore <file>           # Restore from backup
+vestige portable-export <file>         # Exact cross-device archive
+vestige portable-import <file>         # Import archive into an empty database
+vestige portable-import <file> --merge # Merge archive into this database
+vestige sync <file>                    # Pull/merge/push via file backend
 vestige dashboard                # Open 3D dashboard in browser
 ```
 
@@ -384,13 +499,13 @@ First run downloads ~130MB from Hugging Face. If behind a proxy:
 export HTTPS_PROXY=your-proxy:port
 ```
 
-Cache: macOS `~/Library/Caches/com.vestige.core/fastembed` | Linux `~/.cache/vestige/fastembed`
+Cache: platform user cache directory first, then `./.fastembed_cache` as a fallback. Override with `FASTEMBED_CACHE_PATH`.
 </details>
 
 <details>
 <summary>Dashboard not loading</summary>
 
-The dashboard starts automatically on port 3927 when the MCP server runs. Check:
+Run `vestige dashboard` or set `VESTIGE_DASHBOARD_ENABLED=true`, then check:
 ```bash
 curl http://localhost:3927/api/health
 # Should return {"status":"healthy",...}
@@ -413,5 +528,5 @@ AGPL-3.0 — free to use, modify, and self-host. If you offer Vestige as a netwo
 
 <p align="center">
   <i>Built by <a href="https://github.com/samvallad33">@samvallad33</a></i><br>
-  <sub>80,000+ lines of Rust · 29 cognitive modules · 130 years of memory research · one 22MB binary</sub>
+  <sub>80,000+ lines of Rust · 30 cognitive modules · 130 years of memory research · one 22MB binary</sub>
 </p>

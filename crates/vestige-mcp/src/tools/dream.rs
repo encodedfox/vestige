@@ -16,6 +16,13 @@ pub fn schema() -> serde_json::Value {
                 "type": "integer",
                 "description": "Number of recent memories to dream about (default: 50)",
                 "default": 50
+            },
+            "min_similarity": {
+                "type": "number",
+                "description": "Minimum similarity for connection discovery (0.0-1.0, default: 0.5)",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "default": 0.5
             }
         }
     })
@@ -32,6 +39,11 @@ pub async fn execute(
         .and_then(|v| v.as_u64())
         .unwrap_or(50)
         .min(500) as usize; // Cap at 500 to prevent O(N^2) hang
+    let min_similarity = args
+        .as_ref()
+        .and_then(|a| a.get("min_similarity"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v.clamp(0.0, 1.0));
 
     // v1.9.0: Waking SWR tagging — preferential replay of tagged memories (70/30 split)
     let tagged_nodes = storage
@@ -95,15 +107,18 @@ pub async fn execute(
         .collect();
 
     let cog = cognitive.lock().await;
-    // Capture start time before the dream so we can identify newly discovered
-    // connections by timestamp rather than by buffer position. This is robust
-    // against the composite-score eviction sort in store_connections, which
-    // reorders the buffer and makes positional slicing (pre_dream_count..)
-    // unreliable.
-    let dream_start = Utc::now();
-    let dream_result = cog.dreamer.dream(&dream_memories).await;
+    let (dream_result, new_connections) = if let Some(min_similarity) = min_similarity {
+        let config = vestige_core::DreamConfig {
+            min_similarity,
+            ..vestige_core::DreamConfig::default()
+        };
+        cog.dreamer
+            .dream_with_config_and_connections(&dream_memories, config)
+            .await
+    } else {
+        cog.dreamer.dream_with_connections(&dream_memories).await
+    };
     let insights = cog.dreamer.synthesize_insights(&dream_memories);
-    let all_connections = cog.dreamer.get_connections();
     drop(cog);
 
     // v2.1.0: Persist dream insights to database (Bug #4 fix)
@@ -126,17 +141,10 @@ pub async fn execute(
         }
     }
 
-    // Identify new connections from this dream by timestamp rather than buffer
-    // position — positional slicing is broken after composite-score eviction
-    // reorders the buffer.
-    let new_connections: Vec<&vestige_core::DiscoveredConnection> = all_connections
-        .iter()
-        .filter(|c| c.discovered_at >= dream_start)
-        .collect();
     let mut connections_persisted = 0u64;
     {
         let now = Utc::now();
-        for conn in new_connections.iter() {
+        for conn in &new_connections {
             let link_type = match conn.connection_type {
                 vestige_core::DiscoveredConnectionType::Semantic => "semantic",
                 vestige_core::DiscoveredConnectionType::SharedConcept => "shared_concepts",
@@ -178,7 +186,7 @@ pub async fn execute(
     // Hydrate live cognitive engine with newly persisted connections
     if connections_persisted > 0 {
         let mut cog = cognitive.lock().await;
-        for conn in new_connections.iter() {
+        for conn in &new_connections {
             let link_type_enum = match conn.connection_type {
                 vestige_core::DiscoveredConnectionType::Semantic => LinkType::Semantic,
                 vestige_core::DiscoveredConnectionType::SharedConcept => LinkType::Semantic,
@@ -286,6 +294,9 @@ mod tests {
         assert_eq!(s["type"], "object");
         assert!(s["properties"]["memory_count"].is_object());
         assert_eq!(s["properties"]["memory_count"]["default"], 50);
+        assert!(s["properties"]["min_similarity"].is_object());
+        assert_eq!(s["properties"]["min_similarity"]["minimum"], 0.0);
+        assert_eq!(s["properties"]["min_similarity"]["maximum"], 1.0);
     }
 
     #[tokio::test]
@@ -613,6 +624,42 @@ mod tests {
             persisted as usize,
             "Storage should contain exactly {} connections",
             persisted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dream_persists_dense_connection_set_above_legacy_buffer_cap() {
+        let (storage, _dir) = test_storage().await;
+        ingest_n_memories(&storage, 50).await;
+
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "memory_count": 50,
+                "min_similarity": 0.1
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], "dreamed");
+        let found = result["stats"]["new_connections_found"]
+            .as_u64()
+            .unwrap_or(0);
+        let persisted = result["connectionsPersisted"].as_u64().unwrap_or(0);
+
+        assert!(
+            found > 1_000,
+            "test setup should discover more than the legacy 1,000 connection cap"
+        );
+        assert_eq!(
+            persisted, found,
+            "dense dreams should persist every connection discovered in the run"
+        );
+        assert_eq!(
+            storage.get_all_connections().unwrap().len(),
+            persisted as usize
         );
     }
 

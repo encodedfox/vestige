@@ -13,8 +13,7 @@ Xcode 26.3 supports [agentic coding](https://developer.apple.com/documentation/x
 ### 1. Install Vestige
 
 ```bash
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz
-sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/
+npm install -g vestige-mcp-server@latest
 ```
 
 ### 2. Add to your Xcode project
@@ -27,7 +26,7 @@ cat > /path/to/your/project/.mcp.json << 'EOF'
   "mcpServers": {
     "vestige": {
       "type": "stdio",
-      "command": "/usr/local/bin/vestige-mcp",
+      "command": "vestige-mcp",
       "args": [],
       "env": {
         "PATH": "/usr/local/bin:/usr/bin:/bin"
@@ -51,7 +50,7 @@ Quit Xcode completely (Cmd+Q) and reopen your project.
 
 ### 4. Verify
 
-Type `/context` in the Agent panel. You should see `vestige` listed with 24 tools.
+Type `/context` in the Agent panel. You should see `vestige` listed with 25 tools.
 
 ---
 
@@ -166,7 +165,7 @@ See [CLAUDE.md templates](../CLAUDE-SETUP.md) for a full setup.
 The first time Vestige runs, it downloads the embedding model (~130MB). In Xcode's sandboxed environment, the cache location is:
 
 ```
-~/Library/Caches/com.vestige.core/fastembed
+~/Library/Caches/vestige/fastembed
 ```
 
 If the download fails behind a corporate proxy, pre-download by running `vestige-mcp` once from your terminal.
@@ -231,7 +230,7 @@ Xcode 26.3 has a feature gate (`claudeai-mcp`) that may block custom MCP servers
 The first run downloads ~130MB. If Xcode's sandbox blocks the download:
 
 1. Run `vestige-mcp` once from your terminal to cache the model
-2. The cache at `~/Library/Caches/com.vestige.core/fastembed` will be available to the sandboxed instance
+2. The cache at `~/Library/Caches/vestige/fastembed` will be available to the sandboxed instance
 
 Behind a proxy:
 ```bash

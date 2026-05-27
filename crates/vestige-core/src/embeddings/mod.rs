@@ -13,6 +13,7 @@ mod code;
 mod hybrid;
 mod local;
 
+#[cfg(feature = "vector-search")]
 pub(crate) use local::get_cache_dir;
 pub use local::{
     BATCH_SIZE, EMBEDDING_DIMENSIONS, Embedding, EmbeddingError, EmbeddingService, MAX_TEXT_LENGTH,

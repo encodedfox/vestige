@@ -7,10 +7,16 @@
 //! - Temporal memory support
 
 mod migrations;
+mod portable;
 mod sqlite;
 
 pub use migrations::MIGRATIONS;
+pub use portable::{
+    PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode, PortableImportReport,
+    PortableTable, PortableValue,
+};
 pub use sqlite::{
-    ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord, InsightRecord,
-    IntentionRecord, Result, SmartIngestResult, StateTransitionRecord, Storage, StorageError,
+    ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord, FilePortableSyncBackend,
+    InsightRecord, IntentionRecord, PortableSyncBackend, PortableSyncReport, Result,
+    SmartIngestResult, StateTransitionRecord, Storage, StorageError,
 };

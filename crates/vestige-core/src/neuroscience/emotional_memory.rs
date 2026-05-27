@@ -103,21 +103,6 @@ pub enum EmotionCategory {
     Neutral,
 }
 
-impl EmotionCategory {
-    /// Get the base arousal level for this category
-    #[allow(dead_code)]
-    fn base_arousal(&self) -> f64 {
-        match self {
-            Self::Joy => 0.6,
-            Self::Frustration => 0.7,
-            Self::Urgency => 0.9,
-            Self::Surprise => 0.8,
-            Self::Confusion => 0.4,
-            Self::Neutral => 0.1,
-        }
-    }
-}
-
 impl std::fmt::Display for EmotionCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

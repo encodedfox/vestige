@@ -315,7 +315,10 @@ async fn execute_batch(
 
     let mut results = Vec::new();
     let mut created = 0u32;
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     let mut updated = 0u32;
+    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    let updated = 0u32;
     let mut skipped = 0u32;
     let mut errors = 0u32;
 

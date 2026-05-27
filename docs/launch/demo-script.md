@@ -194,10 +194,10 @@ wc -l $(find /path/to/vestige/crates -name "*.rs") | tail -1
 # → 77,840 total
 ```
 
-> Seventy-eight thousand lines of Rust. Seven hundred thirty-four tests. Twenty-two megabyte binary. Ships with the dashboard embedded. Install is one curl command:
+> Seventy-eight thousand lines of Rust. Seven hundred thirty-four tests. Twenty-two megabyte binary. Ships with the dashboard embedded. Install is one npm command:
 
 ```bash
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz
+npm install -g vestige-mcp-server
 claude mcp add vestige vestige-mcp -s user
 ```
 
@@ -241,8 +241,7 @@ claude mcp add vestige vestige-mcp -s user
 
 ```bash
 # Install (macOS Apple Silicon)
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz
-sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/
+npm install -g vestige-mcp-server
 ```
 
 > Three binaries. The MCP server, the CLI admin tool, and a restore utility. Twenty-two megabytes total. No Docker. No Python. No node_modules. No cloud API key.
@@ -389,7 +388,7 @@ vestige-mcp --version
 # <300ns cosine similarity (benchmarked with Criterion)
 # Zero cloud dependencies
 # Zero API keys required
-# One curl command to install
+# One command to install
 ```
 
 > This is what I've been building for the past three months. I'm one person, I'm twenty-one years old, and I believe this is how AI memory should work — grounded in real science, running locally, open source.
@@ -420,7 +419,7 @@ vestige-mcp --version
 > Yes. It speaks MCP — the Model Context Protocol. One config change and it works with Claude Desktop, Cursor, VS Code Copilot, JetBrains, Windsurf, Xcode 26.3. Anything that speaks MCP.
 
 **Q: What about multi-user or team memory?**
-> That's the v3.0 roadmap — "Hivemind." Ed25519 identity, CRDT-based sync, transactive directory (Wegner's "who knows what" routing), federated retrieval with differential privacy. The open source version is single-user, local-first. Team and cloud features will be proprietary.
+> The current Pro plan is more pragmatic: prove portable sync/storage first, then ship Solo and Team workflows around managed sync, backups, onboarding, and support. The open-source core stays local-first; paid team features should stay in the separate Pro/commercial boundary.
 
 **Q: How does Prediction Error Gating prevent duplicate memories?**
 > When you ingest a new memory, it computes embedding similarity against all existing memories. If similarity is above 0.92, it reinforces the existing memory (bumps FSRS stability). Between 0.75 and 0.92, it updates/merges. Below 0.75, it creates a new memory. The thresholds come from computational neuroscience research on prediction error signals — the brain stores what's surprising, reinforces what's familiar, and updates what's partially known. Same principle.
@@ -479,7 +478,7 @@ vestige-mcp --version
 - **Start from the dashboard.** The 3D graph is the hook. It's visual, it's unusual, it makes people lean in.
 - **Don't rush the dream sequence.** The purple wash and sequential node pulses are the most visually impressive moment. Let it breathe for 3-4 seconds.
 - **Say the scientists' names.** "Ebbinghaus," "Bjork," "Frey and Morris" — this signals that you've done the reading. The MCP Dev Summit audience respects depth.
-- **Make eye contact during the punchline.** "One curl command. Your AI now has a brain." Look at the audience, not the screen.
+- **Make eye contact during the punchline.** "One command. Your AI now has a brain." Look at the audience, not the screen.
 - **Own your age.** Twenty-one, solo developer, zero funding. This is an asset, not a liability. You built something that the well-funded competitors haven't.
 - **The dashboard is your co-presenter.** Every time Claude does something, the dashboard should be showing the corresponding event. Practice the terminal-to-browser switch until it's seamless.
 - **Don't apologize.** Not for bugs, not for the AGPL, not for being solo. Confident but not arrogant. The work speaks.

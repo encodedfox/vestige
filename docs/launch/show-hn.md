@@ -401,8 +401,7 @@ locally on your machine.
 **Setup (2 minutes):**
 
 ```bash
-curl -L https://github.com/samvallad33/vestige/releases/latest/download/vestige-mcp-aarch64-apple-darwin.tar.gz | tar -xz
-sudo mv vestige-mcp vestige vestige-restore /usr/local/bin/
+npm install -g vestige-mcp-server
 claude mcp add vestige vestige-mcp -s user
 ```
 

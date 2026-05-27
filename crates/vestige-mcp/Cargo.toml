@@ -1,8 +1,8 @@
 [package]
 name = "vestige-mcp"
-version = "2.0.7"
+version = "2.1.22"
 edition = "2024"
-description = "Cognitive memory MCP server for Claude - FSRS-6, spreading activation, synaptic tagging, 3D dashboard, and 130 years of memory research"
+description = "Cognitive memory MCP server for AI agents - FSRS-6, spreading activation, synaptic tagging, 3D dashboard, and 130 years of memory research"
 authors = ["samvallad33"]
 license = "AGPL-3.0-only"
 keywords = ["mcp", "ai", "memory", "fsrs", "neuroscience", "cognitive-science", "spaced-repetition"]
@@ -10,12 +10,20 @@ categories = ["command-line-utilities", "database"]
 repository = "https://github.com/samvallad33/vestige"
 
 [features]
-default = ["embeddings", "vector-search"]
+default = ["embeddings", "ort-download", "vector-search"]
 embeddings = ["vestige-core/embeddings"]
 vector-search = ["vestige-core/vector-search"]
-# For systems with glibc < 2.38 — use runtime-loaded ORT instead of the downloaded pre-built binary.
-# Usage: cargo install --path crates/vestige-mcp --no-default-features --features ort-dynamic,vector-search
-ort-dynamic = ["vestige-core/ort-dynamic"]
+# Default ort backend: downloads prebuilt ONNX Runtime at build time.
+# Fails on targets without prebuilts (notably x86_64-apple-darwin).
+ort-download = ["embeddings", "vestige-core/ort-download"]
+# Alternative ort backend: runtime-linked system libonnxruntime via dlopen.
+# Required on Intel Mac and on systems with glibc < 2.38.
+# Usage:   cargo build --no-default-features --features ort-dynamic,vector-search
+# Runtime: export ORT_DYLIB_PATH=$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib
+ort-dynamic = ["embeddings", "vestige-core/ort-dynamic"]
+qwen3-embeddings = ["embeddings", "vestige-core/qwen3-embeddings"]
+qwen3-reranker = ["qwen3-embeddings"]
+metal = ["embeddings", "vestige-core/metal"]
 
 [[bin]]
 name = "vestige-mcp"
@@ -39,7 +47,7 @@ path = "src/bin/cli.rs"
 # Only `bundled-sqlite` is always on. `embeddings` and `vector-search` are
 # toggled via vestige-mcp's own feature flags below so `--no-default-features`
 # actually works (previously hardcoded here, which silently defeated the flag).
-vestige-core = { version = "2.0.5", path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
+vestige-core = { version = "2.1.22", path = "../vestige-core", default-features = false, features = ["bundled-sqlite"] }
 
 # ============================================================================
 # MCP Server Dependencies

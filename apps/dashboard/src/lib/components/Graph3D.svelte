@@ -11,6 +11,7 @@
 	import { mapEventToEffects, type GraphMutationContext, type GraphMutation } from '$lib/graph/events';
 	import { createNebulaBackground, updateNebula } from '$lib/graph/shaders/nebula.frag';
 	import { createPostProcessing, updatePostProcessing, type PostProcessingStack } from '$lib/graph/shaders/post-processing';
+	import { graphState } from '$lib/stores/graph-state.svelte';
 	import type * as THREE from 'three';
 
 	interface Props {
@@ -19,9 +20,9 @@
 		centerId: string;
 		events?: VestigeEvent[];
 		isDreaming?: boolean;
-		/// v2.0.8: colour mode for node spheres. "type" tints by node type
-		/// (fact/concept/event/…); "state" tints by FSRS accessibility bucket
-		/// (active/dormant/silent/unavailable). Toggled live from the graph page.
+		/// Colour mode for node spheres. "type" tints by node type, "state"
+		/// tints by FSRS accessibility bucket, and "ahagraph" tints by
+		/// learning tags from AhaGraph.
 		colorMode?: ColorMode;
 		onSelect?: (nodeId: string) => void;
 		onGraphMutation?: (mutation: GraphMutation) => void;
@@ -59,8 +60,13 @@
 	let nebulaMaterial: THREE.ShaderMaterial;
 	let postStack: PostProcessingStack;
 
-	// Event tracking
-	let processedEventCount = 0;
+	// Event tracking — we track the last-processed event by reference identity
+	// rather than by count, because the WebSocket store PREPENDS new events
+	// at index 0 and CAPS the array at MAX_EVENTS, so a numeric high-water
+	// mark would drift out of alignment (and did for ~3 versions — v2.3
+	// demo uncovered this while trying to fire multiple MemoryCreated events
+	// in sequence).
+	let lastProcessedEvent: VestigeEvent | null = null;
 
 	// Internal tracking: initial nodes + live-added nodes
 	let allNodes: GraphNode[] = [];
@@ -116,9 +122,23 @@
 		if (ctx) disposeScene(ctx);
 	});
 
+	// 120Hz Governor. All physics and effect counters are frame-based
+	// (orb.age++, forceSim.tick, materialization frames). On a ProMotion
+	// display the browser drives rAF at 120 FPS, which would double-speed
+	// every ritual. Clamping to ~60 FPS keeps the visual timing identical
+	// across displays without rewriting every counter to use delta time.
+	// The `- (dt % 16)` carry avoids long-term drift.
+	let govLastTime = 0;
+
 	function animate() {
 		animationId = requestAnimationFrame(animate);
-		const time = performance.now() * 0.001;
+		const now = performance.now();
+		if (govLastTime === 0) govLastTime = now;
+		const dt = now - govLastTime;
+		if (dt < 16) return;
+		govLastTime = now - (dt % 16);
+
+		const time = now * 0.001;
 
 		// Force simulation
 		forceSim.tick(edges);
@@ -132,7 +152,7 @@
 
 		// Animate
 		particles.animate(time);
-		nodeManager.animate(time, allNodes, ctx.camera);
+		nodeManager.animate(time, allNodes, ctx.camera, graphState.brightness);
 
 		// Dream mode
 		dreamMode.setActive(isDreaming);
@@ -157,10 +177,33 @@
 	}
 
 	function processEvents() {
-		if (!events || events.length <= processedEventCount) return;
+		if (!events || events.length === 0) return;
 
-		const newEvents = events.slice(processedEventCount);
-		processedEventCount = events.length;
+		// Walk the feed from newest (index 0) backward until we hit the last
+		// event we already processed. Everything between is fresh. This is
+		// robust against both (a) prepend ordering and (b) the MAX_EVENTS cap
+		// dropping old entries off the tail.
+		const fresh: VestigeEvent[] = [];
+		for (const e of events) {
+			if (e === lastProcessedEvent) break;
+			fresh.push(e);
+		}
+		if (fresh.length === 0) return;
+
+		// Event Horizon Guard. If the last-processed reference fell off the
+		// end of the capped array (burst of >MAX_EVENTS events in one tick),
+		// the walk above consumed the ENTIRE buffer — we'd try to animate
+		// 200 simultaneous births and melt the GPU. Detect the overflow and
+		// drop this batch on the floor; state is already current via
+		// lastProcessedEvent pointing forward.
+		if (fresh.length === events.length && events.length >= 200) {
+			// eslint-disable-next-line no-console
+			console.warn('[vestige] Event horizon overflow: dropping visuals for', fresh.length, 'events');
+			lastProcessedEvent = events[0];
+			return;
+		}
+
+		lastProcessedEvent = events[0];
 
 		const mutationCtx: GraphMutationContext = {
 			effects,
@@ -180,8 +223,11 @@
 			},
 		};
 
-		for (const event of newEvents) {
-			mapEventToEffects(event, mutationCtx, allNodes);
+		// Process oldest-first so cause precedes effect (e.g. MemoryCreated
+		// fires before a ConnectionDiscovered that references the new node).
+		// `fresh` is newest-first from the walk above, so iterate reversed.
+		for (let i = fresh.length - 1; i >= 0; i--) {
+			mapEventToEffects(fresh[i], mutationCtx, allNodes);
 		}
 	}
 

@@ -12,7 +12,10 @@ import type {
 	ConsolidationResult,
 	IntentionItem,
 	SuppressResult,
-	UnsuppressResult
+	UnsuppressResult,
+	SanhedrinAppealReason,
+	SanhedrinAppealResponse,
+	SanhedrinLatestResponse
 } from '$types';
 
 const BASE = '/api';
@@ -63,7 +66,21 @@ export const api = {
 		fetcher<TimelineResponse>(`/timeline?days=${days}&limit=${limit}`),
 
 	// Graph
-	graph: (params?: { query?: string; center_id?: string; depth?: number; max_nodes?: number }) => {
+	//
+	// `sort` controls the default center when no query/center_id is given:
+	//   - "recent" (default) — newest memory; matches user expectation of
+	//     "show me what I just added". Previously the backend defaulted to
+	//     "connected" which clustered on historical hotspots and hid
+	//     fresh memories that hadn't accumulated edges yet.
+	//   - "connected" — densest node; richer initial subgraph for a
+	//     well-aged corpus. Exposed for a future UI toggle.
+	graph: (params?: {
+		query?: string;
+		center_id?: string;
+		depth?: number;
+		max_nodes?: number;
+		sort?: 'recent' | 'connected';
+	}) => {
 		const qs = params ? '?' + new URLSearchParams(
 			Object.entries(params)
 				.filter(([, v]) => v !== undefined)
@@ -95,5 +112,24 @@ export const api = {
 
 	// Intentions
 	intentions: (status = 'active') =>
-		fetcher<{ intentions: IntentionItem[]; total: number; filter: string }>(`/intentions?status=${status}`)
+		fetcher<{ intentions: IntentionItem[]; total: number; filter: string }>(`/intentions?status=${status}`),
+
+	// Reasoning Theater (v2.0.8): the 8-stage deep_reference cognitive pipeline.
+	// Returns a reasoning chain + evidence + contradictions + supersession +
+	// evolution + confidence. Emits DeepReferenceCompleted on the WebSocket so
+	// the 3D graph can camera-glide + pulse + arc.
+	deepReference: (query: string, depth = 20) =>
+		fetcher<Record<string, unknown>>('/deep_reference', {
+			method: 'POST',
+			body: JSON.stringify({ query, depth })
+		}),
+
+	sanhedrin: {
+		latest: () => fetcher<SanhedrinLatestResponse>('/sanhedrin/latest'),
+		appeal: (reason: SanhedrinAppealReason, note?: string, claimId?: string, receiptId?: string) =>
+			fetcher<SanhedrinAppealResponse>('/sanhedrin/appeal', {
+				method: 'POST',
+				body: JSON.stringify({ reason, note, claimId, receiptId })
+			})
+	}
 };
