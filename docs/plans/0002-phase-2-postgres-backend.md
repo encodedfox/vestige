@@ -1,5 +1,13 @@
 # Phase 2 Plan: PostgreSQL Backend
 
+> **Supersession Notice (2026-05-26):** This master plan is now archival. Execution is governed by:
+> - **ADR**: [`docs/adr/0002-phase-2-execution.md`](../adr/0002-phase-2-execution.md) -- binding decisions
+> - **Sub-plans** (executable briefs):
+>   - Phase 1 amendment: [0001a-trait-rewrite.md](0001a-trait-rewrite.md), [0001b-sqlite-split.md](0001b-sqlite-split.md), [0001c-async-trait-sunset.md](0001c-async-trait-sunset.md)
+>   - Phase 2: 0002a..0002i (skeleton, pool+config, migrations, store impl, hybrid search, migrate CLI, reembed, tests+benches, runbook)
+>
+> **Deltas vs body**: trait uses `trait_variant`, error type is `MemoryStoreError`/`MemoryStoreResult`, `connect` is `(url, max_connections)` only, the core table is `knowledge_nodes` (not `memories`) and gains `owner_user_id` + `visibility` + `shared_with_groups` + `codebase`, plus `users`/`groups`/`group_memberships` tables. See ADR 0002 D1-D8.
+
 **Status**: Draft
 **Depends on**: Phase 1 (MemoryStore + Embedder traits, embedding_model registry, domain columns)
 **Related**: docs/adr/0001-pluggable-storage-and-network-access.md (Phase 2), docs/prd/001-getting-centralized-vestige.md, docs/plans/local-dev-postgres-setup.md (local cluster provisioning)
