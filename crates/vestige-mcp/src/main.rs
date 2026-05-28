@@ -256,12 +256,13 @@ fn prepare_storage_path(data_dir: Option<PathBuf>) -> io::Result<Option<PathBuf>
     }
 
     // Only create if it doesn't exist (avoids "File exists" error on existing directories)
-    if !data_dir.exists() {
+    let created = !data_dir.exists();
+    if created {
         fs::create_dir_all(&data_dir)?;
     }
 
     #[cfg(unix)]
-    {
+    if created {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700));
     }
@@ -592,6 +593,23 @@ mod tests {
         let db_path = prepare_storage_path(Some(data_dir.clone())).unwrap();
 
         assert_eq!(db_path, Some(data_dir.join(DATABASE_FILE)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_storage_path_preserves_existing_data_dir_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("shared");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db_path = prepare_storage_path(Some(data_dir.clone())).unwrap();
+        let mode = fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(db_path, Some(data_dir.join(DATABASE_FILE)));
+        assert_eq!(mode, 0o755);
     }
 
     #[test]
