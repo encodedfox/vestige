@@ -1,12 +1,8 @@
 # vestige-mcp-server
 
-**v2.1.23** — Vestige MCP Server: local cognitive memory and optional Receipt Lock for MCP-compatible AI agents.
+Vestige MCP Server - A synthetic hippocampus for AI assistants.
 
-- **Memory:** FSRS-6 spaced repetition, prediction error gating, dreaming, 3D dashboard
-- **Receipt Lock:** blocks "tests passed" / "build green" without command receipts (optional hooks)
-- **Stats:** ~86K LOC Rust · 25 tools · 1,200+ tests · 22MB binary · 100% local
-
-Homepage: https://samvallad33.github.io/vestige/ · Repo: https://github.com/samvallad33/vestige
+Built on 130 years of cognitive science research, Vestige provides biologically-inspired memory that decays, strengthens, and consolidates like the human mind.
 
 ## Installation
 
@@ -58,25 +54,6 @@ codex mcp add vestige -- vestige-mcp
 
 Then restart your MCP client.
 
-## Optional Receipt Lock for Claude Code
-
-Receipt Lock is part of Vestige's optional Cognitive Sandwich hook layer. Normal
-MCP memory stays lightweight and local. If you want claim checking for summaries
-like "tests passed" or "lint is clean," enable Sanhedrin and point it at any
-OpenAI-compatible chat endpoint:
-
-```bash
-vestige sandwich install --enable-sanhedrin
-
-vestige sandwich install \
-  --enable-sanhedrin \
-  --sanhedrin-endpoint=http://127.0.0.1:11434/v1/chat/completions \
-  --sanhedrin-model=qwen2.5:14b
-```
-
-If a claim is missing command evidence, Vestige writes local receipts under
-`~/.vestige/sanhedrin/` so the veto is inspectable instead of opaque.
-
 ## Usage with Claude Desktop
 
 Add to your Claude Desktop configuration:
@@ -109,7 +86,6 @@ vestige sandwich install # Manage optional Claude Code hook files
 ## Features
 
 - **FSRS-6 Algorithm**: State-of-the-art spaced repetition for optimal memory retention
-- **Receipt Lock**: Optional command-receipt checking for test/build/lint/typecheck claims
 - **Dual-Strength Memory**: Bjork & Bjork (1992) - Storage + Retrieval strength model
 - **Synaptic Tagging**: Memories become important retroactively (Frey & Morris 1997)
 - **Semantic Search**: Local embeddings via nomic-embed-text-v1.5 (768 dimensions)

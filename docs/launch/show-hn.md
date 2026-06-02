@@ -1,7 +1,4 @@
-# Vestige v2.1.23 Launch — Show HN + Cross-Posts (Wave B: Memory)
-
-> **Wave A (Receipt Lock)** posts live in [receipt-lock.md](receipt-lock.md). Run Wave A first.  
-> Stats: [LAUNCH_STATS.md](../LAUNCH_STATS.md)
+# Vestige v2.0 Launch — Show HN + Cross-Posts
 
 ---
 
@@ -10,7 +7,7 @@
 ### Title (76 chars)
 
 ```
-Show HN: Vestige v2.1.23 – FSRS-6 memory for AI agents + local Receipt Lock
+Show HN: Vestige – FSRS-6 spaced repetition as long-term memory for AI agents
 ```
 
 ### Body (first comment)
@@ -60,7 +57,7 @@ retrieval. Written in Rust, 100% local, single 22MB binary.
   discover hidden connections and synthesize insights. Inspired by hippocampal
   replay during sleep.
 
-**Dashboard (since v2.0, still core):**
+**v2.0 adds:**
 
 - 3D neural visualization dashboard (SvelteKit + Three.js) — watch memories
   pulse when accessed, burst particles on creation, golden flash lines when
@@ -77,10 +74,7 @@ retrieval. Written in Rust, 100% local, single 22MB binary.
   embedded via Rust's `include_dir!` macro. No Docker, no Node runtime, no
   external services.
 
-**v2.1.23 adds Receipt Lock:** optional hooks that block operational claims like
-"tests passed" unless matching command receipts exist in the transcript.
-
-**Numbers:** ~86,000 lines of Rust, 1,200+ tests, 30 cognitive modules, 25 MCP
+**Numbers:** 77,840 lines of Rust, 734 tests, 29 cognitive modules, 21 MCP
 tools, search under 50ms for 1000 memories (SQLite FTS5 + USearch HNSW).
 
 **What it is NOT:** This is not RAG. RAG treats memory as a static database —
@@ -93,7 +87,7 @@ The embedding model (Nomic Embed Text v1.5) runs locally via ONNX. After the
 first-run model download (~130MB), there are zero network requests. No
 telemetry, no analytics, no phoning home.
 
-I've been using this daily and the experience is genuinely different.
+I've been using this daily for 2 months and the experience is genuinely different.
 Claude remembers my coding patterns, my architectural decisions, my preferences.
 New sessions start with context instead of a blank slate.
 
@@ -281,12 +275,12 @@ surprising and useful.
 
 ### r/rust
 
-**Title:** `Vestige v2.1.23 — ~86K LOC Rust memory system with FSRS-6, Receipt Lock, and a 22MB binary`
+**Title:** `Vestige v2.0 — 77K LOC Rust memory system with FSRS-6, HNSW, Axum WebSockets, and an embedded SvelteKit dashboard in a 22MB binary`
 
 **Body:**
 
 ```markdown
-I've been building Vestige and just shipped v2.1.23. It's
+I've been building Vestige for the past few months and just shipped v2.0. It's
 a cognitive memory system for AI agents that implements neuroscience-backed
 memory algorithms in pure Rust.
 
@@ -320,7 +314,7 @@ memory algorithms in pure Rust.
 - **Release profile**: `lto = true`, `codegen-units = 1`, `opt-level = "z"`,
   `strip = true` gets the binary down to 22MB including embedded assets.
 
-- **1,200+ tests** across workspace. Zero warnings on release gates.
+- **734 tests**: 352 core + 378 mcp + 4 doctests. Zero warnings.
 
 **Architecture:**
 
@@ -363,7 +357,7 @@ Happy to discuss any of the Rust architecture decisions.
 
 ### r/ClaudeAI
 
-**Title:** `Vestige v2.1.23 — give Claude real long-term memory (FSRS-6) + optional Receipt Lock for fake "tests passed" claims`
+**Title:** `Vestige v2.0 "Cognitive Leap" — give Claude real long-term memory with neuroscience-backed forgetting, a 3D dashboard, and 21 MCP tools`
 
 **Body:**
 
@@ -391,7 +385,7 @@ locally on your machine.
   strength model, testing effect, synaptic tagging, spreading activation,
   context-dependent retrieval, memory dreaming.
 
-**Highlights:**
+**v2.0 new features:**
 
 - **3D Memory Dashboard** at localhost:3927/dashboard — watch Claude's mind in
   real-time. Memories pulse when accessed, burst particles on creation, golden
@@ -407,8 +401,7 @@ locally on your machine.
 **Setup (2 minutes):**
 
 ```bash
-npm install -g vestige-mcp-server@latest
-vestige health
+npm install -g vestige-mcp-server
 claude mcp add vestige vestige-mcp -s user
 ```
 
@@ -424,7 +417,7 @@ on Project X ended with a tricky race condition in the WebSocket handler.
 It's the difference between talking to someone with amnesia vs. someone who
 actually knows you.
 
-25 MCP tools. ~86,000 lines of Rust. 1,200+ tests. Works with Claude Code, Claude
+21 MCP tools. 77,840 lines of Rust. 734 tests. Works with Claude Code, Claude
 Desktop, Cursor, VS Code Copilot, JetBrains, Windsurf, and Xcode.
 
 Source: https://github.com/samvallad33/vestige
@@ -436,7 +429,7 @@ Happy to answer questions or help with setup.
 
 ### r/LocalLLaMA
 
-**Title:** `Vestige v2.1.23 — local-first AI memory with FSRS-6, Receipt Lock, zero cloud (~86K LOC Rust, 22MB binary)`
+**Title:** `Vestige v2.0 — local-first AI memory server with FSRS-6 spaced repetition, ONNX embeddings, and zero cloud dependency (77K LOC Rust, 22MB binary)`
 
 **Body:**
 
@@ -489,7 +482,7 @@ algorithms:
 - 3D force-directed memory graph with real-time WebSocket events
 - HyDE query expansion (template-based hypothetical document embeddings)
 - FSRS decay visualization with retention curves
-- 1,200+ tests, 30 cognitive modules, 25 tools
+- 734 tests, 29 cognitive modules, 21 tools
 - fastembed 5.11 with feature flags for Nomic v2 MoE + Qwen3 reranker
 
 **Performance:**
@@ -542,7 +535,8 @@ This is a solo project — feedback, issues, and contributions are very welcome.
    implementations, some are engineering heuristics inspired by research)
 3. 100% local, zero cloud — this is a feature, not a limitation
 4. The 3D dashboard is a genuine exploration tool, not just eye candy
-5. FSRS-6 + Receipt Lock — spaced repetition memory and optional agent claim verification
+5. FSRS-6 is the differentiator — no other AI memory system uses real spaced
+   repetition
 
 ### What NOT to Say
 
