@@ -228,19 +228,41 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 }
 ```
 
-### Opencode TUI/Desktop 
+### OpenCode
 
-You can put it at [various different](https://opencode.ai/docs/config/#locations) locations. I recommend `opencode.json` in the project folder. 
+OpenCode supports global and project-local config. For a project-local setup, add to `opencode.json`:
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "vestige": {
-      "command": "vestige-mcp"
+      "type": "local",
+      "command": ["vestige-mcp"],
+      "enabled": true,
+      "timeout": 10000
     }
   }
 }
 ```
+
+For isolated per-project memory, pass the data directory in the command array:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "vestige": {
+      "type": "local",
+      "command": ["vestige-mcp", "--data-dir", "./.vestige"],
+      "enabled": true,
+      "timeout": 10000
+    }
+  }
+}
+```
+
+See the [OpenCode integration guide](integrations/opencode.md) for global config, verification, and troubleshooting.
 
 ---
 

@@ -14,7 +14,7 @@
 
 Built on proven memory and retrieval ideas — FSRS-6 spaced repetition, prediction error gating, synaptic tagging, spreading activation, and memory consolidation — all running in a single Rust binary with a local dashboard. 100% local. Zero cloud.
 
-[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-25-mcp-tools) | [Docs](docs/)
+[Quick Start](#quick-start) | [Dashboard](#-3d-memory-dashboard) | [How It Works](#-the-cognitive-science-stack) | [Tools](#-25-mcp-tools) | [Docs](docs/) | [Roadmap](docs/ROADMAP.md)
 
 </div>
 
@@ -47,6 +47,9 @@ claude mcp add vestige vestige-mcp -s user
 
 # Codex
 codex mcp add vestige -- vestige-mcp
+
+# OpenCode
+npx @vestige/init
 
 # 3. Test it
 # "Remember that I prefer TypeScript over JavaScript"
@@ -142,6 +145,7 @@ Vestige speaks MCP, so any client that can register a stdio MCP server can use i
 | **Xcode 26.3** | [Integration guide](docs/integrations/xcode.md) |
 | **Cursor** | [Integration guide](docs/integrations/cursor.md) |
 | **VS Code (Copilot)** | [Integration guide](docs/integrations/vscode.md) |
+| **OpenCode** | [Integration guide](docs/integrations/opencode.md) |
 | **JetBrains** | [Integration guide](docs/integrations/jetbrains.md) |
 | **Windsurf** | [Integration guide](docs/integrations/windsurf.md) |
 
@@ -421,7 +425,7 @@ vestige dashboard                # Open 3D dashboard in browser
 | [Storage Modes](docs/STORAGE.md) | Global, per-project, multi-instance |
 | [CLAUDE.md Setup](docs/CLAUDE-SETUP.md) | Templates for proactive memory |
 | [Configuration](docs/CONFIGURATION.md) | CLI commands, environment variables |
-| [Integrations](docs/integrations/) | Codex, Xcode, Cursor, VS Code, JetBrains, Windsurf |
+| [Integrations](docs/integrations/) | Codex, Xcode, Cursor, VS Code, OpenCode, JetBrains, Windsurf |
 | [Changelog](CHANGELOG.md) | Version history |
 
 ---
