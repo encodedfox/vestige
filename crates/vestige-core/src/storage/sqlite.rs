@@ -4822,7 +4822,7 @@ impl Storage {
         {
             let tagged_nodes = self.get_nodes_matching_any_tag_prefix(filter, TAGGED_SCAN_LIMIT)?;
             let mut by_id = HashMap::new();
-            for node in nodes.into_iter().chain(tagged_nodes.into_iter()) {
+            for node in nodes.into_iter().chain(tagged_nodes) {
                 by_id.entry(node.id.clone()).or_insert(node);
             }
             nodes = by_id.into_values().collect();

@@ -256,7 +256,7 @@ fn bounty_mode(storage: &Storage, limit: i32, tags: Option<&[String]>) -> Result
             {
                 push_limited(&mut duplicate_risk_lanes, item.clone(), limit);
             }
-            if outcome_types.iter().any(|kind| *kind == "needs_poc") {
+            if outcome_types.contains(&"needs_poc") {
                 push_limited(&mut needs_poc_lanes, item.clone(), limit);
             }
             if already_composed.len() < limit as usize {
