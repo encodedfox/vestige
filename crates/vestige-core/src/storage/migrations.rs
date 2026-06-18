@@ -74,6 +74,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "v2.1.25 Merge/Supersede: reversible operation log, merge plans, bitemporal lineage, protected pins",
         up: MIGRATION_V14_UP,
     },
+    Migration {
+        version: 15,
+        description: "ComposedGraph: composition events, members, outcomes",
+        up: MIGRATION_V15_UP,
+    },
 ];
 
 /// A database migration
@@ -813,6 +818,67 @@ CREATE INDEX IF NOT EXISTS idx_merge_operations_survivor ON merge_operations(sur
 UPDATE schema_version SET version = 14, applied_at = datetime('now');
 "#;
 
+/// V15: ComposedGraph persistence for memory composition outcomes.
+///
+/// These tables record which memories were used together, which tool/query
+/// produced the composition, and what happened afterward. `memory_id` values
+/// are intentionally historical references instead of foreign keys to
+/// `knowledge_nodes`: purging or superseding a memory must not erase the fact
+/// that a bounty lane or reasoning path was previously composed.
+const MIGRATION_V15_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS composition_events (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'deep_reference',
+    query TEXT,
+    query_hash TEXT,
+    confidence REAL,
+    status TEXT,
+    output_preview TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_events_created_at ON composition_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_composition_events_tool ON composition_events(tool);
+CREATE INDEX IF NOT EXISTS idx_composition_events_mode ON composition_events(mode);
+CREATE INDEX IF NOT EXISTS idx_composition_events_query_hash ON composition_events(query_hash);
+
+CREATE TABLE IF NOT EXISTS composition_members (
+    event_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    role TEXT NOT NULL, -- primary | supporting | contradicting | superseded | related
+    rank INTEGER NOT NULL DEFAULT 0,
+    trust REAL,
+    score REAL,
+    preview TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (event_id, memory_id, role),
+    FOREIGN KEY (event_id) REFERENCES composition_events(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_members_memory ON composition_members(memory_id);
+CREATE INDEX IF NOT EXISTS idx_composition_members_role ON composition_members(role);
+
+CREATE TABLE IF NOT EXISTS composition_outcomes (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    outcome_type TEXT NOT NULL,
+    labeled_at TEXT NOT NULL,
+    label_source TEXT NOT NULL DEFAULT 'tool',
+    confidence_delta REAL,
+    notes TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (event_id) REFERENCES composition_events(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_event ON composition_outcomes(event_id);
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_type ON composition_outcomes(outcome_type);
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_labeled_at ON composition_outcomes(labeled_at);
+
+UPDATE schema_version SET version = 15, applied_at = datetime('now');
+"#;
+
 /// Get current schema version from database
 pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     conn.query_row(
@@ -829,7 +895,9 @@ pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32>
 fn add_column_if_missing(conn: &rusqlite::Connection, sql: &str) -> rusqlite::Result<()> {
     match conn.execute(sql, []) {
         Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => {
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+            if msg.contains("duplicate column name") =>
+        {
             Ok(())
         }
         Err(e) => Err(e),
@@ -890,17 +958,17 @@ mod tests {
     /// version after `apply_migrations` runs all migrations end-to-end, and
     /// neither of the dead tables V11 drops must exist afterwards.
     #[test]
-    fn test_apply_migrations_advances_to_v14_and_drops_dead_tables() {
+    fn test_apply_migrations_advances_to_v15_and_drops_dead_tables() {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
 
         // Pre-requisite: schema_version must be bootstrapped by V1.
         apply_migrations(&conn).expect("apply_migrations succeeds");
 
-        // 1. schema_version advanced to V14
+        // 1. schema_version advanced to V15
         let version = get_current_version(&conn).expect("read schema_version");
         assert_eq!(
-            version, 14,
-            "schema_version must be 14 after all migrations"
+            version, 15,
+            "schema_version must be 15 after all migrations"
         );
 
         // 2. knowledge_edges is gone (V11 drops it)
@@ -967,7 +1035,23 @@ mod tests {
             assert_eq!(rows, 1, "{table} table must be created by V14");
         }
 
-        // 7. knowledge_nodes gains `protected` + `superseded_by` (V14)
+        // 7. ComposedGraph tables exist (V15)
+        for table in [
+            "composition_events",
+            "composition_members",
+            "composition_outcomes",
+        ] {
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(rows, 1, "{table} table must be created by V15");
+        }
+
+        // 8. knowledge_nodes gains `protected` + `superseded_by` (V14)
         let node_cols: Vec<String> = {
             let mut stmt = conn
                 .prepare("PRAGMA table_info(knowledge_nodes)")
@@ -1006,6 +1090,6 @@ mod tests {
         apply_migrations(&conn).expect("V11 replay must be idempotent");
 
         let version = get_current_version(&conn).expect("read schema_version");
-        assert_eq!(version, 14, "schema_version back at 14 after replay");
+        assert_eq!(version, 15, "schema_version back at 15 after replay");
     }
 }

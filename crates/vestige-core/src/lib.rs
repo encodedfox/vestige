@@ -155,13 +155,15 @@ pub use fsrs::{
 };
 
 // Configuration (vestige.toml output profiles / defaults)
-pub use config::{OutputConfig, OutputDefaults, OutputProfile, VestigeConfig, CONFIG_FILE};
+pub use config::{CONFIG_FILE, OutputConfig, OutputDefaults, OutputProfile, VestigeConfig};
 
 // Storage layer
 pub use storage::{
-    ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord, InsightRecord,
-    IntentionRecord, PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode,
-    PortableImportReport, Result, SmartIngestResult, StateTransitionRecord, Storage, StorageError,
+    CompositionEventRecord, CompositionMemberRecord, CompositionNeighborRecord,
+    CompositionOutcomeRecord, ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord,
+    InsightRecord, IntentionRecord, NeverComposedCandidate, PORTABLE_ARCHIVE_FORMAT,
+    PortableArchive, PortableImportMode, PortableImportReport, Result, SmartIngestResult,
+    StateTransitionRecord, Storage, StorageError,
 };
 
 // Consolidation (sleep-inspired memory processing)
@@ -220,6 +222,9 @@ pub use advanced::{
     LabileState,
     Language,
     MaintenanceType,
+    // Merge / Supersede controls (Phase 3)
+    MatchClass,
+    MatchSignals,
     // Memory chains
     MemoryChainBuilder,
     // Memory compression
@@ -230,18 +235,15 @@ pub use advanced::{
     MemoryPath,
     MemoryReplay,
     MemorySnapshot,
-    // Merge / Supersede controls (Phase 3)
-    MatchClass,
-    MatchSignals,
     MergeCandidate,
     MergeOperation,
     MergePlan,
     MergePolicy,
     MergeStrategy,
     Modification,
-    PlanKind,
     Pattern,
     PatternType,
+    PlanKind,
     PredictedMemory,
     PredictionContext,
     PredictionErrorConfig,
