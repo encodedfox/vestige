@@ -6,7 +6,7 @@ use uuid::Uuid;
 use vestige_core::storage::{MemoryRecord, MemoryStore, SqliteMemoryStore};
 
 #[tokio::test]
-async fn fresh_db_has_v12_schema() {
+async fn fresh_db_has_v16_schema() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("fresh.db");
     let _store = SqliteMemoryStore::new(Some(db.clone())).expect("create");
@@ -50,13 +50,13 @@ async fn v11_db_upgrades_cleanly() {
                  next_review, scheduled_days, has_embedding) \
                  VALUES (?1, ?2, 'fact', datetime('now'), datetime('now'), datetime('now'), \
                  1.0, 0.3, 0, 0, 'new', 1.0, 1.0, 1.0, datetime('now'), 1, 0)",
-                rusqlite::params![format!("pre-v12-{i}"), format!("content {i}"),],
+                rusqlite::params![format!("pre-v16-{i}"), format!("content {i}"),],
             )
-            .expect("insert pre-v12 row");
+            .expect("insert pre-v16 row");
         }
     }
     // Upgrade by opening through SqliteMemoryStore (triggers full migration)
-    let _store = SqliteMemoryStore::new(Some(db.clone())).expect("open with v12");
+    let _store = SqliteMemoryStore::new(Some(db.clone())).expect("open with v16");
     // Check all 5 rows have empty domains/domain_scores
     let conn = rusqlite::Connection::open(&db).expect("open raw");
     let count: i64 = conn
@@ -68,7 +68,7 @@ async fn v11_db_upgrades_cleanly() {
         .expect("count");
     assert_eq!(
         count, 5,
-        "all pre-v12 rows must have empty domains/domain_scores"
+        "all pre-v16 rows must have empty domains/domain_scores"
     );
 }
 
@@ -157,5 +157,5 @@ async fn domains_table_exists() {
             |row| row.get(0),
         )
         .expect("query");
-    assert_eq!(count, 1, "domains table must exist after V12 migration");
+    assert_eq!(count, 1, "domains table must exist after V16 migration");
 }

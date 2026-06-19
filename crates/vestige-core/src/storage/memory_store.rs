@@ -267,8 +267,7 @@ pub trait LocalMemoryStore: Sync + 'static {
 /// of the borrows captured by the call (typically `&self` plus any reference
 /// arguments). Used as the return type of every method on the dyn-compatible
 /// `MemoryStore` trait below.
-pub type BoxedStoreFuture<'a, T> =
-    Pin<Box<dyn Future<Output = MemoryStoreResult<T>> + Send + 'a>>;
+pub type BoxedStoreFuture<'a, T> = Pin<Box<dyn Future<Output = MemoryStoreResult<T>> + Send + 'a>>;
 
 /// Dyn-compatible storage trait.
 ///
@@ -387,7 +386,9 @@ where
         embedding: &'a [f32],
         limit: usize,
     ) -> BoxedStoreFuture<'a, Vec<SearchResult>> {
-        Box::pin(<T as MemoryStoreSend>::vector_search(self, embedding, limit))
+        Box::pin(<T as MemoryStoreSend>::vector_search(
+            self, embedding, limit,
+        ))
     }
 
     fn get_scheduling<'a>(
@@ -404,7 +405,9 @@ where
         before: DateTime<Utc>,
         limit: usize,
     ) -> BoxedStoreFuture<'a, Vec<(MemoryRecord, SchedulingState)>> {
-        Box::pin(<T as MemoryStoreSend>::get_due_memories(self, before, limit))
+        Box::pin(<T as MemoryStoreSend>::get_due_memories(
+            self, before, limit,
+        ))
     }
 
     fn add_edge<'a>(&'a self, edge: &'a MemoryEdge) -> BoxedStoreFuture<'a, ()> {

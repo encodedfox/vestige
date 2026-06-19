@@ -24,8 +24,7 @@ pub type EmbedderResult<T> = std::result::Result<T, EmbedderError>;
 /// Boxed Send future returning an `EmbedderResult<T>`, bound to the lifetime
 /// of the borrows captured by the call. Used as the return type of every
 /// async method on the dyn-compatible `Embedder` trait below.
-pub type BoxedEmbedderFuture<'a, T> =
-    Pin<Box<dyn Future<Output = EmbedderResult<T>> + Send + 'a>>;
+pub type BoxedEmbedderFuture<'a, T> = Pin<Box<dyn Future<Output = EmbedderResult<T>> + Send + 'a>>;
 
 /// Pluggable embedder. The storage layer NEVER calls fastembed directly;
 /// callers compute vectors via this trait and pass them into `MemoryStore`.
@@ -78,10 +77,7 @@ pub trait LocalEmbedder: Sync + 'static {
 /// implementation automatically.
 pub trait Embedder: Send + Sync + 'static {
     fn embed<'a>(&'a self, text: &'a str) -> BoxedEmbedderFuture<'a, Vec<f32>>;
-    fn embed_batch<'a>(
-        &'a self,
-        texts: &'a [&'a str],
-    ) -> BoxedEmbedderFuture<'a, Vec<Vec<f32>>>;
+    fn embed_batch<'a>(&'a self, texts: &'a [&'a str]) -> BoxedEmbedderFuture<'a, Vec<Vec<f32>>>;
     fn model_name(&self) -> &str;
     fn dimension(&self) -> usize;
     fn model_hash(&self) -> String;
@@ -95,10 +91,7 @@ where
     fn embed<'a>(&'a self, text: &'a str) -> BoxedEmbedderFuture<'a, Vec<f32>> {
         Box::pin(<T as EmbedderSend>::embed(self, text))
     }
-    fn embed_batch<'a>(
-        &'a self,
-        texts: &'a [&'a str],
-    ) -> BoxedEmbedderFuture<'a, Vec<Vec<f32>>> {
+    fn embed_batch<'a>(&'a self, texts: &'a [&'a str]) -> BoxedEmbedderFuture<'a, Vec<Vec<f32>>> {
         Box::pin(<T as EmbedderSend>::embed_batch(self, texts))
     }
     fn model_name(&self) -> &str {
