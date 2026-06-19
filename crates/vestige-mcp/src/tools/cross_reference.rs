@@ -20,9 +20,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::cognitive::CognitiveEngine;
-use vestige_core::Storage;
+use vestige_core::{CompositionEventRecord, CompositionMemberRecord, Storage};
 
 /// Input schema for deep_reference / cross_reference tool
 pub fn schema() -> Value {
@@ -509,6 +510,7 @@ pub async fn execute(
             "confidence": 0.0,
             "guidance": "No memories found. Use smart_ingest to add memories.",
             "memoriesAnalyzed": 0,
+            "compositionWriteStatus": "skipped_empty",
         }));
     }
 
@@ -820,6 +822,7 @@ pub async fn execute(
                 "id": s.id,
                 "preview": s.content.chars().take(200).collect::<String>(),
                 "trust": (s.trust * 100.0).round() / 100.0,
+                "relevanceScore": ((composite(s) * 100.0).round() / 100.0),
                 "date": s.updated_at.to_rfc3339(),
                 "role": if i == 0 { "primary" } else { "supporting" },
             })
@@ -925,7 +928,161 @@ pub async fn execute(
         response["related_insights"] = serde_json::json!(related_insights);
     }
 
+    match persist_deep_reference_composition(storage, &args.query, &intent, &response) {
+        Ok(Some(event_id)) => {
+            response["composition_event_id"] = serde_json::json!(event_id);
+            response["compositionWriteStatus"] = serde_json::json!("persisted");
+        }
+        Ok(None) => {
+            response["compositionWriteStatus"] = serde_json::json!("skipped_empty");
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Failed to persist deep_reference composition event: {}",
+                err
+            );
+            response["compositionWriteStatus"] = serde_json::json!("failed");
+        }
+    }
+
     Ok(response)
+}
+
+fn persist_deep_reference_composition(
+    storage: &Arc<Storage>,
+    query: &str,
+    intent: &QueryIntent,
+    response: &Value,
+) -> Result<Option<String>, String> {
+    let event_id = Uuid::new_v4().to_string();
+    let event = CompositionEventRecord {
+        id: event_id.clone(),
+        created_at: Utc::now(),
+        tool: "deep_reference".to_string(),
+        mode: "deep_reference".to_string(),
+        query: Some(query.to_string()),
+        query_hash: Some(query_hash(query)),
+        confidence: response.get("confidence").and_then(|v| v.as_f64()),
+        status: response
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        output_preview: response
+            .get("guidance")
+            .and_then(|v| v.as_str())
+            .map(|value| preview_text(value, 280)),
+        metadata: serde_json::json!({
+            "intent": format!("{:?}", intent),
+            "memoriesAnalyzed": response.get("memoriesAnalyzed").and_then(|v| v.as_u64()).unwrap_or(0),
+            "activationExpanded": response.get("activationExpanded").and_then(|v| v.as_u64()).unwrap_or(0),
+            "reasoningPreview": response.get("reasoning").and_then(|v| v.as_str()).map(|value| preview_text(value, 600)),
+        }),
+    };
+
+    let mut members = Vec::new();
+    if let Some(evidence) = response.get("evidence").and_then(|v| v.as_array()) {
+        for (idx, item) in evidence.iter().enumerate() {
+            let Some(memory_id) = item.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let role = item
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if idx == 0 { "primary" } else { "supporting" });
+            members.push(CompositionMemberRecord {
+                event_id: event_id.clone(),
+                memory_id: memory_id.to_string(),
+                role: role.to_string(),
+                rank: idx as i32,
+                trust: item.get("trust").and_then(|v| v.as_f64()),
+                score: item
+                    .get("relevanceScore")
+                    .or_else(|| item.get("relevance_score"))
+                    .and_then(|v| v.as_f64()),
+                preview: None,
+                metadata: serde_json::json!({
+                    "roleSource": "deep_reference_evidence",
+                    "evidenceRank": idx,
+                    "date": item.get("date").and_then(|v| v.as_str()),
+                }),
+            });
+        }
+    }
+
+    if let Some(contradictions) = response.get("contradictions").and_then(|v| v.as_array()) {
+        for (idx, contradiction) in contradictions.iter().enumerate() {
+            for side in ["stronger", "weaker"] {
+                let Some(item) = contradiction.get(side) else {
+                    continue;
+                };
+                let Some(memory_id) = item.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                members.push(CompositionMemberRecord {
+                    event_id: event_id.clone(),
+                    memory_id: memory_id.to_string(),
+                    role: "contradicting".to_string(),
+                    rank: idx as i32,
+                    trust: item.get("trust").and_then(|v| v.as_f64()),
+                    score: contradiction.get("topic_overlap").and_then(|v| v.as_f64()),
+                    preview: None,
+                    metadata: serde_json::json!({
+                        "roleSource": "deep_reference_contradiction",
+                        "side": side,
+                        "date": item.get("date").and_then(|v| v.as_str()),
+                    }),
+                });
+            }
+        }
+    }
+
+    if let Some(superseded) = response.get("superseded").and_then(|v| v.as_array()) {
+        for (idx, item) in superseded.iter().enumerate() {
+            let Some(memory_id) = item.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            members.push(CompositionMemberRecord {
+                event_id: event_id.clone(),
+                memory_id: memory_id.to_string(),
+                role: "superseded".to_string(),
+                rank: idx as i32,
+                trust: item.get("trust").and_then(|v| v.as_f64()),
+                score: None,
+                preview: None,
+                metadata: serde_json::json!({
+                    "roleSource": "deep_reference_superseded",
+                    "superseded_by": item.get("superseded_by").and_then(|v| v.as_str()),
+                    "date": item.get("date").and_then(|v| v.as_str()),
+                }),
+            });
+        }
+    }
+
+    if members.is_empty() {
+        return Ok(None);
+    }
+
+    storage
+        .save_composition(&event, &members, &[])
+        .map_err(|e| e.to_string())?;
+    Ok(Some(event_id))
+}
+
+fn query_hash(query: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in query.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn preview_text(value: &str, max: usize) -> String {
+    let collapsed = value.replace('\n', " ");
+    if collapsed.len() <= max {
+        return collapsed;
+    }
+    format!("{}...", &collapsed[..collapsed.floor_char_boundary(max)])
 }
 
 // ============================================================================
@@ -1007,6 +1164,99 @@ mod tests {
              discarding the combined_score signal from hybrid_search + reranker.",
             id_a,
             result["recommended"]["memory_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deep_reference_persists_composition_event() {
+        let (storage, _dir) = test_storage().await;
+
+        let primary_id = ingest_one(
+            &storage,
+            "ProtocolGate control-plane composition tracks global invariant local gate bypasses.",
+            &["protocolgate", "boundary-scope"],
+        )
+        .await;
+        let supporting_id = ingest_one(
+            &storage,
+            "ProtocolGate global invariant local gate research used Aave account-global health factor and route-local validation.",
+            &["protocolgate", "boundary-scope"],
+        )
+        .await;
+
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "query": "ProtocolGate global invariant local gate",
+                "depth": 10
+            })),
+        )
+        .await
+        .expect("execute should succeed");
+
+        let event_id = result["composition_event_id"]
+            .as_str()
+            .expect("deep_reference should return persisted event id");
+        assert_eq!(result["compositionWriteStatus"].as_str(), Some("persisted"));
+
+        let event = storage
+            .get_composition_event(event_id)
+            .unwrap()
+            .expect("composition event should be stored");
+        assert_eq!(event.tool, "deep_reference");
+        assert_eq!(
+            event.query.as_deref(),
+            Some("ProtocolGate global invariant local gate")
+        );
+
+        let members = storage.get_composition_members(event_id).unwrap();
+        assert!(members.iter().any(|member| member.memory_id == primary_id));
+        assert!(
+            members
+                .iter()
+                .any(|member| member.memory_id == supporting_id)
+        );
+        assert!(members.iter().any(|member| member.role == "primary"));
+        assert!(
+            members.iter().any(|member| {
+                member.memory_id == primary_id
+                    && member.score.is_some()
+                    && member.metadata["roleSource"] == "deep_reference_evidence"
+            }),
+            "persisted members should retain relevance score and role source"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deep_reference_skips_empty_composition_event() {
+        let (storage, _dir) = test_storage().await;
+
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            Some(serde_json::json!({
+                "query": "no memories exist for this query",
+                "depth": 10
+            })),
+        )
+        .await
+        .expect("execute should succeed");
+
+        assert_eq!(
+            result["compositionWriteStatus"].as_str(),
+            Some("skipped_empty")
+        );
+        assert!(
+            result.get("composition_event_id").is_none(),
+            "empty evidence should not create a composition event"
+        );
+        assert!(
+            storage
+                .get_recent_composition_events(10)
+                .unwrap()
+                .is_empty(),
+            "ledger should stay empty when no memories participated"
         );
     }
 

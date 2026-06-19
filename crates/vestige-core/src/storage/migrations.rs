@@ -74,6 +74,16 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "v2.1.25 Merge/Supersede: reversible operation log, merge plans, bitemporal lineage, protected pins",
         up: MIGRATION_V14_UP,
     },
+    Migration {
+        version: 15,
+        description: "ComposedGraph: composition events, members, outcomes",
+        up: MIGRATION_V15_UP,
+    },
+    Migration {
+        version: 16,
+        description: "ADR 0001 Phase 1: embedding_model registry, domains/domain_scores columns, domains table",
+        up: MIGRATION_V16_UP,
+    },
 ];
 
 /// A database migration
@@ -813,6 +823,67 @@ CREATE INDEX IF NOT EXISTS idx_merge_operations_survivor ON merge_operations(sur
 UPDATE schema_version SET version = 14, applied_at = datetime('now');
 "#;
 
+/// V15: ComposedGraph persistence for memory composition outcomes.
+///
+/// These tables record which memories were used together, which tool/query
+/// produced the composition, and what happened afterward. `memory_id` values
+/// are intentionally historical references instead of foreign keys to
+/// `knowledge_nodes`: purging or superseding a memory must not erase the fact
+/// that a bounty lane or reasoning path was previously composed.
+const MIGRATION_V15_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS composition_events (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'deep_reference',
+    query TEXT,
+    query_hash TEXT,
+    confidence REAL,
+    status TEXT,
+    output_preview TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_events_created_at ON composition_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_composition_events_tool ON composition_events(tool);
+CREATE INDEX IF NOT EXISTS idx_composition_events_mode ON composition_events(mode);
+CREATE INDEX IF NOT EXISTS idx_composition_events_query_hash ON composition_events(query_hash);
+
+CREATE TABLE IF NOT EXISTS composition_members (
+    event_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    role TEXT NOT NULL, -- primary | supporting | contradicting | superseded | related
+    rank INTEGER NOT NULL DEFAULT 0,
+    trust REAL,
+    score REAL,
+    preview TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (event_id, memory_id, role),
+    FOREIGN KEY (event_id) REFERENCES composition_events(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_members_memory ON composition_members(memory_id);
+CREATE INDEX IF NOT EXISTS idx_composition_members_role ON composition_members(role);
+
+CREATE TABLE IF NOT EXISTS composition_outcomes (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    outcome_type TEXT NOT NULL,
+    labeled_at TEXT NOT NULL,
+    label_source TEXT NOT NULL DEFAULT 'tool',
+    confidence_delta REAL,
+    notes TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (event_id) REFERENCES composition_events(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_event ON composition_outcomes(event_id);
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_type ON composition_outcomes(outcome_type);
+CREATE INDEX IF NOT EXISTS idx_composition_outcomes_labeled_at ON composition_outcomes(labeled_at);
+
+UPDATE schema_version SET version = 15, applied_at = datetime('now');
+"#;
+
 /// Get current schema version from database
 pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     conn.query_row(
@@ -829,12 +900,62 @@ pub fn get_current_version(conn: &rusqlite::Connection) -> rusqlite::Result<u32>
 fn add_column_if_missing(conn: &rusqlite::Connection, sql: &str) -> rusqlite::Result<()> {
     match conn.execute(sql, []) {
         Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => {
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+            if msg.contains("duplicate column name") =>
+        {
             Ok(())
         }
         Err(e) => Err(e),
     }
 }
+
+/// V16: ADR 0001 Phase 1 - embedding_model registry + domain columns.
+///
+/// The ALTER TABLE statements are split out into `MIGRATION_V16_ALTER_COLUMNS`
+/// because SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. The
+/// migration runner handles them individually so replaying V16 is idempotent.
+const MIGRATION_V16_UP: &str = r#"
+-- Migration V16: embedding model registry + per-memory domain columns.
+
+-- 1. Embedding model registry. Single logical row; the (id = 1) constraint is
+--    enforced in code via `register_model` (SQLite CHECK on a single-row
+--    table is uglier than a constraint we already enforce in Rust).
+CREATE TABLE IF NOT EXISTS embedding_model (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    name         TEXT    NOT NULL,
+    dimension    INTEGER NOT NULL,
+    hash         TEXT    NOT NULL,
+    created_at   TEXT    NOT NULL
+);
+
+-- 2. Per-memory domain columns are applied separately (see apply_migrations).
+
+-- 3. Index on the domains JSON column to enable LIKE-style filter in Phase 4.
+CREATE INDEX IF NOT EXISTS idx_nodes_domains ON knowledge_nodes(domains);
+CREATE INDEX IF NOT EXISTS idx_nodes_domain_scores ON knowledge_nodes(domain_scores);
+
+-- 4. Domains catalogue (empty until Phase 4 populates).
+CREATE TABLE IF NOT EXISTS domains (
+    id           TEXT    PRIMARY KEY,
+    label        TEXT    NOT NULL,
+    centroid     BLOB,
+    top_terms    TEXT    NOT NULL DEFAULT '[]',
+    memory_count INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_domains_created_at ON domains(created_at);
+
+UPDATE schema_version SET version = 16, applied_at = datetime('now');
+"#;
+
+/// The two ALTER TABLE statements for V16. Kept separate so the migration
+/// runner can try each individually and ignore "duplicate column" errors,
+/// making V16 idempotent on replay (SQLite has no ADD COLUMN IF NOT EXISTS).
+pub const MIGRATION_V16_ALTER_COLUMNS: &[&str] = &[
+    "ALTER TABLE knowledge_nodes ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE knowledge_nodes ADD COLUMN domain_scores TEXT NOT NULL DEFAULT '{}'",
+];
 
 /// Apply pending migrations
 pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
@@ -864,6 +985,15 @@ pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
                 )?;
             }
 
+            // V16 adds columns via ALTER TABLE, which SQLite does not support
+            // with IF NOT EXISTS. Run them individually and ignore duplicate
+            // column errors so replay stays idempotent.
+            if migration.version == 16 {
+                for stmt in MIGRATION_V16_ALTER_COLUMNS {
+                    add_column_if_missing(conn, stmt)?;
+                }
+            }
+
             // Use execute_batch to handle multi-statement SQL including triggers
             conn.execute_batch(migration.up)?;
 
@@ -890,17 +1020,17 @@ mod tests {
     /// version after `apply_migrations` runs all migrations end-to-end, and
     /// neither of the dead tables V11 drops must exist afterwards.
     #[test]
-    fn test_apply_migrations_advances_to_v14_and_drops_dead_tables() {
+    fn test_apply_migrations_advances_to_v16_and_drops_dead_tables() {
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
 
         // Pre-requisite: schema_version must be bootstrapped by V1.
         apply_migrations(&conn).expect("apply_migrations succeeds");
 
-        // 1. schema_version advanced to V14
+        // 1. schema_version advanced to V16
         let version = get_current_version(&conn).expect("read schema_version");
         assert_eq!(
-            version, 14,
-            "schema_version must be 14 after all migrations"
+            version, 16,
+            "schema_version must be 16 after all migrations"
         );
 
         // 2. knowledge_edges is gone (V11 drops it)
@@ -967,7 +1097,23 @@ mod tests {
             assert_eq!(rows, 1, "{table} table must be created by V14");
         }
 
-        // 7. knowledge_nodes gains `protected` + `superseded_by` (V14)
+        // 7. ComposedGraph tables exist (V15)
+        for table in [
+            "composition_events",
+            "composition_members",
+            "composition_outcomes",
+        ] {
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master");
+            assert_eq!(rows, 1, "{table} table must be created by V15");
+        }
+
+        // 8. knowledge_nodes gains `protected` + `superseded_by` (V14)
         let node_cols: Vec<String> = {
             let mut stmt = conn
                 .prepare("PRAGMA table_info(knowledge_nodes)")
@@ -1002,10 +1148,132 @@ mod tests {
         conn.execute("UPDATE schema_version SET version = 10", [])
             .expect("rewind schema_version");
 
-        // Replay must not error.
-        apply_migrations(&conn).expect("V11 replay must be idempotent");
+        // Replay V11 onward. V11 uses DROP TABLE IF EXISTS so it is idempotent.
+        // V12/V13 tombstone tables use CREATE TABLE IF NOT EXISTS. V14/V16 ALTER
+        // TABLE idempotency is handled by the migration runner.
+        apply_migrations(&conn).expect("V11..V16 replay must be idempotent");
 
+        // After replaying from V10, the schema advances to the latest version.
         let version = get_current_version(&conn).expect("read schema_version");
-        assert_eq!(version, 14, "schema_version back at 14 after replay");
+        assert_eq!(version, 16, "schema_version back at 16 after replay");
+    }
+
+    #[test]
+    fn v16_adds_embedding_model_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedding_model'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(count, 1, "embedding_model table must exist after V16");
+    }
+
+    #[test]
+    fn v16_adds_domains_columns() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        let info: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(knowledge_nodes)")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query_map")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+        assert!(
+            info.contains(&"domains".to_string()),
+            "domains column missing"
+        );
+        assert!(
+            info.contains(&"domain_scores".to_string()),
+            "domain_scores column missing"
+        );
+    }
+
+    #[test]
+    fn v16_default_values_empty_json() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+        // Insert a minimal row to test defaults
+        conn.execute(
+            "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+             stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+             retention_strength, next_review, scheduled_days, has_embedding) \
+             VALUES ('test-id','content','fact',datetime('now'),datetime('now'),datetime('now'),\
+             1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+            [],
+        ).expect("insert row");
+        let (domains, domain_scores): (String, String) = conn
+            .query_row(
+                "SELECT domains, domain_scores FROM knowledge_nodes WHERE id='test-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query row");
+        assert_eq!(domains, "[]");
+        assert_eq!(domain_scores, "{}");
+    }
+
+    #[test]
+    fn v16_is_replayable() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("first apply");
+        // Rewind to V15 so V16 runs again.
+        conn.execute("UPDATE schema_version SET version = 15", [])
+            .expect("rewind");
+        // V16 uses CREATE TABLE IF NOT EXISTS and idempotent ALTER handling.
+        apply_migrations(&conn).expect("V16 replay must be idempotent");
+        let version = get_current_version(&conn).expect("read version");
+        assert_eq!(version, 16, "schema_version must be 16 after replay");
+    }
+
+    #[test]
+    fn v16_preserves_existing_rows_from_v15() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        // Apply up to V15 only, including the V14 ALTER TABLE columns that
+        // `apply_migrations` normally runs before the V14 SQL batch.
+        for migration in MIGRATIONS {
+            if migration.version <= 15 {
+                if migration.version == 14 {
+                    add_column_if_missing(
+                        &conn,
+                        "ALTER TABLE knowledge_nodes ADD COLUMN protected INTEGER NOT NULL DEFAULT 0",
+                    )
+                    .expect("apply V14 protected column");
+                    add_column_if_missing(
+                        &conn,
+                        "ALTER TABLE knowledge_nodes ADD COLUMN superseded_by TEXT",
+                    )
+                    .expect("apply V14 superseded_by column");
+                }
+                conn.execute_batch(migration.up).expect("apply migration");
+            }
+        }
+        // Insert a row under the V15 schema, before PR #61's V16 columns exist.
+        conn.execute(
+            "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+             stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+             retention_strength, next_review, scheduled_days, has_embedding) \
+             VALUES ('existing-id','old content','fact',datetime('now'),datetime('now'),datetime('now'),\
+             1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+            [],
+        ).expect("insert pre-v16 row");
+        apply_migrations(&conn).expect("apply V16 migration");
+
+        // Check the old row has defaults
+        let (domains, domain_scores): (String, String) = conn
+            .query_row(
+                "SELECT domains, domain_scores FROM knowledge_nodes WHERE id='existing-id'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query pre-v16 row");
+        assert_eq!(domains, "[]");
+        assert_eq!(domain_scores, "{}");
     }
 }

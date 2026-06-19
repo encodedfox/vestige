@@ -83,6 +83,7 @@
 /// Optional `vestige.toml` configuration (Phase 2: Configurable Output).
 pub mod config;
 pub mod consolidation;
+pub mod embedder;
 pub mod fsrs;
 pub mod fts;
 pub mod memory;
@@ -155,13 +156,50 @@ pub use fsrs::{
 };
 
 // Configuration (vestige.toml output profiles / defaults)
-pub use config::{OutputConfig, OutputDefaults, OutputProfile, VestigeConfig, CONFIG_FILE};
+pub use config::{CONFIG_FILE, OutputConfig, OutputDefaults, OutputProfile, VestigeConfig};
 
 // Storage layer
 pub use storage::{
-    ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord, InsightRecord,
-    IntentionRecord, PORTABLE_ARCHIVE_FORMAT, PortableArchive, PortableImportMode,
-    PortableImportReport, Result, SmartIngestResult, StateTransitionRecord, Storage, StorageError,
+    ClassificationResult,
+    CompositionEventRecord,
+    CompositionMemberRecord,
+    CompositionNeighborRecord,
+    CompositionOutcomeRecord,
+    ConnectionRecord,
+    ConsolidationHistoryRecord,
+    Domain,
+    DreamHistoryRecord,
+    HealthStatus,
+    InsightRecord,
+    IntentionRecord,
+    LocalMemoryStore,
+    MemoryEdge,
+    MemoryRecord,
+    MemoryStore,
+    MemoryStoreError,
+    MemoryStoreResult,
+    ModelSignature,
+    NeverComposedCandidate,
+    PORTABLE_ARCHIVE_FORMAT,
+    PortableArchive,
+    PortableImportMode,
+    PortableImportReport,
+    Result,
+    SchedulingState,
+    SearchQuery,
+    SmartIngestResult,
+    SqliteMemoryStore,
+    StateTransitionRecord,
+    Storage,
+    StorageError,
+    StoreStats,
+    // Note: storage::SearchResult is intentionally not re-exported here to avoid
+    // collision with memory::SearchResult. Use vestige_core::storage::SearchResult directly.
+};
+
+// Embedder trait and implementations
+pub use embedder::{
+    Embedder, EmbedderError, EmbedderResult, EmbedderSend, FastembedEmbedder, LocalEmbedder,
 };
 
 // Consolidation (sleep-inspired memory processing)
@@ -220,6 +258,9 @@ pub use advanced::{
     LabileState,
     Language,
     MaintenanceType,
+    // Merge / Supersede controls (Phase 3)
+    MatchClass,
+    MatchSignals,
     // Memory chains
     MemoryChainBuilder,
     // Memory compression
@@ -230,18 +271,15 @@ pub use advanced::{
     MemoryPath,
     MemoryReplay,
     MemorySnapshot,
-    // Merge / Supersede controls (Phase 3)
-    MatchClass,
-    MatchSignals,
     MergeCandidate,
     MergeOperation,
     MergePlan,
     MergePolicy,
     MergeStrategy,
     Modification,
-    PlanKind,
     Pattern,
     PatternType,
+    PlanKind,
     PredictedMemory,
     PredictionContext,
     PredictionErrorConfig,

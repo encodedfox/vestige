@@ -248,7 +248,7 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 
 ---
 
-## 🛠 25 MCP Tools
+## 🛠 MCP Tools
 
 ### Context Packets
 | Tool | What It Does |
@@ -276,6 +276,7 @@ This isn't a key-value store with an embedding model bolted on. Vestige implemen
 |------|-------------|
 | `memory_health` | Retention dashboard — distribution, trends, recommendations |
 | `memory_graph` | Knowledge graph export — force-directed layout, up to 200 nodes |
+| `composed_graph` | Composition ledger — recent composed memory sets, neighbors, outcome labels, bounty/research lanes, and never-composed frontier candidates |
 
 ### Scoring & Dedup
 | Tool | What It Does |

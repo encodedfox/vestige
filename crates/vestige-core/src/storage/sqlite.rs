@@ -260,6 +260,9 @@ const PORTABLE_TABLES: &[&str] = &[
     "retention_snapshots",
     "sync_tombstones",
     "deletion_tombstones",
+    "composition_events",
+    "composition_members",
+    "composition_outcomes",
 ];
 
 const PORTABLE_USER_DATA_TABLES: &[&str] = &[
@@ -278,6 +281,9 @@ const PORTABLE_USER_DATA_TABLES: &[&str] = &[
     "retention_snapshots",
     "sync_tombstones",
     "deletion_tombstones",
+    "composition_events",
+    "composition_members",
+    "composition_outcomes",
 ];
 
 #[derive(Default)]
@@ -293,7 +299,7 @@ const DATABASE_FILE: &str = "vestige.db";
 /// Uses separate reader/writer connections for interior mutability.
 /// All methods take `&self` (not `&mut self`), making Storage `Send + Sync`
 /// so the MCP layer can use `Arc<Storage>` instead of `Arc<Mutex<Storage>>`.
-pub struct Storage {
+pub struct SqliteMemoryStore {
     db_path: PathBuf,
     writer: Mutex<Connection>,
     reader: Mutex<Connection>,
@@ -305,9 +311,11 @@ pub struct Storage {
     /// LRU cache for query embeddings to avoid re-embedding repeated queries
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     query_cache: Mutex<LruCache<String, Vec<f32>>>,
+    /// Cached model signature. `None` until the first embedding is written.
+    registered_model: std::sync::RwLock<Option<crate::storage::memory_store::ModelSignature>>,
 }
 
-impl Storage {
+impl SqliteMemoryStore {
     fn data_dir_from_env() -> Option<PathBuf> {
         std::env::var_os(DATA_DIR_ENV).and_then(|value| {
             if value.is_empty() {
@@ -452,6 +460,7 @@ impl Storage {
             vector_index: Mutex::new(vector_index),
             #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             query_cache,
+            registered_model: std::sync::RwLock::new(None),
         };
 
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
@@ -589,13 +598,15 @@ impl Storage {
                     stability, difficulty, reps, lapses, learning_state,
                     storage_strength, retrieval_strength, retention_strength,
                     sentiment_score, sentiment_magnitude, next_review, scheduled_days,
-                    source, tags, valid_from, valid_until, has_embedding, embedding_model
+                    source, tags, valid_from, valid_until, has_embedding, embedding_model,
+                    domains, domain_scores
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14,
                     ?15, ?16, ?17, ?18,
-                    ?19, ?20, ?21, ?22, ?23, ?24
+                    ?19, ?20, ?21, ?22, ?23, ?24,
+                    '[]', '{}'
                 )",
                 params![
                     id,
@@ -1950,10 +1961,7 @@ impl Storage {
             // future migrations that switch.
             chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
                 .map(|naive| naive.and_utc())
-                .or_else(|_| {
-                    DateTime::parse_from_rfc3339(&s)
-                        .map(|dt| dt.with_timezone(&Utc))
-                })
+                .or_else(|_| DateTime::parse_from_rfc3339(&s).map(|dt| dt.with_timezone(&Utc)))
                 .ok()
         });
 
@@ -2105,6 +2113,11 @@ impl Storage {
             "UPDATE knowledge_nodes SET summary_parent_id = NULL WHERE summary_parent_id = ?1",
             params![id],
         )? as i64;
+
+        tx.execute(
+            "UPDATE composition_members SET preview = NULL WHERE memory_id = ?1",
+            params![id],
+        )?;
 
         let tags_json = serde_json::to_string(&node.tags).unwrap_or_else(|_| "[]".to_string());
         tx.execute(
@@ -4035,7 +4048,966 @@ pub struct DreamHistoryRecord {
     pub creative_connections_found: Option<i32>,
 }
 
-impl Storage {
+/// Composition event envelope for ComposedGraph.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionEventRecord {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub tool: String,
+    pub mode: String,
+    pub query: Option<String>,
+    pub query_hash: Option<String>,
+    pub confidence: Option<f64>,
+    pub status: Option<String>,
+    pub output_preview: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Memory participating in a composition event.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionMemberRecord {
+    pub event_id: String,
+    pub memory_id: String,
+    pub role: String,
+    pub rank: i32,
+    pub trust: Option<f64>,
+    pub score: Option<f64>,
+    pub preview: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Outcome label attached to a composition event.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionOutcomeRecord {
+    pub id: String,
+    pub event_id: String,
+    pub outcome_type: String,
+    pub labeled_at: DateTime<Utc>,
+    pub label_source: String,
+    pub confidence_delta: Option<f64>,
+    pub notes: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Memory most often composed with another memory.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositionNeighborRecord {
+    pub memory_id: String,
+    pub composed_count: i64,
+    pub latest_event_at: DateTime<Utc>,
+}
+
+/// Candidate memory pair that shares useful shape but has never been composed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeverComposedCandidate {
+    pub first_id: String,
+    pub second_id: String,
+    pub score: f64,
+    pub novelty_score: f64,
+    pub bridge_score: f64,
+    pub trust_score: f64,
+    pub outcome_score_adjustment: f64,
+    pub shared_tags: Vec<String>,
+    pub boundary_tags: Vec<String>,
+    pub shared_terms: Vec<String>,
+    pub prior_outcomes: Vec<String>,
+    pub outcome_signal: String,
+    pub first_node_type: String,
+    pub second_node_type: String,
+    pub first_preview: String,
+    pub second_preview: String,
+    pub reason: String,
+    pub composition_question: String,
+}
+
+impl SqliteMemoryStore {
+    // ========================================================================
+    // COMPOSEDGRAPH PERSISTENCE
+    // ========================================================================
+
+    /// Save a complete composition event with members and optional outcomes in one transaction.
+    pub fn save_composition(
+        &self,
+        event: &CompositionEventRecord,
+        members: &[CompositionMemberRecord],
+        outcomes: &[CompositionOutcomeRecord],
+    ) -> Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        let tx = writer.transaction()?;
+
+        let metadata_json =
+            serde_json::to_string(&event.metadata).unwrap_or_else(|_| "{}".to_string());
+        tx.execute(
+            "INSERT OR REPLACE INTO composition_events (
+                id, created_at, tool, mode, query, query_hash, confidence, status,
+                output_preview, metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.id,
+                event.created_at.to_rfc3339(),
+                event.tool,
+                event.mode,
+                event.query,
+                event.query_hash,
+                event.confidence,
+                event.status,
+                event.output_preview,
+                metadata_json,
+            ],
+        )?;
+
+        for member in members {
+            let mut member = member.clone();
+            Self::snapshot_composition_member_tags(&tx, &mut member)?;
+            Self::insert_composition_member(&tx, &member)?;
+        }
+        for outcome in outcomes {
+            Self::insert_composition_outcome(&tx, outcome)?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Add one outcome label to an existing composition event.
+    pub fn record_composition_outcome(&self, outcome: &CompositionOutcomeRecord) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        Self::insert_composition_outcome(&writer, outcome)
+    }
+
+    /// Get one composition event by id.
+    pub fn get_composition_event(&self, id: &str) -> Result<Option<CompositionEventRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare("SELECT * FROM composition_events WHERE id = ?1")?;
+        stmt.query_row(params![id], Self::row_to_composition_event)
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    /// Get recent composition events.
+    pub fn get_recent_composition_events(&self, limit: i32) -> Result<Vec<CompositionEventRecord>> {
+        self.get_recent_composition_events_page(limit, 0)
+    }
+
+    /// Get recent composition events with explicit pagination.
+    pub fn get_recent_composition_events_page(
+        &self,
+        limit: i32,
+        offset: i32,
+    ) -> Result<Vec<CompositionEventRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT * FROM composition_events
+             ORDER BY created_at DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![limit.max(1), offset.max(0)],
+            Self::row_to_composition_event,
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get all members for a composition event.
+    pub fn get_composition_members(&self, event_id: &str) -> Result<Vec<CompositionMemberRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT * FROM composition_members
+             WHERE event_id = ?1
+             ORDER BY rank ASC, role ASC, memory_id ASC",
+        )?;
+        let rows = stmt.query_map(params![event_id], Self::row_to_composition_member)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get all outcomes for a composition event.
+    pub fn get_composition_outcomes(
+        &self,
+        event_id: &str,
+    ) -> Result<Vec<CompositionOutcomeRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT * FROM composition_outcomes
+             WHERE event_id = ?1
+             ORDER BY labeled_at DESC",
+        )?;
+        let rows = stmt.query_map(params![event_id], Self::row_to_composition_outcome)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Get composition events containing a memory id.
+    pub fn get_compositions_for_memory(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<CompositionEventRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT DISTINCT e.*
+             FROM composition_events e
+             JOIN composition_members m ON m.event_id = e.id
+             WHERE m.memory_id = ?1
+             ORDER BY e.created_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![memory_id, limit.max(1)],
+            Self::row_to_composition_event,
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Return memories most frequently composed with the requested memory.
+    pub fn get_composition_neighbors(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<CompositionNeighborRecord>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "WITH distinct_members AS (
+                SELECT DISTINCT event_id, memory_id FROM composition_members
+             )
+             SELECT other.memory_id, COUNT(DISTINCT other.event_id) AS composed_count, MAX(e.created_at) AS latest_event_at
+             FROM distinct_members self
+             JOIN distinct_members other
+               ON other.event_id = self.event_id AND other.memory_id != self.memory_id
+             JOIN composition_events e ON e.id = self.event_id
+             WHERE self.memory_id = ?1
+             GROUP BY other.memory_id
+             ORDER BY composed_count DESC, latest_event_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![memory_id, limit.max(1)], |row| {
+            Ok(CompositionNeighborRecord {
+                memory_id: row.get(0)?,
+                composed_count: row.get(1)?,
+                latest_event_at: Self::parse_timestamp(
+                    &row.get::<_, String>(2)?,
+                    "latest_event_at",
+                )?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Generate ranked memory pairs that share useful tags but have not yet been composed.
+    pub fn get_never_composed_candidates(
+        &self,
+        limit: i32,
+        tag_filter: Option<&[String]>,
+    ) -> Result<Vec<NeverComposedCandidate>> {
+        let nodes = self.composition_candidate_nodes(tag_filter)?;
+        let composed_pairs = self.composed_pair_set()?;
+        let composition_degrees = self.composition_degree_map()?;
+        let outcome_map = self.composition_outcome_map()?;
+        let mut candidates = Vec::new();
+
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let a = &nodes[i];
+                let b = &nodes[j];
+                let pair = Self::pair_key(&a.id, &b.id);
+                if composed_pairs.contains(&pair) {
+                    continue;
+                }
+
+                if let Some(filter) = tag_filter
+                    && !filter.is_empty()
+                    && !Self::node_pair_matches_tag_filter(a, b, filter)
+                {
+                    continue;
+                }
+
+                let shared_tags = Self::shared_tags(&a.tags, &b.tags);
+                let shared_terms = Self::shared_content_terms(&a.content, &b.content, 8);
+                if shared_tags.is_empty() && shared_terms.is_empty() {
+                    continue;
+                }
+
+                let boundary_tags = Self::boundary_tags_for_pair(&a.tags, &b.tags);
+                let trust_score =
+                    ((a.retention_strength + b.retention_strength) / 2.0).clamp(0.0, 1.0);
+                let degree_a = composition_degrees.get(&a.id).copied().unwrap_or(0) as f64;
+                let degree_b = composition_degrees.get(&b.id).copied().unwrap_or(0) as f64;
+                let novelty_score = ((1.0 / (1.0 + degree_a)) + (1.0 / (1.0 + degree_b))) / 2.0;
+                let bridge_score = Self::composition_bridge_score(
+                    a,
+                    b,
+                    &shared_tags,
+                    &shared_terms,
+                    &boundary_tags,
+                );
+                let anchor_score =
+                    (shared_tags.len() as f64 * 0.45) + (shared_terms.len().min(5) as f64 * 0.25);
+                let prior_outcomes = Self::pair_prior_outcomes(&outcome_map, &a.id, &b.id);
+                let outcome_signal = Self::outcome_signal(&prior_outcomes);
+                let outcome_score_adjustment = Self::outcome_score_adjustment(&prior_outcomes);
+                let score = anchor_score
+                    + (bridge_score * 2.0)
+                    + (novelty_score * 1.5)
+                    + trust_score
+                    + outcome_score_adjustment;
+                if score < 1.6 {
+                    continue;
+                }
+
+                let reason = if !boundary_tags.is_empty() {
+                    format!(
+                        "Untried bridge across {} with {}",
+                        boundary_tags.join(", "),
+                        Self::anchor_summary(&shared_tags, &shared_terms)
+                    )
+                } else if a.node_type != b.node_type {
+                    format!(
+                        "Untried {} -> {} composition with {}",
+                        a.node_type,
+                        b.node_type,
+                        Self::anchor_summary(&shared_tags, &shared_terms)
+                    )
+                } else {
+                    format!(
+                        "Never composed despite {}",
+                        Self::anchor_summary(&shared_tags, &shared_terms)
+                    )
+                };
+                let composition_question =
+                    Self::composition_question(a, b, &shared_tags, &shared_terms, &boundary_tags);
+                candidates.push(NeverComposedCandidate {
+                    first_id: a.id.clone(),
+                    second_id: b.id.clone(),
+                    score,
+                    novelty_score,
+                    bridge_score,
+                    trust_score,
+                    outcome_score_adjustment,
+                    shared_tags,
+                    boundary_tags,
+                    shared_terms,
+                    prior_outcomes,
+                    outcome_signal,
+                    first_node_type: a.node_type.clone(),
+                    second_node_type: b.node_type.clone(),
+                    first_preview: preview(&a.content, 160),
+                    second_preview: preview(&b.content, 160),
+                    reason,
+                    composition_question,
+                });
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(limit.max(1) as usize);
+        Ok(candidates)
+    }
+
+    fn insert_composition_member(
+        conn: &Connection,
+        member: &CompositionMemberRecord,
+    ) -> Result<()> {
+        let metadata_json =
+            serde_json::to_string(&member.metadata).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT OR REPLACE INTO composition_members (
+                event_id, memory_id, role, rank, trust, score, preview, metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                member.event_id,
+                member.memory_id,
+                member.role,
+                member.rank,
+                member.trust,
+                member.score,
+                member.preview,
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn snapshot_composition_member_tags(
+        conn: &Connection,
+        member: &mut CompositionMemberRecord,
+    ) -> Result<()> {
+        if member.metadata.get("tags").is_some() {
+            return Ok(());
+        }
+
+        let tags_json: Option<String> = conn
+            .query_row(
+                "SELECT tags FROM knowledge_nodes WHERE id = ?1",
+                params![member.memory_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(tags_json) = tags_json else {
+            return Ok(());
+        };
+        let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) else {
+            return Ok(());
+        };
+        if tags.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(object) = member.metadata.as_object_mut() {
+            object.insert("tags".to_string(), serde_json::json!(tags));
+        } else {
+            member.metadata = serde_json::json!({ "tags": tags });
+        }
+        Ok(())
+    }
+
+    fn insert_composition_outcome(
+        conn: &Connection,
+        outcome: &CompositionOutcomeRecord,
+    ) -> Result<()> {
+        let metadata_json =
+            serde_json::to_string(&outcome.metadata).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT OR REPLACE INTO composition_outcomes (
+                id, event_id, outcome_type, labeled_at, label_source,
+                confidence_delta, notes, metadata
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                outcome.id,
+                outcome.event_id,
+                outcome.outcome_type,
+                outcome.labeled_at.to_rfc3339(),
+                outcome.label_source,
+                outcome.confidence_delta,
+                outcome.notes,
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_composition_event(row: &rusqlite::Row) -> rusqlite::Result<CompositionEventRecord> {
+        let metadata_json: String = row.get("metadata")?;
+        Ok(CompositionEventRecord {
+            id: row.get("id")?,
+            created_at: Self::parse_timestamp(&row.get::<_, String>("created_at")?, "created_at")?,
+            tool: row.get("tool")?,
+            mode: row.get("mode")?,
+            query: row.get("query").ok().flatten(),
+            query_hash: row.get("query_hash").ok().flatten(),
+            confidence: row.get("confidence").ok().flatten(),
+            status: row.get("status").ok().flatten(),
+            output_preview: row.get("output_preview").ok().flatten(),
+            metadata: serde_json::from_str(&metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    fn row_to_composition_member(row: &rusqlite::Row) -> rusqlite::Result<CompositionMemberRecord> {
+        let metadata_json: String = row.get("metadata")?;
+        Ok(CompositionMemberRecord {
+            event_id: row.get("event_id")?,
+            memory_id: row.get("memory_id")?,
+            role: row.get("role")?,
+            rank: row.get("rank").unwrap_or(0),
+            trust: row.get("trust").ok().flatten(),
+            score: row.get("score").ok().flatten(),
+            preview: row.get("preview").ok().flatten(),
+            metadata: serde_json::from_str(&metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    fn row_to_composition_outcome(
+        row: &rusqlite::Row,
+    ) -> rusqlite::Result<CompositionOutcomeRecord> {
+        let metadata_json: String = row.get("metadata")?;
+        Ok(CompositionOutcomeRecord {
+            id: row.get("id")?,
+            event_id: row.get("event_id")?,
+            outcome_type: row.get("outcome_type")?,
+            labeled_at: Self::parse_timestamp(&row.get::<_, String>("labeled_at")?, "labeled_at")?,
+            label_source: row
+                .get("label_source")
+                .unwrap_or_else(|_| "tool".to_string()),
+            confidence_delta: row.get("confidence_delta").ok().flatten(),
+            notes: row.get("notes").ok().flatten(),
+            metadata: serde_json::from_str(&metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    fn composition_event_exists(conn: &Connection, id: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM composition_events WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn composed_pair_set(&self) -> Result<HashSet<(String, String)>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT event_id, memory_id
+             FROM composition_members
+             ORDER BY event_id, memory_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (event_id, memory_id) = row?;
+            grouped.entry(event_id).or_default().push(memory_id);
+        }
+
+        let mut pairs = HashSet::new();
+        for ids in grouped.values_mut() {
+            ids.sort();
+            ids.dedup();
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    pairs.insert(Self::pair_key(&ids[i], &ids[j]));
+                }
+            }
+        }
+        Ok(pairs)
+    }
+
+    fn pair_key(a: &str, b: &str) -> (String, String) {
+        if a <= b {
+            (a.to_string(), b.to_string())
+        } else {
+            (b.to_string(), a.to_string())
+        }
+    }
+
+    fn shared_tags(a: &[String], b: &[String]) -> Vec<String> {
+        let b_set: HashSet<&str> = b.iter().map(String::as_str).collect();
+        let mut shared = a
+            .iter()
+            .filter(|tag| b_set.contains(tag.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        shared.sort();
+        shared.dedup();
+        shared
+    }
+
+    fn node_pair_matches_tag_filter(
+        a: &KnowledgeNode,
+        b: &KnowledgeNode,
+        tag_filter: &[String],
+    ) -> bool {
+        a.tags.iter().chain(b.tags.iter()).any(|tag| {
+            tag_filter
+                .iter()
+                .any(|wanted| wanted == tag || tag.starts_with(&format!("{wanted}:")))
+        })
+    }
+
+    fn boundary_tags_for_pair(a: &[String], b: &[String]) -> Vec<String> {
+        let mut tags = a
+            .iter()
+            .chain(b.iter())
+            .filter(|tag| Self::is_boundary_tag(tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+
+    fn composition_bridge_score(
+        a: &KnowledgeNode,
+        b: &KnowledgeNode,
+        shared_tags: &[String],
+        shared_terms: &[String],
+        boundary_tags: &[String],
+    ) -> f64 {
+        let tag_distance = Self::tag_distance(&a.tags, &b.tags);
+        let node_type_bridge = if a.node_type != b.node_type { 1.0 } else { 0.0 };
+        let boundary_bridge = (boundary_tags.len() as f64 / 4.0).min(1.0);
+        let lexical_anchor = if shared_terms.is_empty() { 0.0 } else { 1.0 };
+        let tag_anchor = if shared_tags.is_empty() { 0.0 } else { 1.0 };
+
+        (tag_distance * 0.30
+            + node_type_bridge * 0.20
+            + boundary_bridge * 0.25
+            + lexical_anchor * 0.15
+            + tag_anchor * 0.10)
+            .clamp(0.0, 1.0)
+    }
+
+    fn tag_distance(a: &[String], b: &[String]) -> f64 {
+        let a_set = a.iter().map(String::as_str).collect::<HashSet<_>>();
+        let b_set = b.iter().map(String::as_str).collect::<HashSet<_>>();
+        let union = a_set.union(&b_set).count();
+        if union == 0 {
+            return 0.0;
+        }
+        let intersection = a_set.intersection(&b_set).count();
+        1.0 - (intersection as f64 / union as f64)
+    }
+
+    fn shared_content_terms(a: &str, b: &str, limit: usize) -> Vec<String> {
+        let a_terms = Self::content_terms(a);
+        let b_terms = Self::content_terms(b);
+        let mut shared = a_terms
+            .intersection(&b_terms)
+            .cloned()
+            .collect::<Vec<String>>();
+        shared.sort_by(|left, right| {
+            Self::term_specificity_score(right)
+                .cmp(&Self::term_specificity_score(left))
+                .then_with(|| left.cmp(right))
+        });
+        shared.truncate(limit);
+        shared
+    }
+
+    fn content_terms(content: &str) -> HashSet<String> {
+        const STOPWORDS: &[&str] = &[
+            "about", "after", "again", "against", "because", "before", "between", "could", "every",
+            "first", "from", "have", "into", "memory", "needs", "should", "their", "there",
+            "these", "thing", "through", "using", "where", "which", "while", "would",
+        ];
+        content
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .filter(|term| term.len() >= 5 && !STOPWORDS.contains(term))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn term_specificity_score(term: &str) -> usize {
+        term.len()
+            + term.chars().filter(|ch| ch.is_ascii_digit()).count() * 2
+            + usize::from(term.contains('-')) * 2
+            + usize::from(term.contains('_')) * 2
+    }
+
+    fn anchor_summary(shared_tags: &[String], shared_terms: &[String]) -> String {
+        if !shared_tags.is_empty() && !shared_terms.is_empty() {
+            format!(
+                "shared tags ({}) and shared terms ({})",
+                shared_tags.join(", "),
+                shared_terms
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if !shared_tags.is_empty() {
+            format!("shared tags ({})", shared_tags.join(", "))
+        } else {
+            format!(
+                "shared terms ({})",
+                shared_terms
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+
+    fn composition_question(
+        a: &KnowledgeNode,
+        b: &KnowledgeNode,
+        shared_tags: &[String],
+        shared_terms: &[String],
+        boundary_tags: &[String],
+    ) -> String {
+        let anchor = if !boundary_tags.is_empty() {
+            boundary_tags.join(", ")
+        } else if !shared_tags.is_empty() {
+            shared_tags.join(", ")
+        } else {
+            shared_terms
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "What changes if a {} memory and a {} memory are composed through {}?",
+            a.node_type, b.node_type, anchor
+        )
+    }
+
+    fn composition_degree_map(&self) -> Result<HashMap<String, i64>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT memory_id, COUNT(DISTINCT event_id) AS composition_count
+             FROM composition_members
+             GROUP BY memory_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (memory_id, count) = row?;
+            result.insert(memory_id, count);
+        }
+        Ok(result)
+    }
+
+    fn composition_candidate_nodes(
+        &self,
+        tag_filter: Option<&[String]>,
+    ) -> Result<Vec<KnowledgeNode>> {
+        const BASE_SCAN_LIMIT: i32 = 750;
+        const TAGGED_SCAN_LIMIT: i32 = 1500;
+
+        let mut nodes = self.get_all_nodes(BASE_SCAN_LIMIT, 0)?;
+        if let Some(filter) = tag_filter
+            && !filter.is_empty()
+        {
+            let tagged_nodes = self.get_nodes_matching_any_tag_prefix(filter, TAGGED_SCAN_LIMIT)?;
+            let mut by_id = HashMap::new();
+            for node in nodes.into_iter().chain(tagged_nodes) {
+                by_id.entry(node.id.clone()).or_insert(node);
+            }
+            nodes = by_id.into_values().collect();
+            nodes.sort_by(|a, b| {
+                b.retention_strength
+                    .partial_cmp(&a.retention_strength)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            });
+        }
+        Ok(nodes)
+    }
+
+    fn get_nodes_matching_any_tag_prefix(
+        &self,
+        tag_filter: &[String],
+        limit: i32,
+    ) -> Result<Vec<KnowledgeNode>> {
+        let mut patterns = Vec::new();
+        for wanted in tag_filter
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+        {
+            patterns.push(format!("%\"{}\"%", wanted));
+            patterns.push(format!("%\"{}:%", wanted));
+        }
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let clauses = std::iter::repeat_n("tags LIKE ?", patterns.len())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT * FROM knowledge_nodes
+             WHERE {clauses}
+             ORDER BY retention_strength DESC, created_at DESC
+             LIMIT {}",
+            limit.clamp(1, 5000)
+        );
+
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(patterns.iter()), Self::row_to_node)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    fn composition_outcome_map(&self) -> Result<HashMap<String, HashSet<String>>> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader.prepare(
+            "SELECT DISTINCT m.memory_id, o.outcome_type
+             FROM composition_members m
+             JOIN composition_outcomes o ON o.event_id = m.event_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut result: HashMap<String, HashSet<String>> = HashMap::new();
+        for row in rows {
+            let (memory_id, outcome) = row?;
+            result.entry(memory_id).or_default().insert(outcome);
+        }
+        Ok(result)
+    }
+
+    fn pair_prior_outcomes(
+        outcome_map: &HashMap<String, HashSet<String>>,
+        first_id: &str,
+        second_id: &str,
+    ) -> Vec<String> {
+        let mut outcomes = outcome_map
+            .get(first_id)
+            .into_iter()
+            .chain(outcome_map.get(second_id))
+            .flat_map(|values| values.iter().cloned())
+            .collect::<Vec<_>>();
+        outcomes.sort();
+        outcomes.dedup();
+        outcomes
+    }
+
+    fn outcome_signal(prior_outcomes: &[String]) -> String {
+        if prior_outcomes.is_empty() {
+            return "clean".to_string();
+        }
+
+        let has_closed = prior_outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.as_str(),
+                "dead_end"
+                    | "rejected"
+                    | "bad_severity"
+                    | "user_demoted"
+                    | "closed_by_scope"
+                    | "closed_by_false_assumption"
+                    | "closed_by_user"
+                    | "expired_lane"
+            )
+        });
+        let has_duplicate = prior_outcomes
+            .iter()
+            .any(|outcome| matches!(outcome.as_str(), "duplicate_risk" | "closed_by_duplicate"));
+        let has_success = prior_outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.as_str(),
+                "accepted" | "helpful" | "submitted" | "user_promoted"
+            )
+        });
+        let has_needs_poc = prior_outcomes.iter().any(|outcome| outcome == "needs_poc");
+
+        if (has_closed || has_duplicate) && has_success {
+            "mixed_prior_outcomes".to_string()
+        } else if has_closed {
+            "prior_closed_door".to_string()
+        } else if has_duplicate {
+            "prior_duplicate_risk".to_string()
+        } else if has_success {
+            "prior_success".to_string()
+        } else if has_needs_poc {
+            "prior_needs_poc".to_string()
+        } else {
+            "prior_outcome".to_string()
+        }
+    }
+
+    fn outcome_score_adjustment(prior_outcomes: &[String]) -> f64 {
+        let mut adjustment: f64 = 0.0;
+        for outcome in prior_outcomes {
+            adjustment += match outcome.as_str() {
+                "accepted" => 0.35,
+                "helpful" => 0.25,
+                "submitted" => 0.15,
+                "user_promoted" => 0.20,
+                "needs_poc" => -0.05,
+                "duplicate_risk" => -0.35,
+                "closed_by_duplicate" => -0.40,
+                "dead_end"
+                | "rejected"
+                | "bad_severity"
+                | "closed_by_scope"
+                | "closed_by_false_assumption"
+                | "closed_by_user"
+                | "expired_lane" => -0.45,
+                "user_demoted" => -0.20,
+                _ => 0.0,
+            };
+        }
+        adjustment.clamp(-0.8, 0.5)
+    }
+
+    fn is_boundary_tag(tag: &str) -> bool {
+        let lowered = tag.to_ascii_lowercase();
+        lowered.starts_with("boundary-")
+            || matches!(
+                lowered.as_str(),
+                "time"
+                    | "chain"
+                    | "role"
+                    | "oracle"
+                    | "queue"
+                    | "settlement"
+                    | "keeper"
+                    | "upgrade"
+                    | "pause"
+                    | "accounting"
+                    | "scope"
+            )
+    }
+
     // ========================================================================
     // INTENTIONS PERSISTENCE
     // ========================================================================
@@ -5213,6 +6185,17 @@ impl Storage {
             | "consolidation_history"
             | "dream_history"
             | "retention_snapshots" => Self::merge_append_only_table(tx, table_name, table, report),
+            "composition_events" | "composition_outcomes" => {
+                Self::merge_keyed_table(tx, table_name, table, &["id"], report, state)
+            }
+            "composition_members" => Self::merge_keyed_table(
+                tx,
+                table_name,
+                table,
+                &["event_id", "memory_id", "role"],
+                report,
+                state,
+            ),
             "node_embeddings" => {
                 Self::merge_keyed_table(tx, table_name, table, &["node_id"], report, state)
             }
@@ -5363,6 +6346,10 @@ impl Storage {
                     (None, _) => false,
                 };
                 if should_delete {
+                    tx.execute(
+                        "UPDATE composition_members SET preview = NULL WHERE memory_id = ?1",
+                        params![row_id],
+                    )?;
                     let deleted =
                         tx.execute("DELETE FROM knowledge_nodes WHERE id = ?1", params![row_id])?;
                     report.rows_deleted += deleted;
@@ -5534,6 +6521,20 @@ impl Storage {
                     .unwrap_or(false);
                 Ok(source_exists && target_exists)
             }
+            "composition_members" => {
+                let event_exists = Self::portable_text(table, row, "event_id")
+                    .map(|id| Self::composition_event_exists(tx, id))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(event_exists)
+            }
+            "composition_outcomes" => {
+                let event_exists = Self::portable_text(table, row, "event_id")
+                    .map(|id| Self::composition_event_exists(tx, id))
+                    .transpose()?
+                    .unwrap_or(false);
+                Ok(event_exists)
+            }
             _ => Ok(true),
         }
     }
@@ -5557,6 +6558,8 @@ impl Storage {
     fn merge_key_columns(table_name: &str) -> &'static [&'static str] {
         match table_name {
             "knowledge_nodes" | "intentions" | "insights" | "sessions" => &["id"],
+            "composition_events" | "composition_outcomes" => &["id"],
+            "composition_members" => &["event_id", "memory_id", "role"],
             "node_embeddings" => &["node_id"],
             "fsrs_cards" | "memory_states" | "deletion_tombstones" => &["memory_id"],
             "memory_connections" => &["source_id", "target_id"],
@@ -6377,7 +7380,10 @@ impl Storage {
         let possible_threshold = read_key("merge_possible_threshold")
             .map(|v| v as f32)
             .unwrap_or_else(|| {
-                env_f32("VESTIGE_MERGE_POSSIBLE_THRESHOLD", default.possible_threshold)
+                env_f32(
+                    "VESTIGE_MERGE_POSSIBLE_THRESHOLD",
+                    default.possible_threshold,
+                )
             });
         let auto_apply = match read_key("merge_auto_apply") {
             Some(v) => v != 0.0,
@@ -6495,8 +7501,10 @@ impl Storage {
         }
 
         // Best pair score per resulting cluster member, for the explanation.
-        let mut pair_score: std::collections::HashMap<(usize, usize), crate::advanced::MatchSignals> =
-            std::collections::HashMap::new();
+        let mut pair_score: std::collections::HashMap<
+            (usize, usize),
+            crate::advanced::MatchSignals,
+        > = std::collections::HashMap::new();
 
         for i in 0..n {
             for j in (i + 1)..n {
@@ -6697,10 +7705,12 @@ impl Storage {
             .map(|n| (n.id.clone(), n.content.clone()))
             .collect();
         let result_content = compose_merged_content(&members);
-        let result_tags = compose_merged_tags(
-            &nodes.iter().map(|n| n.tags.clone()).collect::<Vec<_>>(),
-        );
-        let result_source = nodes.iter().find(|n| n.id == survivor).and_then(|n| n.source.clone());
+        let result_tags =
+            compose_merged_tags(&nodes.iter().map(|n| n.tags.clone()).collect::<Vec<_>>());
+        let result_source = nodes
+            .iter()
+            .find(|n| n.id == survivor)
+            .and_then(|n| n.source.clone());
         let invalidated_ids: Vec<String> = nodes
             .iter()
             .filter(|n| n.id != survivor)
@@ -6968,11 +7978,7 @@ impl Storage {
                 undo.insert("absorbed".into(), serde_json::json!(absorbed));
 
                 // Apply: rewrite survivor, invalidate absorbed.
-                self.rewrite_survivor(
-                    &plan.survivor_id,
-                    &plan.result_content,
-                    &plan.result_tags,
-                )?;
+                self.rewrite_survivor(&plan.survivor_id, &plan.result_content, &plan.result_tags)?;
                 for id in &plan.invalidated_ids {
                     self.invalidate_node(id, &plan.survivor_id, now)?;
                 }
@@ -7046,9 +8052,7 @@ impl Storage {
             )));
         }
         if op.op_type == "undo" {
-            return Err(StorageError::Init(
-                "cannot undo an undo operation".into(),
-            ));
+            return Err(StorageError::Init("cannot undo an undo operation".into()));
         }
 
         let undo: serde_json::Value = {
@@ -7180,9 +8184,7 @@ impl Storage {
         Ok(op)
     }
 
-    fn row_to_operation(
-        row: &rusqlite::Row,
-    ) -> rusqlite::Result<crate::advanced::MergeOperation> {
+    fn row_to_operation(row: &rusqlite::Row) -> rusqlite::Result<crate::advanced::MergeOperation> {
         let affected: String = row.get("affected_ids")?;
         let affected_ids: Vec<String> = serde_json::from_str(&affected).unwrap_or_default();
         Ok(crate::advanced::MergeOperation {
@@ -7195,7 +8197,11 @@ impl Storage {
             reverts_op_id: row.get("reverts_op_id").ok().flatten(),
             survivor_id: row.get("survivor_id").ok().flatten(),
             affected_ids,
-            confidence: row.get::<_, Option<f64>>("confidence").ok().flatten().map(|v| v as f32),
+            confidence: row
+                .get::<_, Option<f64>>("confidence")
+                .ok()
+                .flatten()
+                .map(|v| v as f32),
             reason: row.get("reason").ok().flatten(),
         })
     }
@@ -7285,6 +8291,1014 @@ fn preview(content: &str, max: usize) -> String {
 }
 
 // ============================================================================
+// LOCAL MEMORY STORE TRAIT IMPL
+// ============================================================================
+
+impl SqliteMemoryStore {
+    /// Convert a `KnowledgeNode` (plus optional embedding vector read separately)
+    /// into a `MemoryRecord` for the trait surface.
+    fn node_to_record(
+        node: KnowledgeNode,
+        embedding: Option<Vec<f32>>,
+    ) -> crate::storage::memory_store::MemoryRecord {
+        use crate::storage::memory_store::MemoryRecord;
+        let id = uuid::Uuid::parse_str(&node.id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+        MemoryRecord {
+            id,
+            domains: Vec::new(),
+            domain_scores: std::collections::HashMap::new(),
+            content: node.content,
+            node_type: node.node_type,
+            tags: node.tags,
+            embedding,
+            created_at: node.created_at,
+            updated_at: node.updated_at,
+            metadata: serde_json::json!({
+                "source": node.source,
+                "stability": node.stability,
+                "difficulty": node.difficulty,
+                "reps": node.reps,
+                "lapses": node.lapses,
+                "retention_strength": node.retention_strength,
+            }),
+        }
+    }
+
+    /// Read domains and domain_scores JSON columns for a node by id.
+    fn read_domain_columns(
+        &self,
+        id: &str,
+    ) -> (Vec<String>, std::collections::HashMap<String, f64>) {
+        let reader = match self.reader.lock() {
+            Ok(r) => r,
+            Err(_) => return (Vec::new(), std::collections::HashMap::new()),
+        };
+        let result = reader.query_row(
+            "SELECT domains, domain_scores FROM knowledge_nodes WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                let d: Option<String> = row.get(0).ok().flatten();
+                let ds: Option<String> = row.get(1).ok().flatten();
+                Ok((d, ds))
+            },
+        );
+        match result {
+            Ok((d, ds)) => {
+                let domains: Vec<String> = d
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                let domain_scores: std::collections::HashMap<String, f64> = ds
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                (domains, domain_scores)
+            }
+            Err(_) => (Vec::new(), std::collections::HashMap::new()),
+        }
+    }
+
+    /// Enforce the registered embedding model. Returns `Ok(())` if:
+    /// - no vector is being written (`incoming.is_none()`) and nothing is registered
+    /// - the incoming signature matches the registered signature
+    ///
+    /// Auto-registers on the first embedded write.
+    fn enforce_model(
+        &self,
+        incoming: Option<&crate::storage::memory_store::ModelSignature>,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::{MemoryStoreError, ModelSignature};
+        let Some(incoming) = incoming else {
+            return Ok(());
+        };
+        // Try from cache first
+        {
+            let guard = self
+                .registered_model
+                .read()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            if let Some(ref reg) = *guard {
+                if reg == incoming {
+                    return Ok(());
+                }
+                return Err(MemoryStoreError::ModelMismatch {
+                    registered_name: reg.name.clone(),
+                    registered_dim: reg.dimension,
+                    registered_hash: reg.hash.clone(),
+                    actual_name: incoming.name.clone(),
+                    actual_dim: incoming.dimension,
+                    actual_hash: incoming.hash.clone(),
+                });
+            }
+        }
+        // Not registered yet -- auto-register
+        let now = Utc::now().to_rfc3339();
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        // Try INSERT OR IGNORE
+        writer.execute(
+            "INSERT OR IGNORE INTO embedding_model (id, name, dimension, hash, created_at) VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![incoming.name, incoming.dimension as i64, incoming.hash, now],
+        ).map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        // Read back what was stored
+        let stored: Option<ModelSignature> = writer
+            .query_row(
+                "SELECT name, dimension, hash FROM embedding_model WHERE id = 1",
+                [],
+                |row| {
+                    let name: String = row.get(0)?;
+                    let dim: i64 = row.get(1)?;
+                    let hash: String = row.get(2)?;
+                    Ok(ModelSignature {
+                        name,
+                        dimension: dim as usize,
+                        hash,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        drop(writer);
+        if let Some(stored) = stored {
+            if stored != *incoming {
+                return Err(MemoryStoreError::ModelMismatch {
+                    registered_name: stored.name,
+                    registered_dim: stored.dimension,
+                    registered_hash: stored.hash,
+                    actual_name: incoming.name.clone(),
+                    actual_dim: incoming.dimension,
+                    actual_hash: incoming.hash.clone(),
+                });
+            }
+            // Populate cache
+            let mut guard = self
+                .registered_model
+                .write()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            *guard = Some(stored);
+        }
+        Ok(())
+    }
+}
+
+impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
+    async fn init(&self) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        // Migrations run in `new`; this is a no-op for the SQLite backend.
+        Ok(())
+    }
+
+    async fn health_check(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<crate::storage::memory_store::HealthStatus>
+    {
+        use crate::storage::memory_store::HealthStatus;
+        let reader = self.reader.lock().map_err(|_| {
+            crate::storage::memory_store::MemoryStoreError::Init("Reader lock poisoned".into())
+        })?;
+        let ok: rusqlite::Result<i64> = reader.query_row("SELECT 1", [], |row| row.get(0));
+        if ok.is_ok() {
+            Ok(HealthStatus::Healthy)
+        } else {
+            Ok(HealthStatus::Degraded {
+                reason: "SQLite connectivity check failed".to_string(),
+            })
+        }
+    }
+
+    async fn registered_model(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Option<crate::storage::memory_store::ModelSignature>,
+    > {
+        use crate::storage::memory_store::MemoryStoreError;
+        // Check cache first
+        {
+            let guard = self
+                .registered_model
+                .read()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            if guard.is_some() {
+                return Ok(guard.clone());
+            }
+        }
+        // Fall through to DB read
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let stored: Option<crate::storage::memory_store::ModelSignature> = reader
+            .query_row(
+                "SELECT name, dimension, hash FROM embedding_model WHERE id = 1",
+                [],
+                |row| {
+                    let name: String = row.get(0)?;
+                    let dim: i64 = row.get(1)?;
+                    let hash: String = row.get(2)?;
+                    Ok(crate::storage::memory_store::ModelSignature {
+                        name,
+                        dimension: dim as usize,
+                        hash,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        drop(reader);
+        // Populate cache if we read something
+        if stored.is_some() {
+            let mut guard = self
+                .registered_model
+                .write()
+                .map_err(|_| MemoryStoreError::Init("registered_model rwlock poisoned".into()))?;
+            *guard = stored.clone();
+        }
+        Ok(stored)
+    }
+
+    async fn register_model(
+        &self,
+        sig: &crate::storage::memory_store::ModelSignature,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        self.enforce_model(Some(sig))
+    }
+
+    async fn insert(
+        &self,
+        record: &crate::storage::memory_store::MemoryRecord,
+    ) -> crate::storage::memory_store::MemoryStoreResult<uuid::Uuid> {
+        use crate::storage::memory_store::{MemoryStoreError, ModelSignature};
+        // Enforce model registry if embedding is provided
+        if let Some(vec) = &record.embedding {
+            // Derive a signature from metadata if present, or use a generic sentinel
+            let sig: Option<ModelSignature> = record
+                .metadata
+                .get("model_name")
+                .and_then(|v| v.as_str())
+                .zip(
+                    record
+                        .metadata
+                        .get("model_dim")
+                        .and_then(|v| v.as_u64())
+                        .map(|d| d as usize),
+                )
+                .zip(record.metadata.get("model_hash").and_then(|v| v.as_str()))
+                .map(|((name, dim), hash)| ModelSignature {
+                    name: name.to_string(),
+                    dimension: dim,
+                    hash: hash.to_string(),
+                });
+            if let Some(ref s) = sig {
+                self.enforce_model(Some(s))?;
+                if vec.len() != s.dimension {
+                    return Err(MemoryStoreError::InvalidInput(format!(
+                        "embedding length {} != registered dimension {}",
+                        vec.len(),
+                        s.dimension
+                    )));
+                }
+            }
+        }
+        // Insert directly using the record's own id so the caller-supplied UUID is
+        // preserved (unlike ingest() which always generates a fresh UUID).
+        let id_str = record.id.to_string();
+        let now = chrono::Utc::now();
+        let tags_json = serde_json::to_string(&record.tags).unwrap_or_else(|_| "[]".to_string());
+        let domains_json =
+            serde_json::to_string(&record.domains).unwrap_or_else(|_| "[]".to_string());
+        let scores_json =
+            serde_json::to_string(&record.domain_scores).unwrap_or_else(|_| "{}".to_string());
+        let source: Option<String> = record
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+            writer
+                .execute(
+                    "INSERT INTO knowledge_nodes (
+                    id, content, node_type, created_at, updated_at, last_accessed,
+                    stability, difficulty, reps, lapses, learning_state,
+                    storage_strength, retrieval_strength, retention_strength,
+                    sentiment_score, sentiment_magnitude, next_review, scheduled_days,
+                    source, tags, has_embedding, embedding_model,
+                    domains, domain_scores
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6,
+                    1.0, 0.3, 0, 0, 'new',
+                    1.0, 1.0, 1.0,
+                    0.0, 0.0, ?7, 1,
+                    ?8, ?9, 0, NULL,
+                    ?10, ?11
+                )",
+                    rusqlite::params![
+                        id_str,
+                        record.content,
+                        record.node_type,
+                        record.created_at.to_rfc3339(),
+                        record.updated_at.to_rfc3339(),
+                        now.to_rfc3339(),
+                        (now + chrono::Duration::days(1)).to_rfc3339(),
+                        source,
+                        tags_json,
+                        domains_json,
+                        scores_json,
+                    ],
+                )
+                .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        }
+        Ok(record.id)
+    }
+
+    async fn get(
+        &self,
+        id: uuid::Uuid,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Option<crate::storage::memory_store::MemoryRecord>,
+    > {
+        use crate::storage::memory_store::MemoryStoreError;
+        let node = self
+            .get_node(&id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        let (domains, domain_scores) = self.read_domain_columns(&id.to_string());
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        let embedding = self.get_node_embedding(&id.to_string()).ok().flatten();
+        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        let embedding: Option<Vec<f32>> = None;
+        let mut rec = Self::node_to_record(node, embedding);
+        rec.domains = domains;
+        rec.domain_scores = domain_scores;
+        Ok(Some(rec))
+    }
+
+    async fn update(
+        &self,
+        record: &crate::storage::memory_store::MemoryRecord,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        self.update_node_content(&record.id.to_string(), &record.content)
+            .map_err(MemoryStoreError::from)?;
+        // Update domains/domain_scores
+        let domains_json =
+            serde_json::to_string(&record.domains).unwrap_or_else(|_| "[]".to_string());
+        let scores_json =
+            serde_json::to_string(&record.domain_scores).unwrap_or_else(|_| "{}".to_string());
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute(
+                "UPDATE knowledge_nodes SET domains = ?1, domain_scores = ?2 WHERE id = ?3",
+                rusqlite::params![domains_json, scores_json, record.id.to_string()],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete(&self, id: uuid::Uuid) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        self.delete_node(&id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        query: &crate::storage::memory_store::SearchQuery,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::SearchResult>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SearchResult};
+        // For Phase 1 we delegate to hybrid_search or keyword_search based on what is provided.
+        let limit = if query.limit == 0 { 10 } else { query.limit };
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        {
+            if let Some(ref text) = query.text {
+                let results = self
+                    .hybrid_search(text, limit as i32, 0.3, 0.7)
+                    .map_err(MemoryStoreError::from)?;
+                let out = results
+                    .into_iter()
+                    .map(|r| {
+                        let (domains, domain_scores) = self.read_domain_columns(&r.node.id);
+                        let mut rec = Self::node_to_record(r.node, None);
+                        rec.domains = domains;
+                        rec.domain_scores = domain_scores;
+                        SearchResult {
+                            score: r.combined_score as f64,
+                            fts_score: r.keyword_score.map(|s| s as f64),
+                            vector_score: r.semantic_score.map(|s| s as f64),
+                            record: rec,
+                        }
+                    })
+                    .collect();
+                return Ok(out);
+            }
+        }
+        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        {
+            if let Some(ref text) = query.text {
+                // Use individual-term matching so multi-word queries find documents
+                // where all words appear anywhere (not necessarily as a phrase).
+                let nodes = self
+                    .search_terms(text, limit as i32)
+                    .map_err(MemoryStoreError::from)?;
+                let out = nodes
+                    .into_iter()
+                    .map(|node| {
+                        let (domains, domain_scores) = self.read_domain_columns(&node.id);
+                        let mut rec = Self::node_to_record(node, None);
+                        rec.domains = domains;
+                        rec.domain_scores = domain_scores;
+                        SearchResult {
+                            record: rec,
+                            score: 1.0,
+                            fts_score: Some(1.0),
+                            vector_score: None,
+                        }
+                    })
+                    .collect();
+                return Ok(out);
+            }
+        }
+        Ok(vec![])
+    }
+
+    async fn fts_search(
+        &self,
+        text: &str,
+        limit: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::SearchResult>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SearchResult};
+        // Use individual-term matching so multi-word queries find documents
+        // where all words appear anywhere (not necessarily as a phrase).
+        let nodes = self
+            .search_terms(text, limit as i32)
+            .map_err(MemoryStoreError::from)?;
+        let out = nodes
+            .into_iter()
+            .map(|node| {
+                let (domains, domain_scores) = self.read_domain_columns(&node.id);
+                let mut rec = Self::node_to_record(node, None);
+                rec.domains = domains;
+                rec.domain_scores = domain_scores;
+                SearchResult {
+                    record: rec,
+                    score: 1.0,
+                    fts_score: Some(1.0),
+                    vector_score: None,
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+
+    async fn vector_search(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::SearchResult>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SearchResult};
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        {
+            let index = self
+                .vector_index
+                .lock()
+                .map_err(|_| MemoryStoreError::Init("Vector index lock poisoned".into()))?;
+            let raw_results = index
+                .search_with_threshold(embedding, limit, 0.0_f32)
+                .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+            drop(index);
+            let out = raw_results
+                .into_iter()
+                .filter_map(|(node_id, score)| {
+                    let node = self.get_node(&node_id).ok().flatten()?;
+                    let (domains, domain_scores) = self.read_domain_columns(&node_id);
+                    let mut rec = Self::node_to_record(node, None);
+                    rec.domains = domains;
+                    rec.domain_scores = domain_scores;
+                    Some(SearchResult {
+                        record: rec,
+                        score: score as f64,
+                        fts_score: None,
+                        vector_score: Some(score as f64),
+                    })
+                })
+                .collect();
+            Ok(out)
+        }
+        #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+        {
+            let _ = (embedding, limit);
+            Ok(vec![])
+        }
+    }
+
+    async fn get_scheduling(
+        &self,
+        memory_id: uuid::Uuid,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Option<crate::storage::memory_store::SchedulingState>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SchedulingState};
+        let node = self
+            .get_node(&memory_id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        Ok(Some(SchedulingState {
+            memory_id,
+            stability: node.stability,
+            difficulty: node.difficulty,
+            retrievability: node.retention_strength,
+            last_review: Some(node.last_accessed),
+            next_review: node.next_review,
+            reps: node.reps as u32,
+            lapses: node.lapses as u32,
+        }))
+    }
+
+    async fn update_scheduling(
+        &self,
+        state: &crate::storage::memory_store::SchedulingState,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        let next_review_str = state.next_review.map(|dt| dt.to_rfc3339());
+        let last_review_str = state.last_review.map(|dt| dt.to_rfc3339());
+        writer
+            .execute(
+                "UPDATE knowledge_nodes SET stability=?1, difficulty=?2, retention_strength=?3,
+                 last_accessed=?4, next_review=?5, reps=?6, lapses=?7
+                 WHERE id=?8",
+                rusqlite::params![
+                    state.stability,
+                    state.difficulty,
+                    state.retrievability,
+                    last_review_str.as_deref().unwrap_or(""),
+                    next_review_str,
+                    state.reps as i64,
+                    state.lapses as i64,
+                    state.memory_id.to_string(),
+                ],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_due_memories(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<(
+            crate::storage::memory_store::MemoryRecord,
+            crate::storage::memory_store::SchedulingState,
+        )>,
+    > {
+        use crate::storage::memory_store::{MemoryStoreError, SchedulingState};
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let before_str = before.to_rfc3339();
+        let mut stmt = reader
+            .prepare(
+                "SELECT * FROM knowledge_nodes WHERE next_review <= ?1 ORDER BY next_review ASC LIMIT ?2",
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let nodes: Vec<KnowledgeNode> = stmt
+            .query_map(
+                rusqlite::params![before_str, limit as i64],
+                Self::row_to_node,
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        drop(stmt);
+        drop(reader);
+        let out = nodes
+            .into_iter()
+            .map(|node| {
+                let id_str = node.id.clone();
+                let (domains, domain_scores) = self.read_domain_columns(&id_str);
+                let id_uuid =
+                    uuid::Uuid::parse_str(&id_str).unwrap_or_else(|_| uuid::Uuid::new_v4());
+                let state = SchedulingState {
+                    memory_id: id_uuid,
+                    stability: node.stability,
+                    difficulty: node.difficulty,
+                    retrievability: node.retention_strength,
+                    last_review: Some(node.last_accessed),
+                    next_review: node.next_review,
+                    reps: node.reps as u32,
+                    lapses: node.lapses as u32,
+                };
+                let mut rec = Self::node_to_record(node, None);
+                rec.domains = domains;
+                rec.domain_scores = domain_scores;
+                (rec, state)
+            })
+            .collect();
+        Ok(out)
+    }
+
+    async fn add_edge(
+        &self,
+        edge: &crate::storage::memory_store::MemoryEdge,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let conn = ConnectionRecord {
+            source_id: edge.source_id.to_string(),
+            target_id: edge.target_id.to_string(),
+            strength: edge.weight,
+            link_type: edge.edge_type.clone(),
+            created_at: edge.created_at,
+            last_activated: edge.created_at,
+            activation_count: 0,
+        };
+        self.save_connection(&conn).map_err(MemoryStoreError::from)
+    }
+
+    async fn get_edges(
+        &self,
+        node_id: uuid::Uuid,
+        edge_type: Option<&str>,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<crate::storage::memory_store::MemoryEdge>,
+    > {
+        use crate::storage::memory_store::{MemoryEdge, MemoryStoreError};
+        let conns = self
+            .get_connections_for_memory(&node_id.to_string())
+            .map_err(MemoryStoreError::from)?;
+        let edges = conns
+            .into_iter()
+            .filter(|c| edge_type.is_none_or(|t| c.link_type == t))
+            .filter_map(|c| {
+                let src = uuid::Uuid::parse_str(&c.source_id).ok()?;
+                let tgt = uuid::Uuid::parse_str(&c.target_id).ok()?;
+                Some(MemoryEdge {
+                    source_id: src,
+                    target_id: tgt,
+                    edge_type: c.link_type,
+                    weight: c.strength,
+                    created_at: c.created_at,
+                })
+            })
+            .collect();
+        Ok(edges)
+    }
+
+    async fn remove_edge(
+        &self,
+        source: uuid::Uuid,
+        target: uuid::Uuid,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute(
+                "DELETE FROM memory_connections WHERE source_id = ?1 AND target_id = ?2",
+                rusqlite::params![source.to_string(), target.to_string()],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_neighbors(
+        &self,
+        node_id: uuid::Uuid,
+        depth: usize,
+    ) -> crate::storage::memory_store::MemoryStoreResult<
+        Vec<(crate::storage::memory_store::MemoryRecord, f64)>,
+    > {
+        use crate::storage::memory_store::MemoryStoreError;
+        // Depth 0: return just the node itself if it exists.
+        if depth == 0 {
+            let node = self
+                .get_node(&node_id.to_string())
+                .map_err(MemoryStoreError::from)?
+                .ok_or_else(|| MemoryStoreError::NotFound(node_id.to_string()))?;
+            let (domains, domain_scores) = self.read_domain_columns(&node_id.to_string());
+            let mut rec = Self::node_to_record(node, None);
+            rec.domains = domains;
+            rec.domain_scores = domain_scores;
+            return Ok(vec![(rec, 1.0)]);
+        }
+        // BFS up to `depth` levels, capped at 256 nodes.
+        const MAX_NODES: usize = 256;
+        let mut visited: std::collections::HashMap<uuid::Uuid, f64> =
+            std::collections::HashMap::new();
+        let mut frontier: Vec<(uuid::Uuid, f64)> = vec![(node_id, 1.0)];
+        visited.insert(node_id, 1.0);
+        for _ in 0..depth {
+            if visited.len() >= MAX_NODES {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            for (current, current_weight) in frontier.iter() {
+                let conns = self
+                    .get_connections_for_memory(&current.to_string())
+                    .unwrap_or_default();
+                for conn in conns {
+                    let neighbor_id_str = if conn.source_id == current.to_string() {
+                        conn.target_id
+                    } else {
+                        conn.source_id
+                    };
+                    let Ok(nid) = uuid::Uuid::parse_str(&neighbor_id_str) else {
+                        continue;
+                    };
+                    if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(nid) {
+                        let w = current_weight * conn.strength;
+                        e.insert(w);
+                        next_frontier.push((nid, w));
+                        if visited.len() >= MAX_NODES {
+                            break;
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        let mut result = Vec::with_capacity(visited.len());
+        for (nid, weight) in visited {
+            let Some(node) = self.get_node(&nid.to_string()).ok().flatten() else {
+                continue;
+            };
+            let (domains, domain_scores) = self.read_domain_columns(&nid.to_string());
+            let mut rec = Self::node_to_record(node, None);
+            rec.domains = domains;
+            rec.domain_scores = domain_scores;
+            result.push((rec, weight));
+        }
+        Ok(result)
+    }
+
+    async fn list_domains(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<Vec<crate::storage::memory_store::Domain>>
+    {
+        use crate::storage::memory_store::{Domain, MemoryStoreError};
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let mut stmt = reader
+            .prepare("SELECT id, label, centroid, top_terms, memory_count, created_at FROM domains ORDER BY created_at ASC")
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let label: String = row.get(1)?;
+                let centroid_bytes: Option<Vec<u8>> = row.get(2)?;
+                let top_terms_json: String = row.get(3)?;
+                let memory_count: i64 = row.get(4)?;
+                let created_at_str: String = row.get(5)?;
+                Ok((
+                    id,
+                    label,
+                    centroid_bytes,
+                    top_terms_json,
+                    memory_count,
+                    created_at_str,
+                ))
+            })
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, label, centroid_bytes, top_terms_json, memory_count, created_at_str) =
+                row.map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+            let centroid: Vec<f32> = centroid_bytes
+                .map(|b| {
+                    b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let top_terms: Vec<String> = serde_json::from_str(&top_terms_json).unwrap_or_default();
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| Utc::now());
+            result.push(Domain {
+                id,
+                label,
+                centroid,
+                top_terms,
+                memory_count: memory_count as usize,
+                created_at,
+            });
+        }
+        Ok(result)
+    }
+
+    async fn get_domain(
+        &self,
+        id: &str,
+    ) -> crate::storage::memory_store::MemoryStoreResult<Option<crate::storage::memory_store::Domain>>
+    {
+        use crate::storage::memory_store::{Domain, MemoryStoreError};
+        type DomainRow = (String, String, Option<Vec<u8>>, String, i64, String);
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let result: Option<DomainRow> = reader
+            .query_row(
+                "SELECT id, label, centroid, top_terms, memory_count, created_at FROM domains WHERE id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let Some((id, label, centroid_bytes, top_terms_json, memory_count, created_at_str)) =
+            result
+        else {
+            return Ok(None);
+        };
+        let centroid: Vec<f32> = centroid_bytes
+            .map(|b| {
+                b.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let top_terms: Vec<String> = serde_json::from_str(&top_terms_json).unwrap_or_default();
+        let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| Utc::now());
+        Ok(Some(Domain {
+            id,
+            label,
+            centroid,
+            top_terms,
+            memory_count: memory_count as usize,
+            created_at,
+        }))
+    }
+
+    async fn upsert_domain(
+        &self,
+        domain: &crate::storage::memory_store::Domain,
+    ) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let centroid_bytes: Vec<u8> = domain
+            .centroid
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let top_terms_json =
+            serde_json::to_string(&domain.top_terms).unwrap_or_else(|_| "[]".to_string());
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute(
+                "INSERT INTO domains (id, label, centroid, top_terms, memory_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   label = excluded.label,
+                   centroid = excluded.centroid,
+                   top_terms = excluded.top_terms,
+                   memory_count = excluded.memory_count",
+                rusqlite::params![
+                    domain.id,
+                    domain.label,
+                    centroid_bytes,
+                    top_terms_json,
+                    domain.memory_count as i64,
+                    domain.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_domain(&self, id: &str) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute("DELETE FROM domains WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn classify(
+        &self,
+        _embedding: &[f32],
+    ) -> crate::storage::memory_store::MemoryStoreResult<Vec<(String, f64)>> {
+        // Phase 1 stub: no centroids yet. Phase 4 wires the full soft-assignment pass.
+        Ok(vec![])
+    }
+
+    async fn count(&self) -> crate::storage::memory_store::MemoryStoreResult<usize> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let n: i64 = reader
+            .query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| row.get(0))
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(n as usize)
+    }
+
+    async fn get_stats(
+        &self,
+    ) -> crate::storage::memory_store::MemoryStoreResult<crate::storage::memory_store::StoreStats>
+    {
+        use crate::storage::memory_store::{MemoryStoreError, StoreStats};
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Reader lock poisoned".into()))?;
+        let total: i64 = reader
+            .query_row("SELECT COUNT(*) FROM knowledge_nodes", [], |row| row.get(0))
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let with_emb: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_nodes WHERE has_embedding = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let total_edges: i64 = reader
+            .query_row("SELECT COUNT(*) FROM memory_connections", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        let total_domains: i64 = reader
+            .query_row("SELECT COUNT(*) FROM domains", [], |row| row.get(0))
+            .unwrap_or(0);
+        let model_row: Option<(String, i64)> = reader
+            .query_row(
+                "SELECT name, dimension FROM embedding_model WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        let (model_name, model_dim) = model_row
+            .map(|(n, d)| (Some(n), Some(d as usize)))
+            .unwrap_or((None, None));
+        Ok(StoreStats {
+            total_memories: total as usize,
+            memories_with_embeddings: with_emb as usize,
+            total_edges: total_edges as usize,
+            total_domains: total_domains as usize,
+            registered_model_name: model_name,
+            registered_model_dim: model_dim,
+        })
+    }
+
+    async fn vacuum(&self) -> crate::storage::memory_store::MemoryStoreResult<()> {
+        use crate::storage::memory_store::MemoryStoreError;
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| MemoryStoreError::Init("Writer lock poisoned".into()))?;
+        writer
+            .execute_batch("VACUUM;")
+            .map_err(|e| MemoryStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -7293,6 +9307,9 @@ mod tests {
     use super::*;
     use crate::advanced::{MatchClass, MergePolicy};
     use tempfile::tempdir;
+    // The public struct was renamed from Storage to SqliteMemoryStore; this
+    // alias keeps all existing tests compiling without modification.
+    use SqliteMemoryStore as Storage;
 
     fn create_test_storage() -> Storage {
         let dir = tempdir().unwrap();
@@ -7402,13 +9419,17 @@ mod tests {
         use chrono::TimeZone;
 
         // Canonical writer: RFC 3339 with fractional seconds + offset.
-        let rfc = Storage::parse_timestamp("2026-06-12T15:07:59.730+00:00", "last_accessed").unwrap();
+        let rfc =
+            Storage::parse_timestamp("2026-06-12T15:07:59.730+00:00", "last_accessed").unwrap();
         assert_eq!(rfc.to_rfc3339(), "2026-06-12T15:07:59.730+00:00");
 
         // External writer: SQLite-native `datetime('now')` (space separator,
         // no timezone, no fraction) — must be tolerated, assumed UTC.
         let sqlite = Storage::parse_timestamp("2026-06-12 15:07:59", "last_accessed").unwrap();
-        assert_eq!(sqlite, Utc.with_ymd_and_hms(2026, 6, 12, 15, 7, 59).unwrap());
+        assert_eq!(
+            sqlite,
+            Utc.with_ymd_and_hms(2026, 6, 12, 15, 7, 59).unwrap()
+        );
 
         // SQLite-native with fractional seconds.
         let sqlite_frac =
@@ -7488,6 +9509,622 @@ mod tests {
         let deleted = storage.delete_node(&node.id).unwrap();
         assert!(deleted);
         assert!(storage.get_node(&node.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_composition_save_query_outcome_and_never_composed() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Oracle drift can break delayed settlement.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-oracle".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Withdrawal queues can settle stale claims.".to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-queue".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let third = storage
+            .ingest(IngestInput {
+                content: "Keeper roles can drift from local validation paths.".to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-role".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let before = storage
+            .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
+            .unwrap();
+        let first_second_before = before
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &second.id)
+            })
+            .expect("uncomposed first/second pair should be ranked before any event");
+        assert!(
+            first_second_before.bridge_score > 0.0,
+            "candidate should expose a bridge score"
+        );
+        assert!(
+            first_second_before.novelty_score > 0.0,
+            "candidate should expose a novelty score"
+        );
+        assert_eq!(
+            first_second_before.outcome_signal, "clean",
+            "new candidate should start without prior outcome context"
+        );
+        assert!(
+            first_second_before
+                .composition_question
+                .contains("composed through"),
+            "candidate should include a promptable composition question"
+        );
+
+        let event = CompositionEventRecord {
+            id: "composition-test-1".to_string(),
+            created_at: Utc::now(),
+            tool: "deep_reference".to_string(),
+            mode: "bounty".to_string(),
+            query: Some("oracle drift delayed settlement".to_string()),
+            query_hash: Some("sha256:test".to_string()),
+            confidence: Some(0.87),
+            status: Some("resolved".to_string()),
+            output_preview: Some("Compose oracle drift with withdrawal queue.".to_string()),
+            metadata: serde_json::json!({"workflow": "test"}),
+        };
+        let members = vec![
+            CompositionMemberRecord {
+                event_id: event.id.clone(),
+                memory_id: first.id.clone(),
+                role: "primary".to_string(),
+                rank: 0,
+                trust: Some(0.8),
+                score: Some(0.9),
+                preview: Some(preview(&first.content, 120)),
+                metadata: serde_json::json!({}),
+            },
+            CompositionMemberRecord {
+                event_id: event.id.clone(),
+                memory_id: second.id.clone(),
+                role: "supporting".to_string(),
+                rank: 1,
+                trust: Some(0.7),
+                score: Some(0.75),
+                preview: Some(preview(&second.content, 120)),
+                metadata: serde_json::json!({}),
+            },
+        ];
+        storage.save_composition(&event, &members, &[]).unwrap();
+
+        let outcome = CompositionOutcomeRecord {
+            id: "composition-outcome-1".to_string(),
+            event_id: event.id.clone(),
+            outcome_type: "submitted".to_string(),
+            labeled_at: Utc::now(),
+            label_source: "test".to_string(),
+            confidence_delta: Some(0.1),
+            notes: Some("Report submitted".to_string()),
+            metadata: serde_json::json!({"severity": "high"}),
+        };
+        storage.record_composition_outcome(&outcome).unwrap();
+
+        let fetched = storage.get_composition_event(&event.id).unwrap().unwrap();
+        assert_eq!(fetched.mode, "bounty");
+        assert_eq!(fetched.metadata["workflow"], "test");
+
+        let fetched_members = storage.get_composition_members(&event.id).unwrap();
+        assert_eq!(fetched_members.len(), 2);
+        assert_eq!(fetched_members[0].role, "primary");
+
+        let fetched_outcomes = storage.get_composition_outcomes(&event.id).unwrap();
+        assert_eq!(fetched_outcomes.len(), 1);
+        assert_eq!(fetched_outcomes[0].outcome_type, "submitted");
+
+        let for_memory = storage.get_compositions_for_memory(&first.id, 5).unwrap();
+        assert_eq!(for_memory.len(), 1);
+        assert_eq!(for_memory[0].id, event.id);
+
+        let neighbors = storage.get_composition_neighbors(&first.id, 5).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].memory_id, second.id);
+
+        let after = storage
+            .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
+            .unwrap();
+        assert!(
+            !after.iter().any(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &second.id)
+            }),
+            "already-composed first/second pair should be removed"
+        );
+        assert!(
+            after.iter().any(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &third.id)
+                    || pair == Storage::pair_key(&second.id, &third.id)
+            }),
+            "other protocolgate pairs should remain candidates"
+        );
+    }
+
+    #[test]
+    fn test_composition_neighbors_count_distinct_events_not_member_roles() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Oracle role appears once in the event.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["protocolgate".to_string(), "settlement".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Queue role appears under two evidence roles.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["protocolgate".to_string(), "settlement".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "multi-role-neighbor-event".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "bounty".to_string(),
+                    query: Some("multi role neighbor".to_string()),
+                    query_hash: Some("fnv1a64:neighbor".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "multi-role-neighbor-event".to_string(),
+                        memory_id: first.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.8),
+                        score: Some(0.9),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "multi-role-neighbor-event".to_string(),
+                        memory_id: second.id.clone(),
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.8),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "multi-role-neighbor-event".to_string(),
+                        memory_id: second.id.clone(),
+                        role: "related".to_string(),
+                        rank: 2,
+                        trust: Some(0.7),
+                        score: Some(0.6),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+
+        let neighbors = storage.get_composition_neighbors(&first.id, 10).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].memory_id, second.id);
+        assert_eq!(
+            neighbors[0].composed_count, 1,
+            "one event with multiple member roles should count as one composition"
+        );
+    }
+
+    #[test]
+    fn test_never_composed_tag_filter_includes_older_tagged_candidates() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Older Vestige composition frontier about outcome-shaped recall."
+                    .to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["project:vestige".to_string(), "composition".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Older Vestige composition frontier about never-composed recall."
+                    .to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec!["project:vestige".to_string(), "composition".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        for idx in 0..751 {
+            storage
+                .ingest(IngestInput {
+                    content: format!("Unrelated recent memory {idx} for scan-window pressure."),
+                    node_type: "fact".to_string(),
+                    tags: vec!["unrelated".to_string()],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let candidates = storage
+            .get_never_composed_candidates(10, Some(&["project".to_string()]))
+            .unwrap();
+        assert!(
+            candidates.iter().any(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &second.id)
+            }),
+            "tag-filtered frontier should include older namespaced-tag memories outside the base scan window"
+        );
+    }
+
+    #[test]
+    fn test_never_composed_carries_prior_outcome_signal() {
+        let storage = create_test_storage();
+        let first = storage
+            .ingest(IngestInput {
+                content: "Oracle drift lane previously looked duplicate-prone.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-oracle".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let second = storage
+            .ingest(IngestInput {
+                content: "Withdrawal queue lane had weak proof.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-queue".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let third = storage
+            .ingest(IngestInput {
+                content: "Keeper settlement lane has not been composed with oracle drift."
+                    .to_string(),
+                node_type: "pattern".to_string(),
+                tags: vec![
+                    "protocolgate".to_string(),
+                    "boundary-role".to_string(),
+                    "settlement".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let event = CompositionEventRecord {
+            id: "prior-outcome-composition".to_string(),
+            created_at: Utc::now(),
+            tool: "deep_reference".to_string(),
+            mode: "bounty".to_string(),
+            query: Some("oracle withdrawal duplicate risk".to_string()),
+            query_hash: Some("fnv1a64:prior".to_string()),
+            confidence: Some(0.4),
+            status: Some("closed".to_string()),
+            output_preview: Some("Prior composition was labeled duplicate risk.".to_string()),
+            metadata: serde_json::json!({}),
+        };
+        storage
+            .save_composition(
+                &event,
+                &[
+                    CompositionMemberRecord {
+                        event_id: event.id.clone(),
+                        memory_id: first.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.7),
+                        score: Some(0.8),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: event.id.clone(),
+                        memory_id: second.id.clone(),
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.8),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "prior-outcome-label".to_string(),
+                    event_id: event.id.clone(),
+                    outcome_type: "duplicate_risk".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: Some(-0.2),
+                    notes: Some("Duplicate family in prior lane.".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
+
+        let candidates = storage
+            .get_never_composed_candidates(10, Some(&["protocolgate".to_string()]))
+            .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&first.id, &third.id)
+            })
+            .expect("untried first/third pair should remain a frontier candidate");
+
+        assert!(
+            candidate
+                .prior_outcomes
+                .iter()
+                .any(|outcome| outcome == "duplicate_risk"),
+            "frontier candidate should expose prior outcome labels from either member"
+        );
+        assert_eq!(candidate.outcome_signal, "prior_duplicate_risk");
+        assert!(
+            candidate.outcome_score_adjustment < 0.0,
+            "duplicate-risk history should reduce but not hide the untried lane"
+        );
+    }
+
+    #[test]
+    fn test_never_composed_marks_mixed_prior_outcomes() {
+        let storage = create_test_storage();
+        let successful = storage
+            .ingest(IngestInput {
+                content: "Accepted release lane linked rollback evidence to install telemetry."
+                    .to_string(),
+                node_type: "decision".to_string(),
+                tags: vec![
+                    "project:vestige".to_string(),
+                    "release".to_string(),
+                    "telemetry".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let closed = storage
+            .ingest(IngestInput {
+                content: "Closed release lane linked install telemetry to out-of-scope claims."
+                    .to_string(),
+                node_type: "incident".to_string(),
+                tags: vec![
+                    "project:vestige".to_string(),
+                    "release".to_string(),
+                    "telemetry".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let success_helper = storage
+            .ingest(IngestInput {
+                content: "Helper memory for an accepted release composition.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["project:vestige".to_string(), "release".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let closed_helper = storage
+            .ingest(IngestInput {
+                content: "Helper memory for a closed release composition.".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["project:vestige".to_string(), "release".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "prior-success-composition".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "release".to_string(),
+                    query: Some("accepted release lane".to_string()),
+                    query_hash: Some("fnv1a64:success".to_string()),
+                    confidence: Some(0.9),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "prior-success-composition".to_string(),
+                        memory_id: successful.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.9),
+                        score: Some(0.9),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "prior-success-composition".to_string(),
+                        memory_id: success_helper.id,
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.6),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "prior-success-label".to_string(),
+                    event_id: "prior-success-composition".to_string(),
+                    outcome_type: "accepted".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: Some(0.2),
+                    notes: None,
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
+
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "prior-closed-composition".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "release".to_string(),
+                    query: Some("closed release lane".to_string()),
+                    query_hash: Some("fnv1a64:closed".to_string()),
+                    confidence: Some(0.3),
+                    status: Some("closed".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "prior-closed-composition".to_string(),
+                        memory_id: closed.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.8),
+                        score: Some(0.7),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "prior-closed-composition".to_string(),
+                        memory_id: closed_helper.id,
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.7),
+                        score: Some(0.6),
+                        preview: None,
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "prior-closed-label".to_string(),
+                    event_id: "prior-closed-composition".to_string(),
+                    outcome_type: "closed_by_scope".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: Some(-0.3),
+                    notes: None,
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
+
+        let candidates = storage
+            .get_never_composed_candidates(10, Some(&["project".to_string()]))
+            .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&successful.id, &closed.id)
+            })
+            .expect("untried success/closed pair should remain a frontier candidate");
+
+        assert_eq!(candidate.outcome_signal, "mixed_prior_outcomes");
+        assert!(
+            candidate
+                .prior_outcomes
+                .iter()
+                .any(|outcome| outcome == "accepted")
+        );
+        assert!(
+            candidate
+                .prior_outcomes
+                .iter()
+                .any(|outcome| outcome == "closed_by_scope")
+        );
+    }
+
+    #[test]
+    fn test_never_composed_surfaces_weak_tie_shared_terms_without_shared_tags() {
+        let storage = create_test_storage();
+        let incident = storage
+            .ingest(IngestInput {
+                content:
+                    "OpenCode handshake stalls when embedding startup blocks stdio negotiation."
+                        .to_string(),
+                node_type: "incident".to_string(),
+                tags: vec!["opencode".to_string(), "startup".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        let mitigation = storage
+            .ingest(IngestInput {
+                content: "JetBrains startup should keep embedding backfill behind the handshake."
+                    .to_string(),
+                node_type: "mitigation".to_string(),
+                tags: vec!["jetbrains".to_string(), "background-work".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let candidates = storage.get_never_composed_candidates(10, None).unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                let pair = Storage::pair_key(&candidate.first_id, &candidate.second_id);
+                pair == Storage::pair_key(&incident.id, &mitigation.id)
+            })
+            .expect("shared terms should surface a weak-tie candidate without shared tags");
+
+        assert!(
+            candidate.shared_tags.is_empty(),
+            "test fixture intentionally has no shared tags"
+        );
+        assert!(
+            candidate
+                .shared_terms
+                .iter()
+                .any(|term| term == "embedding" || term == "startup" || term == "handshake"),
+            "shared terms should explain the candidate"
+        );
+        assert!(
+            candidate.bridge_score > 0.5,
+            "different tags and node types should create a bridge signal"
+        );
     }
 
     #[test]
@@ -7586,6 +10223,54 @@ mod tests {
                 activation_count: 1,
             })
             .unwrap();
+        source
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "portable-composition-1".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "bounty".to_string(),
+                    query: Some("portable composition".to_string()),
+                    query_hash: Some("sha256:portable".to_string()),
+                    confidence: Some(0.9),
+                    status: Some("resolved".to_string()),
+                    output_preview: Some("Portable composition event".to_string()),
+                    metadata: serde_json::json!({}),
+                },
+                &[
+                    CompositionMemberRecord {
+                        event_id: "portable-composition-1".to_string(),
+                        memory_id: first.id.clone(),
+                        role: "primary".to_string(),
+                        rank: 0,
+                        trust: Some(0.9),
+                        score: Some(1.0),
+                        preview: Some("alpha".to_string()),
+                        metadata: serde_json::json!({}),
+                    },
+                    CompositionMemberRecord {
+                        event_id: "portable-composition-1".to_string(),
+                        memory_id: second.id.clone(),
+                        role: "supporting".to_string(),
+                        rank: 1,
+                        trust: Some(0.8),
+                        score: Some(0.8),
+                        preview: Some("beta".to_string()),
+                        metadata: serde_json::json!({}),
+                    },
+                ],
+                &[CompositionOutcomeRecord {
+                    id: "portable-composition-outcome-1".to_string(),
+                    event_id: "portable-composition-1".to_string(),
+                    outcome_type: "helpful".to_string(),
+                    labeled_at: Utc::now(),
+                    label_source: "test".to_string(),
+                    confidence_delta: None,
+                    notes: None,
+                    metadata: serde_json::json!({}),
+                }],
+            )
+            .unwrap();
 
         let archive = source.export_portable_archive().unwrap();
         assert_eq!(archive.archive_format, PORTABLE_ARCHIVE_FORMAT);
@@ -7596,6 +10281,16 @@ mod tests {
                 .iter()
                 .any(|table| table.name == "knowledge_nodes" && table.rows.len() == 2)
         );
+        for table_name in [
+            "composition_events",
+            "composition_members",
+            "composition_outcomes",
+        ] {
+            assert!(
+                archive.tables.iter().any(|table| table.name == table_name),
+                "{table_name} must be included in portable archive"
+            );
+        }
 
         let target = create_test_storage_at(&target_dir, "target.db");
         let report = target
@@ -7613,6 +10308,26 @@ mod tests {
         let connections = target.get_connections_for_memory(&first.id).unwrap();
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0].target_id, second.id);
+
+        let composition = target
+            .get_composition_event("portable-composition-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(composition.mode, "bounty");
+        assert_eq!(
+            target
+                .get_composition_members("portable-composition-1")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            target
+                .get_composition_outcomes("portable-composition-1")
+                .unwrap()
+                .len(),
+            1
+        );
 
         let results = target.search("alpha", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -7920,6 +10635,84 @@ mod tests {
     }
 
     #[test]
+    fn test_portable_merge_import_keeps_composition_members_for_newer_local_memory() {
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&source_dir, "source.db");
+        let target = create_test_storage_at(&target_dir, "target.db");
+
+        let node = source
+            .ingest(IngestInput {
+                content: "Shared memory with historical composition".to_string(),
+                node_type: "fact".to_string(),
+                tags: vec!["protocolgate".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+        source
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "merge-composition-1".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "bounty".to_string(),
+                    query: Some("historical composition".to_string()),
+                    query_hash: Some("sha256:historical".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: Some("Historical composition survives merge".to_string()),
+                    metadata: serde_json::json!({}),
+                },
+                &[CompositionMemberRecord {
+                    event_id: "merge-composition-1".to_string(),
+                    memory_id: node.id.clone(),
+                    role: "primary".to_string(),
+                    rank: 0,
+                    trust: Some(0.8),
+                    score: Some(0.9),
+                    preview: Some("historical".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        let archive = source.export_portable_archive().unwrap();
+        target
+            .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
+            .unwrap();
+
+        let local_time = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        {
+            let writer = target.writer.lock().unwrap();
+            writer
+                .execute(
+                    "DELETE FROM composition_members WHERE event_id = ?1",
+                    params!["merge-composition-1"],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params!["Newer local content", &local_time, &node.id],
+                )
+                .unwrap();
+        }
+
+        target
+            .import_portable_archive(&archive, PortableImportMode::Merge)
+            .unwrap();
+
+        let restored = target.get_node(&node.id).unwrap().unwrap();
+        assert_eq!(restored.content, "Newer local content");
+        let members = target
+            .get_composition_members("merge-composition-1")
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].memory_id, node.id);
+    }
+
+    #[test]
     fn test_portable_merge_import_applies_delete_tombstones() {
         let source_dir = tempdir().unwrap();
         let target_dir = tempdir().unwrap();
@@ -7964,22 +10757,71 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        source
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "portable-purge-composition".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "sync".to_string(),
+                    query: Some("portable purge preview".to_string()),
+                    query_hash: Some("fnv1a64:portable-purge".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[CompositionMemberRecord {
+                    event_id: "portable-purge-composition".to_string(),
+                    memory_id: node.id.clone(),
+                    role: "primary".to_string(),
+                    rank: 0,
+                    trust: Some(0.8),
+                    score: Some(0.8),
+                    preview: Some("Portable purge composition preview leak".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+            )
+            .unwrap();
         let archive = source.export_portable_archive().unwrap();
         target
             .import_portable_archive(&archive, PortableImportMode::EmptyOnly)
             .unwrap();
         assert!(target.get_node(&node.id).unwrap().is_some());
+        assert_eq!(
+            target
+                .get_composition_members("portable-purge-composition")
+                .unwrap()[0]
+                .preview
+                .as_deref(),
+            Some("Portable purge composition preview leak")
+        );
 
         source
             .purge_node(&node.id, Some("sync purge test"))
             .unwrap();
         let purge_archive = source.export_portable_archive().unwrap();
+        assert!(
+            !serde_json::to_string(&purge_archive)
+                .unwrap()
+                .contains("Portable purge composition preview leak"),
+            "source portable archive should not retain purged composition previews"
+        );
         let report = target
             .import_portable_archive(&purge_archive, PortableImportMode::Merge)
             .unwrap();
 
         assert!(report.rows_deleted >= 1);
         assert!(target.get_node(&node.id).unwrap().is_none());
+        assert!(
+            target
+                .get_composition_members("portable-purge-composition")
+                .unwrap()[0]
+                .preview
+                .is_none(),
+            "portable purge merge should scrub target composition previews"
+        );
 
         let writer = target.writer.lock().unwrap();
         let tombstone_count: i64 = writer
@@ -8348,6 +11190,34 @@ mod tests {
                 .unwrap();
         }
 
+        storage
+            .save_composition(
+                &CompositionEventRecord {
+                    id: "purge-composition-preview-test".to_string(),
+                    created_at: Utc::now(),
+                    tool: "deep_reference".to_string(),
+                    mode: "audit".to_string(),
+                    query: Some("purge preview leak".to_string()),
+                    query_hash: Some("fnv1a64:purge".to_string()),
+                    confidence: Some(0.7),
+                    status: Some("resolved".to_string()),
+                    output_preview: None,
+                    metadata: serde_json::json!({}),
+                },
+                &[CompositionMemberRecord {
+                    event_id: "purge-composition-preview-test".to_string(),
+                    memory_id: doomed.id.clone(),
+                    role: "primary".to_string(),
+                    rank: 0,
+                    trust: Some(0.8),
+                    score: Some(0.9),
+                    preview: Some("Sensitive purge target memory preview leak".to_string()),
+                    metadata: serde_json::json!({}),
+                }],
+                &[],
+            )
+            .unwrap();
+
         let report = storage
             .purge_node(&doomed.id, Some("user requested hard purge"))
             .unwrap();
@@ -8386,6 +11256,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tombstone_count, 1);
+
+        let members = storage
+            .get_composition_members("purge-composition-preview-test")
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert!(
+            members[0].preview.is_none(),
+            "purge should scrub composition member previews for the purged memory"
+        );
+        let archive_json =
+            serde_json::to_string(&storage.export_portable_archive().unwrap()).unwrap();
+        assert!(
+            !archive_json.contains("Sensitive purge target memory preview leak"),
+            "portable archive should not retain purged memory content through composition previews"
+        );
 
         let has_content_column: i64 = writer
             .query_row(
@@ -8453,6 +11338,187 @@ mod tests {
         v
     }
 
+    // =========================================================================
+    // Phase 1 trait-method unit tests
+    // =========================================================================
+    use crate::storage::memory_store::{
+        MemoryEdge, MemoryRecord, MemoryStore, MemoryStoreError, ModelSignature, SchedulingState,
+    };
+
+    fn make_record(content: &str) -> MemoryRecord {
+        MemoryRecord {
+            id: uuid::Uuid::new_v4(),
+            domains: vec![],
+            domain_scores: Default::default(),
+            content: content.to_string(),
+            node_type: "fact".to_string(),
+            tags: vec!["test".to_string()],
+            embedding: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().unwrap()
+    }
+
+    #[test]
+    fn trait_init_is_idempotent() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            s.init().await.unwrap();
+            s.init().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn trait_health_check_reports_healthy_on_fresh_db() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let h = s.health_check().await.unwrap();
+            assert!(matches!(
+                h,
+                crate::storage::memory_store::HealthStatus::Healthy
+            ));
+        });
+    }
+
+    #[test]
+    fn trait_register_model_first_write_succeeds() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "a".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            let got = s.registered_model().await.unwrap();
+            assert_eq!(got, Some(sig));
+        });
+    }
+
+    #[test]
+    fn trait_register_model_mismatched_write_refused() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "model-a".to_string(),
+            dimension: 256,
+            hash: "a".repeat(64),
+        };
+        let sig2 = ModelSignature {
+            name: "model-b".to_string(),
+            dimension: 256,
+            hash: "b".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            let err = s.register_model(&sig2).await.unwrap_err();
+            assert!(matches!(err, MemoryStoreError::ModelMismatch { .. }));
+        });
+    }
+
+    #[test]
+    fn trait_register_model_same_signature_idempotent() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "a".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            s.register_model(&sig).await.unwrap(); // second call must not error
+        });
+    }
+
+    #[test]
+    fn trait_insert_returns_uuid() {
+        let s = create_test_storage();
+        let rec = make_record("test content");
+        let expected_id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            let got = s.insert(&rec).await.unwrap();
+            assert_eq!(got, expected_id);
+        });
+    }
+
+    #[test]
+    fn trait_get_missing_returns_none() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let got = s.get(uuid::Uuid::new_v4()).await.unwrap();
+            assert!(got.is_none());
+        });
+    }
+
+    #[test]
+    fn trait_get_after_insert_round_trip() {
+        let s = create_test_storage();
+        let rec = make_record("round trip content");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            let got = s.get(id).await.unwrap().unwrap();
+            assert_eq!(got.content, "round trip content");
+            assert_eq!(got.node_type, "fact");
+            assert!(got.domains.is_empty());
+            assert!(got.domain_scores.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_update_modifies_content() {
+        let s = create_test_storage();
+        let rec = make_record("original content");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            let mut updated = s.get(id).await.unwrap().unwrap();
+            updated.content = "updated content".to_string();
+            s.update(&updated).await.unwrap();
+            let got = s.get(id).await.unwrap().unwrap();
+            assert_eq!(got.content, "updated content");
+        });
+    }
+
+    #[test]
+    fn trait_delete_removes_record() {
+        let s = create_test_storage();
+        let rec = make_record("to be deleted");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            s.delete(id).await.unwrap();
+            let got = s.get(id).await.unwrap();
+            assert!(got.is_none());
+        });
+    }
+
+    #[test]
+    fn trait_fts_search_returns_tokens_match() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec = make_record("mitochondria powerhouse cell energy");
+            s.insert(&rec).await.unwrap();
+            let results = s.fts_search("mitochondria", 10).await.unwrap();
+            assert!(!results.is_empty());
+        });
+    }
+
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     #[test]
     fn test_merge_candidates_threshold_classification() {
@@ -8496,7 +11562,12 @@ mod tests {
     #[test]
     fn test_plan_merge_is_preview_only_no_mutation() {
         let storage = create_test_storage();
-        let a = seed_node(&storage, "Fact A about caching", &["perf"], axis_vector(5, 0.02));
+        let a = seed_node(
+            &storage,
+            "Fact A about caching",
+            &["perf"],
+            axis_vector(5, 0.02),
+        );
         let b = seed_node(
             &storage,
             "Fact A about caching, expanded",
@@ -8524,14 +11595,22 @@ mod tests {
         assert!(vu_b.is_none() && sb_b.is_none());
 
         // Plan persisted as pending.
-        assert_eq!(storage.plan_status(&plan.id).unwrap().as_deref(), Some("pending"));
+        assert_eq!(
+            storage.plan_status(&plan.id).unwrap().as_deref(),
+            Some("pending")
+        );
     }
 
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     #[test]
     fn test_apply_then_undo_merge_is_reversible() {
         let storage = create_test_storage();
-        let survivor = seed_node(&storage, "Keep this canonical note", &["x"], axis_vector(7, 0.02));
+        let survivor = seed_node(
+            &storage,
+            "Keep this canonical note",
+            &["x"],
+            axis_vector(7, 0.02),
+        );
         let absorbed = seed_node(
             &storage,
             "Extra detail to fold in",
@@ -8572,7 +11651,10 @@ mod tests {
         let surv_after = storage.get_node(&survivor).unwrap().unwrap();
         assert_eq!(surv_after.content, "Keep this canonical note");
         let (vu2, sb2) = storage.read_bitemporal(&absorbed).unwrap();
-        assert!(vu2.is_none() && sb2.is_none(), "invalidation cleared on undo");
+        assert!(
+            vu2.is_none() && sb2.is_none(),
+            "invalidation cleared on undo"
+        );
         assert!(!storage.superseded_node_ids().unwrap().contains(&absorbed));
 
         // The original op is now marked reverted; double-undo is rejected.
@@ -8621,7 +11703,12 @@ mod tests {
     #[test]
     fn test_protect_blocks_merge_away() {
         let storage = create_test_storage();
-        let pinned = seed_node(&storage, "Load-bearing fact", &["pin"], axis_vector(11, 0.02));
+        let pinned = seed_node(
+            &storage,
+            "Load-bearing fact",
+            &["pin"],
+            axis_vector(11, 0.02),
+        );
         let other = seed_node(
             &storage,
             "Load-bearing fact restated",
@@ -8632,7 +11719,11 @@ mod tests {
         assert!(storage.is_protected(&pinned).unwrap());
 
         // Protected node may not be merged AWAY (survivor=other).
-        let err = storage.plan_merge(&[other.clone(), pinned.clone()], Some(&other), MergePolicy::default());
+        let err = storage.plan_merge(
+            &[other.clone(), pinned.clone()],
+            Some(&other),
+            MergePolicy::default(),
+        );
         assert!(err.is_err(), "merging a protected node away must fail");
 
         // But it CAN be the survivor.
@@ -8645,12 +11736,16 @@ mod tests {
 
         // Supersede of a protected node is also blocked.
         assert!(
-            storage.plan_supersede(&pinned, &other, MergePolicy::default()).is_err(),
+            storage
+                .plan_supersede(&pinned, &other, MergePolicy::default())
+                .is_err(),
             "superseding a protected node must fail"
         );
 
         // merge_candidates flags the protected member.
-        let cands = storage.merge_candidates(MergePolicy::default(), 20, &[]).unwrap();
+        let cands = storage
+            .merge_candidates(MergePolicy::default(), 20, &[])
+            .unwrap();
         assert!(cands.iter().all(|c| c.has_protected_member));
     }
 
@@ -8664,7 +11759,9 @@ mod tests {
 
         let a = seed_node(&storage, "Topic alpha note", &["t"], axis_vector(13, 0.30));
         let b = seed_node(&storage, "Topic alpha aside", &["t"], axis_vector(13, 0.60));
-        let plan = storage.plan_merge(&[a, b], None, storage.get_merge_policy().unwrap()).unwrap();
+        let plan = storage
+            .plan_merge(&[a, b], None, storage.get_merge_policy().unwrap())
+            .unwrap();
         assert_ne!(plan.classification, MatchClass::Match);
 
         // Without confirm => rejected.
@@ -8691,5 +11788,338 @@ mod tests {
     fn test_set_protected_unknown_node_errors() {
         let storage = create_test_storage();
         assert!(storage.set_protected("does-not-exist", true).is_err());
+    }
+
+    #[test]
+    fn trait_hybrid_search_multi_word_via_insert() {
+        // Verify that hybrid_search finds records inserted via the trait insert()
+        // even when no embedding is present (keyword path via terms matching).
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec = make_record("quantum entanglement superposition physics");
+            s.insert(&rec).await.unwrap();
+            let results = s.hybrid_search("quantum physics", 10, 0.3, 0.7).unwrap();
+            assert!(
+                !results.is_empty(),
+                "hybrid_search must find record containing 'quantum' and 'physics'"
+            );
+        });
+    }
+
+    #[test]
+    fn trait_scheduling_round_trip() {
+        let s = create_test_storage();
+        let rec = make_record("fsrs scheduling test");
+        let id = rec.id;
+        let rt = rt();
+        rt.block_on(async {
+            s.insert(&rec).await.unwrap();
+            let state = SchedulingState {
+                memory_id: id,
+                stability: 5.0,
+                difficulty: 0.4,
+                retrievability: 0.8,
+                last_review: Some(chrono::Utc::now()),
+                next_review: Some(chrono::Utc::now() + chrono::Duration::days(7)),
+                reps: 3,
+                lapses: 1,
+            };
+            s.update_scheduling(&state).await.unwrap();
+            let got = s.get_scheduling(id).await.unwrap().unwrap();
+            assert!((got.stability - 5.0).abs() < 0.01);
+        });
+    }
+
+    #[test]
+    fn trait_get_scheduling_missing_returns_none() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let got = s.get_scheduling(uuid::Uuid::new_v4()).await.unwrap();
+            assert!(got.is_none());
+        });
+    }
+
+    #[test]
+    fn trait_get_due_memories_returns_in_order() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            for i in 0..3usize {
+                let rec = make_record(&format!("due memory {i}"));
+                let id = rec.id;
+                s.insert(&rec).await.unwrap();
+                let state = SchedulingState {
+                    memory_id: id,
+                    stability: 1.0,
+                    difficulty: 0.3,
+                    retrievability: 0.5,
+                    last_review: Some(chrono::Utc::now()),
+                    next_review: Some(chrono::Utc::now() - chrono::Duration::days(3 - i as i64)),
+                    reps: 1,
+                    lapses: 0,
+                };
+                s.update_scheduling(&state).await.unwrap();
+            }
+            let due = s.get_due_memories(chrono::Utc::now(), 10).await.unwrap();
+            assert_eq!(due.len(), 3);
+        });
+    }
+
+    #[test]
+    fn trait_add_edge_is_idempotent() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("node a");
+            let rec_b = make_record("node b");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            let edge = MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "semantic".to_string(),
+                weight: 0.9,
+                created_at: chrono::Utc::now(),
+            };
+            s.add_edge(&edge).await.unwrap();
+            s.add_edge(&edge).await.unwrap(); // idempotent
+            let edges = s.get_edges(id_a, None).await.unwrap();
+            let filtered: Vec<_> = edges
+                .iter()
+                .filter(|e| e.source_id == id_a && e.target_id == id_b)
+                .collect();
+            assert_eq!(filtered.len(), 1, "edge must not be duplicated");
+        });
+    }
+
+    #[test]
+    fn trait_get_edges_filters_by_type() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("filter a");
+            let rec_b = make_record("filter b");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            let edge = MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "causal".to_string(),
+                weight: 0.5,
+                created_at: chrono::Utc::now(),
+            };
+            s.add_edge(&edge).await.unwrap();
+            let causal = s.get_edges(id_a, Some("causal")).await.unwrap();
+            assert!(!causal.is_empty());
+            let semantic = s.get_edges(id_a, Some("semantic")).await.unwrap();
+            assert!(semantic.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_remove_edge_deletes_single() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("rm edge a");
+            let rec_b = make_record("rm edge b");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            let edge = MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "semantic".to_string(),
+                weight: 0.7,
+                created_at: chrono::Utc::now(),
+            };
+            s.add_edge(&edge).await.unwrap();
+            s.remove_edge(id_a, id_b).await.unwrap();
+            let edges = s.get_edges(id_a, None).await.unwrap();
+            assert!(edges.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_get_neighbors_bfs_depth_zero_returns_self_only() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec = make_record("depth zero");
+            let id = rec.id;
+            s.insert(&rec).await.unwrap();
+            let neighbors = s.get_neighbors(id, 0).await.unwrap();
+            assert_eq!(neighbors.len(), 1);
+            assert_eq!(neighbors[0].0.id, id);
+        });
+    }
+
+    #[test]
+    fn trait_get_neighbors_bfs_depth_two_expands() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let rec_a = make_record("bfs node a");
+            let rec_b = make_record("bfs node b");
+            let rec_c = make_record("bfs node c");
+            let id_a = rec_a.id;
+            let id_b = rec_b.id;
+            let id_c = rec_c.id;
+            s.insert(&rec_a).await.unwrap();
+            s.insert(&rec_b).await.unwrap();
+            s.insert(&rec_c).await.unwrap();
+            s.add_edge(&MemoryEdge {
+                source_id: id_a,
+                target_id: id_b,
+                edge_type: "semantic".to_string(),
+                weight: 1.0,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+            s.add_edge(&MemoryEdge {
+                source_id: id_b,
+                target_id: id_c,
+                edge_type: "semantic".to_string(),
+                weight: 1.0,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+            let neighbors = s.get_neighbors(id_a, 2).await.unwrap();
+            let ids: Vec<uuid::Uuid> = neighbors.iter().map(|(r, _)| r.id).collect();
+            assert!(ids.contains(&id_a));
+            assert!(ids.contains(&id_b));
+            assert!(ids.contains(&id_c));
+        });
+    }
+
+    #[test]
+    fn trait_list_domains_empty_in_phase_1() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let domains = s.list_domains().await.unwrap();
+            assert!(domains.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_upsert_then_get_domain_round_trip() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let domain = crate::storage::memory_store::Domain {
+                id: "dev".to_string(),
+                label: "Development".to_string(),
+                centroid: vec![0.1, 0.2, 0.3],
+                top_terms: vec!["rust".to_string(), "code".to_string()],
+                memory_count: 42,
+                created_at: chrono::Utc::now(),
+            };
+            s.upsert_domain(&domain).await.unwrap();
+            let got = s.get_domain("dev").await.unwrap().unwrap();
+            assert_eq!(got.id, "dev");
+            assert_eq!(got.memory_count, 42);
+        });
+    }
+
+    #[test]
+    fn trait_delete_domain_idempotent() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            s.delete_domain("nonexistent").await.unwrap();
+            s.delete_domain("nonexistent").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn trait_classify_with_no_domains_returns_empty() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            let result = s.classify(&[0.1, 0.2, 0.3]).await.unwrap();
+            assert!(result.is_empty());
+        });
+    }
+
+    #[test]
+    fn trait_count_matches_insert_count() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            for i in 0..5usize {
+                let rec = make_record(&format!("count test {i}"));
+                s.insert(&rec).await.unwrap();
+            }
+            assert_eq!(s.count().await.unwrap(), 5);
+        });
+    }
+
+    #[test]
+    fn trait_get_stats_reports_registered_model() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "c".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            use crate::storage::memory_store::MemoryStore;
+            // Cast to &dyn MemoryStore so the async trait method is called
+            // instead of the inherent sync get_stats() on SqliteMemoryStore.
+            let dyn_s: &dyn MemoryStore = &s;
+            dyn_s.register_model(&sig).await.unwrap();
+            let stats = dyn_s.get_stats().await.unwrap();
+            assert_eq!(stats.registered_model_name, Some("test-model".to_string()));
+            assert_eq!(stats.registered_model_dim, Some(256));
+        });
+    }
+
+    #[test]
+    fn trait_vacuum_succeeds() {
+        let s = create_test_storage();
+        let rt = rt();
+        rt.block_on(async {
+            s.vacuum().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn trait_insert_refuses_dimension_mismatch() {
+        let s = create_test_storage();
+        let sig = ModelSignature {
+            name: "test-model".to_string(),
+            dimension: 256,
+            hash: "d".repeat(64),
+        };
+        let rt = rt();
+        rt.block_on(async {
+            s.register_model(&sig).await.unwrap();
+            // Build a record with wrong dimension (512 instead of 256) and
+            // declare the model signature in metadata
+            let mut rec = make_record("dimension mismatch");
+            rec.embedding = Some(vec![0.0f32; 512]);
+            rec.metadata = serde_json::json!({
+                "model_name": "test-model",
+                "model_dim": 256_u64,
+                "model_hash": "d".repeat(64),
+            });
+            let err = s.insert(&rec).await.unwrap_err();
+            assert!(
+                matches!(err, MemoryStoreError::InvalidInput(_)),
+                "expected InvalidInput, got {:?}",
+                err
+            );
+        });
     }
 }

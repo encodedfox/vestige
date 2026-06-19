@@ -41,6 +41,7 @@ pub mod graph;
 pub mod health;
 
 // v2.1: Cross-reference (connect the dots)
+pub mod composed_graph;
 pub mod contradictions;
 pub mod cross_reference;
 

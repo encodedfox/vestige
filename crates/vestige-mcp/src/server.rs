@@ -443,6 +443,12 @@ impl McpServer {
                 input_schema: tools::graph::schema(),
                 ..Default::default()
             },
+            ToolDescription {
+                name: "composed_graph".to_string(),
+                description: Some("ComposedGraph memory topology. Reads durable composition events, members, and outcome labels; returns recent/already-composed lanes, neighbors, never-composed pairs, bounty-mode lanes, and lets users label outcomes such as helpful, submitted, accepted, rejected, duplicate_risk, needs_poc, or dead_end.".to_string()),
+                input_schema: tools::composed_graph::schema(),
+                ..Default::default()
+            },
             // ================================================================
             // DEEP REFERENCE (v2.0.4+) — replaces cross_reference
             // ================================================================
@@ -959,7 +965,8 @@ impl McpServer {
             // TEMPORAL TOOLS (v1.2+)
             // ================================================================
             "memory_timeline" => {
-                tools::timeline::execute(&self.storage, &self.output_config, request.arguments).await
+                tools::timeline::execute(&self.storage, &self.output_config, request.arguments)
+                    .await
             }
             "memory_changelog" => tools::changelog::execute(&self.storage, request.arguments).await,
 
@@ -1032,6 +1039,9 @@ impl McpServer {
             // ================================================================
             "memory_health" => tools::health::execute(&self.storage, request.arguments).await,
             "memory_graph" => tools::graph::execute(&self.storage, request.arguments).await,
+            "composed_graph" => {
+                tools::composed_graph::execute(&self.storage, request.arguments).await
+            }
             "deep_reference" | "cross_reference" => {
                 tools::cross_reference::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
@@ -1796,10 +1806,10 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // v2.1.25: 32 tools (25 from v2.1.21 + 7 Phase 3 merge/supersede tools:
+        // 33 tools: 25 from v2.1.21 + 7 Phase 3 merge/supersede tools:
         // merge_candidates, plan_merge, plan_supersede, apply_plan, merge_undo,
-        // protect, merge_policy)
-        assert_eq!(tools.len(), 32, "Expected exactly 32 tools in v2.1.25");
+        // protect, merge_policy, composed_graph)
+        assert_eq!(tools.len(), 33, "Expected exactly 33 tools");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -1874,6 +1884,7 @@ mod tests {
         // Autonomic tools (v1.9)
         assert!(tool_names.contains(&"memory_health"));
         assert!(tool_names.contains(&"memory_graph"));
+        assert!(tool_names.contains(&"composed_graph"));
 
         // Deep reference + cross_reference alias (v2.0.4)
         assert!(tool_names.contains(&"deep_reference"));
