@@ -293,6 +293,7 @@ struct PortableMergeState {
 
 const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
 const DATABASE_FILE: &str = "vestige.db";
+const VESTIGE_DISABLE_VECTOR_SEARCH: &str = "VESTIGE_DISABLE_VECTOR_SEARCH";
 
 /// Main storage struct with integrated embedding and vector search
 ///
@@ -307,15 +308,63 @@ pub struct SqliteMemoryStore {
     #[cfg(feature = "embeddings")]
     embedding_service: EmbeddingService,
     #[cfg(feature = "vector-search")]
-    vector_index: Mutex<VectorIndex>,
+    vector_index: Option<Mutex<VectorIndex>>,
     /// LRU cache for query embeddings to avoid re-embedding repeated queries
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    query_cache: Mutex<LruCache<String, Vec<f32>>>,
+    query_cache: Option<Mutex<LruCache<String, Vec<f32>>>>,
     /// Cached model signature. `None` until the first embedding is written.
     registered_model: std::sync::RwLock<Option<crate::storage::memory_store::ModelSignature>>,
 }
 
 impl SqliteMemoryStore {
+    #[cfg(feature = "vector-search")]
+    fn vector_search_enabled_by_cpu() -> bool {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let has_required_features = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma");
+
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let has_required_features = true;
+
+        let disabled_by_env = std::env::var_os(VESTIGE_DISABLE_VECTOR_SEARCH)
+            .and_then(|v| {
+                let value = v.to_ascii_lowercase();
+                if value == "1"
+                    || value == "true"
+                    || value == "yes"
+                    || value == "on"
+                    || value == "enable"
+                    || value == "enabled"
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some();
+
+        has_required_features && !disabled_by_env
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn vector_search_unavailable_reason() -> Option<&'static str> {
+        if std::env::var_os(VESTIGE_DISABLE_VECTOR_SEARCH).is_some() {
+            return Some("disabled by VESTIGE_DISABLE_VECTOR_SEARCH");
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                return Some("unsupported CPU: AVX2 required");
+            }
+            if !std::arch::is_x86_feature_detected!("fma") {
+                return Some("unsupported CPU: FMA required");
+            }
+        }
+
+        None
+    }
+
     fn data_dir_from_env() -> Option<PathBuf> {
         std::env::var_os(DATA_DIR_ENV).and_then(|value| {
             if value.is_empty() {
@@ -439,15 +488,26 @@ impl SqliteMemoryStore {
         let embedding_service = EmbeddingService::new();
 
         #[cfg(feature = "vector-search")]
-        let vector_index = VectorIndex::new()
-            .map_err(|e| StorageError::Init(format!("Failed to create vector index: {}", e)))?;
+        let vector_index = if Self::vector_search_enabled_by_cpu() {
+            let vector_index = VectorIndex::new()
+                .map_err(|e| StorageError::Init(format!("Failed to create vector index: {}", e)))?;
+            Some(Mutex::new(vector_index))
+        } else {
+            tracing::warn!(
+                "Vector search disabled: {}",
+                Self::vector_search_unavailable_reason().unwrap_or("manual override"),
+            );
+            None
+        };
 
-        // Initialize LRU cache for query embeddings (capacity: 100 queries)
-        // SAFETY: 100 is always non-zero, this cannot fail
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        let query_cache = Mutex::new(LruCache::new(
-            NonZeroUsize::new(100).expect("100 is non-zero"),
-        ));
+        let query_cache = if vector_index.is_some() {
+            Some(Mutex::new(LruCache::new(
+                NonZeroUsize::new(100).expect("100 is non-zero"),
+            )))
+        } else {
+            None
+        };
 
         let storage = Self {
             db_path: path,
@@ -457,14 +517,16 @@ impl SqliteMemoryStore {
             #[cfg(feature = "embeddings")]
             embedding_service,
             #[cfg(feature = "vector-search")]
-            vector_index: Mutex::new(vector_index),
+            vector_index,
             #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             query_cache,
             registered_model: std::sync::RwLock::new(None),
         };
 
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        storage.load_embeddings_into_index()?;
+        if storage.vector_index.is_some() {
+            storage.load_embeddings_into_index()?;
+        }
 
         Ok(storage)
     }
@@ -487,8 +549,11 @@ impl SqliteMemoryStore {
     /// Load existing embeddings into vector index
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn load_embeddings_into_index(&self) -> Result<()> {
-        let mut index = self
-            .vector_index
+        let Some(index) = self.vector_index.as_ref() else {
+            return Ok(());
+        };
+
+        let mut index = index
             .lock()
             .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
         let reader = self
@@ -998,8 +1063,10 @@ impl SqliteMemoryStore {
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
             // Remove old embedding from index
-            if let Ok(mut index) = self.vector_index.lock() {
-                let _ = index.remove(id);
+            if let Some(index) = self.vector_index.as_ref() {
+                if let Ok(mut index) = index.lock() {
+                    let _ = index.remove(id);
+                }
             }
             // Generate new embedding
             if let Err(e) = self.generate_embedding_for_node(id, new_content) {
@@ -1048,13 +1115,14 @@ impl SqliteMemoryStore {
             )?;
         }
 
-        let mut index = self
-            .vector_index
-            .lock()
-            .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
-        index
-            .add(node_id, &embedding.vector)
-            .map_err(|e| StorageError::Init(format!("Vector index add failed: {}", e)))?;
+        if let Some(index) = self.vector_index.as_ref() {
+            let mut index = index
+                .lock()
+                .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
+            index
+                .add(node_id, &embedding.vector)
+                .map_err(|e| StorageError::Init(format!("Vector index add failed: {}", e)))?;
+        }
 
         Ok(())
     }
@@ -1388,35 +1456,36 @@ impl SqliteMemoryStore {
         // Content-aware cross-memory reinforcement: boost semantically similar neighbors
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
-            if let Ok(Some(embedding)) = self.get_node_embedding(id) {
-                let index = self
-                    .vector_index
-                    .lock()
-                    .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
+            if let Some(index) = self.vector_index.as_ref() {
+                if let Ok(Some(embedding)) = self.get_node_embedding(id) {
+                    let index = index.lock().map_err(|_| {
+                        StorageError::Init("Vector index lock poisoned".to_string())
+                    })?;
 
-                // Query top-6 similar (one will be self, so we get ~5 neighbors)
-                let neighbors_result = index.search(&embedding, 6);
-                drop(index);
+                    // Query top-6 similar (one will be self, so we get ~5 neighbors)
+                    let neighbors_result = index.search(&embedding, 6);
+                    drop(index);
 
-                if let Ok(neighbors) = neighbors_result {
-                    let writer = self
-                        .writer
-                        .lock()
-                        .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
-                    for (neighbor_id, similarity) in neighbors {
-                        if neighbor_id == id || similarity < 0.7 {
-                            continue;
+                    if let Ok(neighbors) = neighbors_result {
+                        let writer = self
+                            .writer
+                            .lock()
+                            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+                        for (neighbor_id, similarity) in neighbors {
+                            if neighbor_id == id || similarity < 0.7 {
+                                continue;
+                            }
+                            // Diminished boost: 0.02 * similarity (max ~0.02)
+                            let boost = 0.02 * similarity as f64;
+                            let retention_boost = 0.008 * similarity as f64;
+                            let _ = writer.execute(
+                                "UPDATE knowledge_nodes SET
+                                    retrieval_strength = MIN(1.0, retrieval_strength + ?1),
+                                    retention_strength = MIN(1.0, retention_strength + ?2)
+                                WHERE id = ?3",
+                                params![boost, retention_boost, neighbor_id],
+                            );
                         }
-                        // Diminished boost: 0.02 * similarity (max ~0.02)
-                        let boost = 0.02 * similarity as f64;
-                        let retention_boost = 0.008 * similarity as f64;
-                        let _ = writer.execute(
-                            "UPDATE knowledge_nodes SET
-                                retrieval_strength = MIN(1.0, retrieval_strength + ?1),
-                                retention_strength = MIN(1.0, retention_strength + ?2)
-                            WHERE id = ?3",
-                            params![boost, retention_boost, neighbor_id],
-                        );
                     }
                 }
             }
@@ -2031,10 +2100,12 @@ impl SqliteMemoryStore {
 
         // Clean up vector index to prevent stale search results
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if rows > 0
-            && let Ok(mut index) = self.vector_index.lock()
-        {
-            let _ = index.remove(id);
+        if rows > 0 {
+            if let Some(index) = self.vector_index.as_ref() {
+                if let Ok(mut index) = index.lock() {
+                    let _ = index.remove(id);
+                }
+            }
         }
 
         Ok(rows > 0)
@@ -2153,8 +2224,10 @@ impl SqliteMemoryStore {
         tx.commit()?;
 
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if let Ok(mut index) = self.vector_index.lock() {
-            let _ = index.remove(id);
+        if let Some(index) = self.vector_index.as_ref() {
+            if let Ok(mut index) = index.lock() {
+                let _ = index.remove(id);
+            }
         }
 
         Ok(PurgeReport {
@@ -2551,9 +2624,11 @@ impl SqliteMemoryStore {
     fn get_query_embedding(&self, query: &str) -> Result<Vec<f32>> {
         let cache_key = format!("{}\0{}", self.embedding_service.model_name(), query);
         // Check cache first
+        let Some(index_cache) = self.query_cache.as_ref() else {
+            return Err(StorageError::Init("Query cache unavailable".to_string()));
+        };
         {
-            let mut cache = self
-                .query_cache
+            let mut cache = index_cache
                 .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
             if let Some(cached) = cache.get(&cache_key) {
@@ -2569,8 +2644,7 @@ impl SqliteMemoryStore {
 
         // Store in cache
         {
-            let mut cache = self
-                .query_cache
+            let mut cache = index_cache
                 .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
             cache.put(cache_key, embedding.vector.clone());
@@ -2591,10 +2665,15 @@ impl SqliteMemoryStore {
             return Err(StorageError::Init("Embedding model not ready".to_string()));
         }
 
+        let Some(index_lock) = self.vector_index.as_ref() else {
+            return Err(StorageError::Init(
+                "Vector search unavailable: disabled for this machine".to_string(),
+            ));
+        };
+
         let query_embedding = self.get_query_embedding(query)?;
 
-        let index = self
-            .vector_index
+        let index = index_lock
             .lock()
             .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
 
@@ -2911,6 +2990,9 @@ impl SqliteMemoryStore {
         if !self.embedding_service.is_ready() {
             return Ok(vec![]);
         }
+        self.vector_index.as_ref().ok_or_else(|| {
+            StorageError::Init("Vector search unavailable: disabled for this machine".to_string())
+        })?;
 
         // HyDE query expansion: for conceptual queries, embed expanded variants
         // and use the centroid for broader semantic coverage
@@ -2934,8 +3016,8 @@ impl SqliteMemoryStore {
             _ => self.get_query_embedding(query)?,
         };
 
-        let index = self
-            .vector_index
+        let index = self.vector_index.as_ref().unwrap();
+        let index = index
             .lock()
             .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
 
@@ -7095,11 +7177,13 @@ impl SqliteMemoryStore {
 
         // Clean up vector index
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if deleted > 0
-            && let Ok(mut index) = self.vector_index.lock()
-        {
-            for id in &doomed_ids {
-                let _ = index.remove(id);
+        if deleted > 0 {
+            if let Some(index) = self.vector_index.as_ref() {
+                if let Ok(mut index) = index.lock() {
+                    for id in &doomed_ids {
+                        let _ = index.remove(id);
+                    }
+                }
             }
         }
 
@@ -8772,8 +8856,10 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
         use crate::storage::memory_store::{MemoryStoreError, SearchResult};
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
-            let index = self
-                .vector_index
+            let Some(index) = self.vector_index.as_ref() else {
+                return Ok(vec![]);
+            };
+            let index = index
                 .lock()
                 .map_err(|_| MemoryStoreError::Init("Vector index lock poisoned".into()))?;
             let raw_results = index
