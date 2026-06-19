@@ -417,7 +417,9 @@ mod tests {
         // Limit 5 against 12 total — before the fix, `retain` on `concept`
         // would operate on the 5 most recent rows (all `fact`) and find 0.
         let args = serde_json::json!({ "node_type": "concept", "limit": 5 });
-        let value = execute(&storage, &OutputConfig::default(), Some(args)).await.unwrap();
+        let value = execute(&storage, &OutputConfig::default(), Some(args))
+            .await
+            .unwrap();
         assert_eq!(
             value["totalMemories"], 2,
             "Both sparse concepts should survive a limit smaller than the dominant set"
@@ -455,7 +457,9 @@ mod tests {
         }
 
         let args = serde_json::json!({ "tags": ["rare"], "limit": 5 });
-        let value = execute(&storage, &OutputConfig::default(), Some(args)).await.unwrap();
+        let value = execute(&storage, &OutputConfig::default(), Some(args))
+            .await
+            .unwrap();
         assert_eq!(
             value["totalMemories"], 2,
             "Both sparse-tag matches should survive a limit smaller than the dominant set"

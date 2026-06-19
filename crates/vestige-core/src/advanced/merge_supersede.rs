@@ -401,7 +401,10 @@ mod tests {
             "totally unrelated subject beta",
         );
         assert!(s.combined_score < 0.3);
-        assert_eq!(MergePolicy::default().classify(s.combined_score), MatchClass::NonMatch);
+        assert_eq!(
+            MergePolicy::default().classify(s.combined_score),
+            MatchClass::NonMatch
+        );
     }
 
     #[test]

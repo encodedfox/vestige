@@ -143,8 +143,7 @@ pub async fn execute_system_status(
 ) -> Result<Value, String> {
     // Parse arguments (all optional, including the args envelope itself).
     let parsed: SystemStatusArgs = match args {
-        Some(v) => serde_json::from_value(v)
-            .map_err(|e| format!("Invalid arguments: {}", e))?,
+        Some(v) => serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {}", e))?,
         None => SystemStatusArgs::default(),
     };
     let include_schema = parsed.schema_introspection.unwrap_or(false);

@@ -568,7 +568,13 @@ mod tests {
         let args = serde_json::json!({
             "queries": ["user preferences", "project context"]
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
 
         let value = result.unwrap();
@@ -596,7 +602,13 @@ mod tests {
             "queries": ["memory"],
             "token_budget": 200
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
 
         let value = result.unwrap();
@@ -632,7 +644,13 @@ mod tests {
             "queries": ["expandable test memory"],
             "token_budget": 150
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
 
         let value = result.unwrap();
@@ -663,7 +681,13 @@ mod tests {
             "include_intentions": false,
             "include_predictions": false
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
 
         let value = result.unwrap();
@@ -697,7 +721,13 @@ mod tests {
                 "topics": ["performance"]
             }
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
 
         let value = result.unwrap();
@@ -715,9 +745,14 @@ mod tests {
 
         // Default profile -> profile echoed, dates present.
         let args = serde_json::json!({ "queries": ["profile content"] });
-        let value = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args))
-            .await
-            .unwrap();
+        let value = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await
+        .unwrap();
         assert_eq!(value["profile"], "default");
 
         // Lean profile -> profile echoed as lean. The memory line must not carry

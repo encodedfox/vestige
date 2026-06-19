@@ -152,7 +152,11 @@ pub fn merge_policy_schema() -> Value {
 // ============================================================================
 
 /// Route a merge/supersede tool call by tool name.
-pub async fn execute(storage: &Arc<Storage>, tool: &str, args: Option<Value>) -> Result<Value, String> {
+pub async fn execute(
+    storage: &Arc<Storage>,
+    tool: &str,
+    args: Option<Value>,
+) -> Result<Value, String> {
     match tool {
         "merge_candidates" => merge_candidates(storage, args),
         "plan_merge" => plan_merge(storage, args),
@@ -304,7 +308,8 @@ fn plan_supersede(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, 
 
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 fn plan_to_json(plan: &vestige_core::MergePlan, policy: &vestige_core::MergePolicy) -> Value {
-    let requires_confirm = plan.classification != vestige_core::MatchClass::Match || !policy.auto_apply;
+    let requires_confirm =
+        plan.classification != vestige_core::MatchClass::Match || !policy.auto_apply;
     json!({
         "planId": plan.id,
         "kind": plan.kind.as_str(),
@@ -393,7 +398,9 @@ fn merge_undo(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, Stri
             }
             None => {
                 // No id => return the reflog so the caller can pick one.
-                let ops = storage.list_merge_operations(20).map_err(|e| e.to_string())?;
+                let ops = storage
+                    .list_merge_operations(20)
+                    .map_err(|e| e.to_string())?;
                 let log: Vec<Value> = ops
                     .iter()
                     .map(|op| {
@@ -478,7 +485,9 @@ fn merge_policy(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, St
             .and_then(|v| v.as_bool())
             .unwrap_or(current.auto_apply);
         let policy = vestige_core::MergePolicy::new(match_t, possible_t, auto);
-        storage.set_merge_policy(policy).map_err(|e| e.to_string())?;
+        storage
+            .set_merge_policy(policy)
+            .map_err(|e| e.to_string())?;
         Ok(json!({
             "updated": true,
             "matchThreshold": policy.match_threshold,
@@ -521,10 +530,12 @@ mod tests {
 
     #[test]
     fn plan_merge_requires_two_ids() {
-        assert!(plan_merge_schema()["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "member_ids"));
+        assert!(
+            plan_merge_schema()["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "member_ids")
+        );
     }
 }

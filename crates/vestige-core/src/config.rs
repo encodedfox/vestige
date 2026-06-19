@@ -242,9 +242,7 @@ impl OutputConfig {
     /// tool's own built-in fallback (used only when neither param nor config
     /// supplies one).
     pub fn resolve_limit(&self, explicit: Option<i32>, builtin_default: i32) -> i32 {
-        explicit
-            .or(self.limit)
-            .unwrap_or(builtin_default)
+        explicit.or(self.limit).unwrap_or(builtin_default)
     }
 }
 
@@ -288,7 +286,10 @@ mod tests {
     #[test]
     fn empty_or_missing_file_is_default() {
         assert_eq!(VestigeConfig::parse(""), VestigeConfig::default());
-        assert_eq!(VestigeConfig::parse("\n\n# just a comment\n"), VestigeConfig::default());
+        assert_eq!(
+            VestigeConfig::parse("\n\n# just a comment\n"),
+            VestigeConfig::default()
+        );
     }
 
     #[test]
@@ -308,9 +309,7 @@ mod tests {
 
     #[test]
     fn unquoted_and_commented_values() {
-        let cfg = VestigeConfig::parse(
-            "[defaults]\nprofile = lean # inline comment\nlimit = 7\n",
-        );
+        let cfg = VestigeConfig::parse("[defaults]\nprofile = lean # inline comment\nlimit = 7\n");
         assert_eq!(cfg.defaults.profile, OutputProfile::Lean);
         assert_eq!(cfg.defaults.limit, Some(7));
     }
@@ -357,10 +356,9 @@ mod tests {
     #[test]
     fn explicit_defaults_override_profile_presets() {
         // profile=lean would give brief/limit 5, but explicit keys win.
-        let out = VestigeConfig::parse(
-            "[defaults]\nprofile=lean\ndetail_level=\"full\"\nlimit=42\n",
-        )
-        .output();
+        let out =
+            VestigeConfig::parse("[defaults]\nprofile=lean\ndetail_level=\"full\"\nlimit=42\n")
+                .output();
         assert_eq!(out.detail_level, "full");
         assert_eq!(out.limit, Some(42));
     }

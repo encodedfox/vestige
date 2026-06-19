@@ -428,7 +428,13 @@ mod tests {
     async fn test_invalid_action_fails() {
         let (storage, _dir) = test_storage().await;
         let args = serde_json::json!({ "action": "invalid" });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid action"));
     }
@@ -443,7 +449,13 @@ mod tests {
             "files": ["src/lib.rs"],
             "codebase": "vestige"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["action"], "remember_pattern");
@@ -459,7 +471,13 @@ mod tests {
             "action": "remember_pattern",
             "description": "Some description"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("'name' is required"));
     }
@@ -471,7 +489,13 @@ mod tests {
             "action": "remember_pattern",
             "name": "Test Pattern"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("'description' is required"));
     }
@@ -484,7 +508,13 @@ mod tests {
             "name": "   ",
             "description": "Some description"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("empty"));
     }
@@ -500,7 +530,13 @@ mod tests {
             "files": ["src/storage.rs"],
             "codebase": "vestige"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["action"], "remember_decision");
@@ -515,7 +551,13 @@ mod tests {
             "action": "remember_decision",
             "rationale": "Some rationale"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("'decision' is required"));
     }
@@ -527,7 +569,13 @@ mod tests {
             "action": "remember_decision",
             "decision": "Use SQLite"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("'rationale' is required"));
     }
@@ -540,7 +588,13 @@ mod tests {
             "decision": "  ",
             "rationale": "Something"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("empty"));
     }
@@ -552,7 +606,13 @@ mod tests {
             "action": "get_context",
             "codebase": "nonexistent"
         });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["action"], "get_context");
@@ -571,7 +631,9 @@ mod tests {
             "description": "A test pattern",
             "codebase": "myproject"
         });
-        execute(&storage, &cog, &OutputConfig::default(), Some(save_args)).await.unwrap();
+        execute(&storage, &cog, &OutputConfig::default(), Some(save_args))
+            .await
+            .unwrap();
 
         // Now retrieve
         let get_args = serde_json::json!({
@@ -588,7 +650,13 @@ mod tests {
     async fn test_get_context_no_codebase() {
         let (storage, _dir) = test_storage().await;
         let args = serde_json::json!({ "action": "get_context" });
-        let result = execute(&storage, &test_cognitive(), &OutputConfig::default(), Some(args)).await;
+        let result = execute(
+            &storage,
+            &test_cognitive(),
+            &OutputConfig::default(),
+            Some(args),
+        )
+        .await;
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value["action"], "get_context");
