@@ -9655,7 +9655,11 @@ impl SqliteMemoryStore {
 
     /// Read the incremental-sync checkpoint for a `(source_system, scope)`.
     /// Returns a zeroed cursor (no high-water mark) if none has been saved yet.
-    pub fn get_connector_cursor(&self, source_system: &str, scope: &str) -> Result<ConnectorCursor> {
+    pub fn get_connector_cursor(
+        &self,
+        source_system: &str,
+        scope: &str,
+    ) -> Result<ConnectorCursor> {
         let reader = self
             .reader
             .lock()
@@ -9873,7 +9877,11 @@ mod tests {
             assert_eq!(r.outcome, SourceUpsertOutcome::Unchanged);
             assert_eq!(r.node_id, r1.node_id, "must reuse the same memory id");
         }
-        assert_eq!(node_count(&store), 1, "idempotent: still exactly one memory");
+        assert_eq!(
+            node_count(&store),
+            1,
+            "idempotent: still exactly one memory"
+        );
     }
 
     #[test]
@@ -9945,7 +9953,13 @@ mod tests {
         let mut c2 = cursor.clone();
         c2.records_seen = 99;
         store.save_connector_cursor(&c2).unwrap();
-        assert_eq!(store.get_connector_cursor("github", "o/r").unwrap().records_seen, 99);
+        assert_eq!(
+            store
+                .get_connector_cursor("github", "o/r")
+                .unwrap()
+                .records_seen,
+            99
+        );
     }
 
     #[test]
@@ -9977,9 +9991,15 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert!(two.1.is_some(), "tombstoned record must have valid_until set");
+        assert!(
+            two.1.is_some(),
+            "tombstoned record must have valid_until set"
+        );
         let node = store.get_node(&two.0).unwrap().unwrap();
-        assert!(!node.is_currently_valid(), "tombstoned node is not valid now");
+        assert!(
+            !node.is_currently_valid(),
+            "tombstoned node is not valid now"
+        );
         assert_eq!(node.content, "issue 2", "content retained for audit");
 
         // A reappearing record un-tombstones on next upsert (clears valid_until).
@@ -9987,7 +10007,10 @@ mod tests {
             .upsert_by_source(source_input("2", "issue 2", "h2"))
             .unwrap();
         let revived = store.get_node(&two.0).unwrap().unwrap();
-        assert!(revived.is_currently_valid(), "re-synced record is valid again");
+        assert!(
+            revived.is_currently_valid(),
+            "re-synced record is valid again"
+        );
     }
 
     #[test]
@@ -10013,7 +10036,10 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            store.superseded_node_ids().unwrap().contains(&created.node_id),
+            store
+                .superseded_node_ids()
+                .unwrap()
+                .contains(&created.node_id),
             "precondition: node is superseded"
         );
 
@@ -10023,7 +10049,10 @@ mod tests {
             .unwrap();
         assert_eq!(res.outcome, SourceUpsertOutcome::Updated);
         assert!(
-            !store.superseded_node_ids().unwrap().contains(&created.node_id),
+            !store
+                .superseded_node_ids()
+                .unwrap()
+                .contains(&created.node_id),
             "superseded_by must be cleared on re-sync (no bitemporal zombie)"
         );
         let node = store.get_node(&created.node_id).unwrap().unwrap();
@@ -10044,7 +10073,10 @@ mod tests {
             .unwrap();
         assert_eq!(res2.outcome, SourceUpsertOutcome::Unchanged);
         assert!(
-            !store.superseded_node_ids().unwrap().contains(&created.node_id),
+            !store
+                .superseded_node_ids()
+                .unwrap()
+                .contains(&created.node_id),
             "Unchanged branch must also clear superseded_by"
         );
     }

@@ -11,9 +11,9 @@
 //! - The [`Connector`] contract, [`NormalizedRecord`] shape, and the stable
 //!   [`content_hash`] are pure (no network) and always compiled, so the sync
 //!   semantics are unit-testable without hitting an API.
-//! - Network-backed reference connectors (e.g. [`github`]) live behind the
-//!   `connectors` cargo feature so the default local-first build links no HTTP
-//!   client.
+//! - Network-backed reference connectors ([`github`] and [`redmine`]) live
+//!   behind the `connectors` cargo feature so the default local-first build
+//!   links no HTTP client.
 //!
 //! ## Sync contract (the part that makes re-running safe)
 //!
@@ -38,6 +38,9 @@ use crate::storage::ConnectorCursor;
 
 #[cfg(feature = "connectors")]
 pub mod github;
+
+#[cfg(feature = "connectors")]
+pub mod redmine;
 
 /// A single external record, already normalized into the fields Vestige needs.
 ///
@@ -329,8 +332,16 @@ mod tests {
 
     #[test]
     fn content_hash_is_order_independent() {
-        let a = content_hash(&[("title", "Crash"), ("body", "stacktrace"), ("state", "open")]);
-        let b = content_hash(&[("state", "open"), ("title", "Crash"), ("body", "stacktrace")]);
+        let a = content_hash(&[
+            ("title", "Crash"),
+            ("body", "stacktrace"),
+            ("state", "open"),
+        ]);
+        let b = content_hash(&[
+            ("state", "open"),
+            ("title", "Crash"),
+            ("body", "stacktrace"),
+        ]);
         assert_eq!(a, b, "reordering fields must not change the hash");
     }
 

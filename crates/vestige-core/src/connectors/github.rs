@@ -490,25 +490,25 @@ mod tests {
     fn hash_stable_across_label_order_and_changes_on_edit() {
         let c = connector();
         let mut a = issue(1, "T", "body", "open");
-        a.labels = vec![
-            RawLabel { name: "b".into() },
-            RawLabel { name: "a".into() },
-        ];
+        a.labels = vec![RawLabel { name: "b".into() }, RawLabel { name: "a".into() }];
         let mut b = issue(1, "T", "body", "open");
-        b.labels = vec![
-            RawLabel { name: "a".into() },
-            RawLabel { name: "b".into() },
-        ];
+        b.labels = vec![RawLabel { name: "a".into() }, RawLabel { name: "b".into() }];
         let ha = c.normalize(&a, &[]).envelope.content_hash;
         let hb = c.normalize(&b, &[]).envelope.content_hash;
         assert_eq!(ha, hb, "label order must not change the hash");
 
         // Editing the body must change the hash.
-        let edited = c.normalize(&issue(1, "T", "EDITED", "open"), &[]).envelope.content_hash;
+        let edited = c
+            .normalize(&issue(1, "T", "EDITED", "open"), &[])
+            .envelope
+            .content_hash;
         assert_ne!(ha, edited);
 
         // Closing the issue changes state → changes the hash (not a no-op).
-        let closed = c.normalize(&issue(1, "T", "body", "closed"), &[]).envelope.content_hash;
+        let closed = c
+            .normalize(&issue(1, "T", "body", "closed"), &[])
+            .envelope
+            .content_hash;
         assert_ne!(ha, closed);
     }
 
@@ -533,7 +533,10 @@ mod tests {
         let second_pos = rec.content.find("second").unwrap();
         assert!(first_pos < second_pos, "comments must fold in id order");
 
-        let no_comments = c.normalize(&issue(1, "T", "body", "open"), &[]).envelope.content_hash;
+        let no_comments = c
+            .normalize(&issue(1, "T", "body", "open"), &[])
+            .envelope
+            .content_hash;
         assert_ne!(
             rec.envelope.content_hash, no_comments,
             "comments must contribute to the hash"

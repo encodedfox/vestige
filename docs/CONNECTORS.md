@@ -1,7 +1,7 @@
 # External-Source Connectors
 
-> Status: **v2.1.27** — GitHub Issues connector (reference). Redmine and others
-> follow the same contract. Tracking issue:
+> Status: **v2.1.27** — GitHub Issues + Redmine reference connectors, plus
+> source-aware investigation filters for search. Tracking issue:
 > [#57](https://github.com/samvallad33/vestige/issues/57).
 
 Connectors let Vestige act as a durable, local **retrieval and reasoning layer**
@@ -59,17 +59,62 @@ you can:
    }
    ```
 
+## Quick start (Redmine)
+
+Redmine stays the system of record; Vestige indexes a project's issues +
+journals (comments and status/assignment history).
+
+1. Point Vestige at the Redmine host and key (env only, never tool args):
+
+   ```sh
+   export REDMINE_URL=https://redmine.example.com
+   export REDMINE_API_KEY=xxxxxxxx   # or VESTIGE_REDMINE_API_KEY
+   ```
+
+   The instance must have the REST API enabled (Administration → Settings → API)
+   or every call returns 401/403 even with a valid key.
+
+2. Run `source_sync`:
+
+   ```json
+   { "source": "redmine", "project": "infra" }
+   ```
+
+   Results cite the canonical `https://redmine.example.com/issues/<id>` URL.
+
 ## The `source_sync` tool
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `repo` | string | — (required) | `owner/name`, e.g. `samvallad33/vestige`. |
-| `source` | string | `github` | External system. Currently only `github`. |
+| `source` | string | `github` | `github` or `redmine`. |
+| `repo` | string | — | **GitHub:** `owner/name`, e.g. `samvallad33/vestige`. |
+| `project` | string | — | **Redmine:** project identifier (host from `REDMINE_URL`). |
 | `reconcile` | bool | `false` | Also tombstone local memories for issues no longer visible upstream (an extra full-enumeration pass). |
-| `max_pages` | int | `10` | API pages to fetch this run (≤100 issues each). Lets a first sync of a large repo resume across calls. |
+| `max_pages` | int | `10` | API pages to fetch this run (≤100 issues each). Lets a first sync of a large project resume across calls. |
 
 The tool returns counts (`created` / `updated` / `unchanged` / `tombstoned`),
 the saved `cursor`, whether it ran authenticated, and a `hint` for the next step.
+
+## Investigation filters (Phase 4)
+
+`search` accepts source-aware filters so an agent can scope a query to indexed
+records. All are optional post-filters; combine with a larger `limit` if you
+expect heavy thinning. A source-scoped query excludes non-connector memories.
+
+| Filter | Matches |
+|---|---|
+| `source_system` | `github`, `redmine`, … |
+| `source_project` | repo / project (exact) |
+| `source_id` | a specific issue/ticket id |
+| `source_type` | `issue`, `comment`, … |
+| `source_author` | reporter/author (not assignee) |
+| `source_updated_after` / `source_updated_before` | RFC3339 date range (inclusive) |
+| `source_status` | `valid` (default `any`) or `tombstoned` |
+
+Status, tracker, and priority are filterable through the existing `tag_prefix`
+(the connectors emit lowercase `status:`, `tracker:`, `priority:`, and GitHub
+`label:` / `state:` tags) — e.g. `tag_prefix: "status:open"`. Assignee and
+linked-issue graph traversal are not yet exposed (see below).
 
 ### Idempotent, incremental sync
 
@@ -144,7 +189,18 @@ cargo build -p vestige-core --features connectors
 Implement the `Connector` trait in `vestige_core::connectors` (fetch a window of
 records updated since a cursor, page forward, and optionally enumerate live ids
 for reconciliation), produce `NormalizedRecord`s with a filled
-`SourceEnvelope`, and hand them to `run_sync`. The GitHub connector
-(`crates/vestige-core/src/connectors/github.rs`) is the reference
-implementation. The sync driver, idempotent upsert, cursor checkpointing, and
-tombstone reconciliation are all reused for free.
+`SourceEnvelope`, and hand them to `run_sync`. Two reference connectors show the
+shape — `crates/vestige-core/src/connectors/github.rs` (Link-header pagination,
+opaque-url cursor) and `crates/vestige-core/src/connectors/redmine.rs`
+(offset pagination, two-phase list-then-detail fetch). The sync driver,
+idempotent upsert, cursor checkpointing, and tombstone reconciliation are all
+reused for free.
+
+## Not yet supported
+
+- **Assignee filter** — the envelope stores `source_author` (reporter) only; no
+  assignee column yet.
+- **Tracker / version dedicated filter params** — reachable today via
+  `tag_prefix` (`tracker:`, and `version:`/`category:` when emitted).
+- **Linked-issue graph traversal** — connectors import relations into the memory
+  body, but issue-to-issue graph edges are not yet exposed in search.

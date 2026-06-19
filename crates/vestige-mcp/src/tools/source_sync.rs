@@ -1,11 +1,11 @@
 //! `source_sync` MCP tool (#57) — index an external system into Vestige.
 //!
 //! Turns Vestige into a durable, offline, provenance-linked retrieval layer
-//! over a long-lived external system. The first connector is GitHub Issues:
-//! point it at `owner/repo` and Vestige indexes every issue + its comments as
-//! source-aware memories you can search semantically and cite back to the
-//! canonical issue URL — re-runnable idempotently (no duplicates) and able to
-//! tombstone issues that vanish upstream.
+//! over a long-lived external system. GitHub Issues and Redmine are the first
+//! reference connectors: Vestige indexes issues, comments/journals, and source
+//! metadata as source-aware memories you can search semantically and cite back
+//! to the canonical issue URL — re-runnable idempotently (no duplicates) and
+//! able to tombstone issues that vanish upstream.
 //!
 //! Unlike the official GitHub MCP server (a stateless live API proxy), this
 //! keeps a local index: searchable offline, embedded for semantic recall,
@@ -13,10 +13,11 @@
 //!
 //! ## Auth (security)
 //!
-//! The GitHub token is read from the `GITHUB_TOKEN` (or `VESTIGE_GITHUB_TOKEN`)
-//! environment variable, never from tool arguments, so credentials are not
-//! logged in the conversation. Public repositories work without a token at a
-//! lower rate limit.
+//! Tokens are read from environment variables (`GITHUB_TOKEN` /
+//! `VESTIGE_GITHUB_TOKEN`, `REDMINE_API_KEY` / `VESTIGE_REDMINE_API_KEY`) and
+//! never from tool arguments, so credentials are not logged in the conversation.
+//! Public GitHub repositories and anonymous Redmine instances can work without a
+//! token/key at lower capability.
 
 use std::sync::Arc;
 
@@ -32,13 +33,17 @@ pub fn schema() -> Value {
         "properties": {
             "source": {
                 "type": "string",
-                "enum": ["github"],
-                "description": "External system to sync. Currently: 'github' (GitHub Issues).",
+                "enum": ["github", "redmine"],
+                "description": "External system to sync: 'github' (GitHub Issues) or 'redmine' (a Redmine project).",
                 "default": "github"
             },
             "repo": {
                 "type": "string",
-                "description": "GitHub repository as 'owner/name', e.g. 'samvallad33/vestige'."
+                "description": "GitHub only: repository as 'owner/name', e.g. 'samvallad33/vestige'."
+            },
+            "project": {
+                "type": "string",
+                "description": "Redmine only: project identifier (slug or numeric id) to sync. The Redmine host comes from the REDMINE_URL env var."
             },
             "reconcile": {
                 "type": "boolean",
@@ -47,13 +52,13 @@ pub fn schema() -> Value {
             },
             "max_pages": {
                 "type": "integer",
-                "description": "Max API pages to fetch this run (each page is up to 100 issues). Lets a first sync of a large repo be resumed across calls. Default 10.",
+                "description": "Max API pages to fetch this run (each page is up to 100 issues). Lets a first sync of a large project be resumed across calls. Default 10.",
                 "default": 10,
                 "minimum": 1,
                 "maximum": 1000
             }
         },
-        "required": ["repo"]
+        "required": []
     })
 }
 
@@ -62,7 +67,10 @@ pub fn schema() -> Value {
 struct SourceSyncArgs {
     #[serde(default = "default_source")]
     source: String,
-    repo: String,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
     #[serde(default)]
     reconcile: bool,
     #[serde(default, alias = "max_pages")]
@@ -81,35 +89,60 @@ fn github_token() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// Read the Redmine API key from the environment (never from tool args).
+fn redmine_api_key() -> Option<String> {
+    std::env::var("REDMINE_API_KEY")
+        .or_else(|_| std::env::var("VESTIGE_REDMINE_API_KEY"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Read the Redmine base URL from the environment.
+fn redmine_url() -> Option<String> {
+    std::env::var("REDMINE_URL")
+        .or_else(|_| std::env::var("VESTIGE_REDMINE_URL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
     let args: SourceSyncArgs = match args {
         Some(v) => serde_json::from_value(v).map_err(|e| format!("Invalid arguments: {e}"))?,
         None => return Err("Missing arguments".to_string()),
     };
 
-    if args.source != "github" {
-        return Err(format!(
-            "Unsupported source '{}'. Currently only 'github' is supported.",
-            args.source
-        ));
+    let max_pages = args.max_pages.unwrap_or(10);
+
+    match args.source.as_str() {
+        "github" => {
+            let repo = args
+                .repo
+                .as_deref()
+                .ok_or_else(|| "github requires a 'repo' ('owner/name')".to_string())?;
+            let (owner, repo) = repo
+                .split_once('/')
+                .filter(|(o, r)| !o.is_empty() && !r.is_empty())
+                .ok_or_else(|| {
+                    "repo must be in 'owner/name' form, e.g. 'samvallad33/vestige'".to_string()
+                })?;
+            execute_github(storage, owner, repo, args.reconcile, max_pages).await
+        }
+        "redmine" => {
+            let project = args
+                .project
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| "redmine requires a 'project' identifier".to_string())?;
+            let base_url = redmine_url().ok_or_else(|| {
+                "set the REDMINE_URL env var to the Redmine host (e.g. https://redmine.example.com)"
+                    .to_string()
+            })?;
+            execute_redmine(storage, &base_url, project, args.reconcile, max_pages).await
+        }
+        other => Err(format!(
+            "Unsupported source '{other}'. Supported: 'github', 'redmine'."
+        )),
     }
-
-    let (owner, repo) = args
-        .repo
-        .split_once('/')
-        .filter(|(o, r)| !o.is_empty() && !r.is_empty())
-        .ok_or_else(|| {
-            "repo must be in 'owner/name' form, e.g. 'samvallad33/vestige'".to_string()
-        })?;
-
-    execute_github(
-        storage,
-        owner,
-        repo,
-        args.reconcile,
-        args.max_pages.unwrap_or(10),
-    )
-    .await
 }
 
 /// Connectors are feature-gated; surface a clear message when the build omits
@@ -122,10 +155,23 @@ async fn execute_github(
     _reconcile: bool,
     _max_pages: usize,
 ) -> Result<Value, String> {
-    Err("This Vestige build was compiled without the 'connectors' feature. \
-         Rebuild with --features connectors to enable source_sync."
-        .to_string())
+    Err(NO_CONNECTORS_MSG.to_string())
 }
+
+#[cfg(not(feature = "connectors"))]
+async fn execute_redmine(
+    _storage: &Arc<Storage>,
+    _base_url: &str,
+    _project: &str,
+    _reconcile: bool,
+    _max_pages: usize,
+) -> Result<Value, String> {
+    Err(NO_CONNECTORS_MSG.to_string())
+}
+
+#[cfg(not(feature = "connectors"))]
+const NO_CONNECTORS_MSG: &str = "This Vestige build was compiled without the 'connectors' feature. \
+     Rebuild with --features connectors to enable source_sync.";
 
 #[cfg(feature = "connectors")]
 async fn execute_github(
@@ -182,6 +228,64 @@ async fn execute_github(
             "More may remain — run source_sync again to continue from the saved cursor."
         } else {
             "Search these with the normal search tools; results cite the GitHub issue URL."
+        }
+    }))
+}
+
+#[cfg(feature = "connectors")]
+async fn execute_redmine(
+    storage: &Arc<Storage>,
+    base_url: &str,
+    project: &str,
+    reconcile: bool,
+    max_pages: usize,
+) -> Result<Value, String> {
+    use vestige_core::connectors::redmine::{RedmineConfig, RedmineConnector};
+    use vestige_core::connectors::run_sync;
+
+    let config = RedmineConfig::new(base_url, project).with_api_key(redmine_api_key());
+    let connector =
+        RedmineConnector::new(config).map_err(|e| format!("connector init failed: {e}"))?;
+
+    let report = run_sync(storage.as_ref(), &connector, reconcile, max_pages)
+        .await
+        .map_err(|e| format!("sync failed: {e}"))?;
+
+    let total = report.created + report.updated + report.unchanged;
+    let authed = redmine_api_key().is_some();
+
+    let summary = format!(
+        "Synced redmine project '{project}': {} created, {} updated, {} unchanged{} ({total} records seen{}).",
+        report.created,
+        report.updated,
+        report.unchanged,
+        if report.reconciled {
+            format!(", {} tombstoned", report.tombstoned)
+        } else {
+            String::new()
+        },
+        if authed { "" } else { ", anonymous" },
+    );
+
+    Ok(json!({
+        "ok": true,
+        "summary": summary,
+        "source": "redmine",
+        "scope": project,
+        "created": report.created,
+        "updated": report.updated,
+        "unchanged": report.unchanged,
+        "tombstoned": report.tombstoned,
+        "reconciled": report.reconciled,
+        "cursor": report.new_cursor.map(|d| d.to_rfc3339()),
+        "authenticated": authed,
+        "warnings": report.warnings,
+        "hint": if total == 0 && !authed {
+            "No records returned. Set REDMINE_API_KEY (and confirm the REST API is enabled on the instance) for private projects."
+        } else if report.new_cursor.is_some() && total >= 100 {
+            "More may remain — run source_sync again to continue from the saved cursor."
+        } else {
+            "Search these with the normal search tools; results cite the Redmine issue URL."
         }
     }))
 }

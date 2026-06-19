@@ -96,6 +96,40 @@ pub fn schema() -> Value {
             "tag_prefix": {
                 "type": "string",
                 "description": "Optional tag-prefix filter. When set, only results carrying at least one tag whose value starts with this prefix are returned (case-sensitive). Example: tag_prefix=\"meeting:\" matches memories tagged 'meeting:standup', 'meeting:1-on-1', etc. Applied as a post-filter; combine with a larger 'limit' if you expect heavy thinning."
+            },
+            "source_system": {
+                "type": "string",
+                "description": "Investigation filter (#57): only memories ingested from this external system, e.g. 'github' or 'redmine'. Post-filter — non-connector memories are excluded. Combine with a larger 'limit' if thinning is heavy."
+            },
+            "source_project": {
+                "type": "string",
+                "description": "Investigation filter: only memories from this source project/repo, exact match (GitHub 'owner/repo', Redmine project id)."
+            },
+            "source_id": {
+                "type": "string",
+                "description": "Investigation filter: a specific source record id (issue number / ticket id). Pair with source_system to disambiguate across systems."
+            },
+            "source_type": {
+                "type": "string",
+                "description": "Investigation filter: source record type, e.g. 'issue', 'comment'."
+            },
+            "source_author": {
+                "type": "string",
+                "description": "Investigation filter: the source author/reporter (not assignee)."
+            },
+            "source_updated_after": {
+                "type": "string",
+                "description": "Investigation filter: only records whose source was updated at/after this RFC3339 timestamp (inclusive)."
+            },
+            "source_updated_before": {
+                "type": "string",
+                "description": "Investigation filter: only records whose source was updated at/before this RFC3339 timestamp (inclusive)."
+            },
+            "source_status": {
+                "type": "string",
+                "enum": ["any", "valid", "tombstoned"],
+                "description": "Investigation filter: 'any' (default), 'valid' (currently-valid records only), or 'tombstoned' (records no longer visible upstream, kept for audit).",
+                "default": "any"
             }
         },
         "required": ["query"]
@@ -126,6 +160,23 @@ struct SearchArgs {
     concrete: Option<bool>,
     #[serde(alias = "tag_prefix")]
     tag_prefix: Option<String>,
+    // #57 Phase 4 — source-aware investigation filters (all post-filters).
+    #[serde(alias = "source_system")]
+    source_system: Option<String>,
+    #[serde(alias = "source_project")]
+    source_project: Option<String>,
+    #[serde(alias = "source_id")]
+    source_id: Option<String>,
+    #[serde(alias = "source_type")]
+    source_type: Option<String>,
+    #[serde(alias = "source_author")]
+    source_author: Option<String>,
+    #[serde(alias = "source_updated_after")]
+    source_updated_after: Option<String>,
+    #[serde(alias = "source_updated_before")]
+    source_updated_before: Option<String>,
+    #[serde(alias = "source_status")]
+    source_status: Option<String>,
 }
 
 /// Execute unified search with 7-stage cognitive pipeline.
@@ -190,15 +241,19 @@ pub async fn execute(
         }
     };
 
+    // #57 Phase 4 — parse the source-aware investigation filter once (shared by
+    // both the concrete and hybrid paths). Hard-errors on malformed input.
+    let source_filter = SourceFilter::from_args(&args)?;
+
     let concrete = args
         .concrete
         .unwrap_or_else(|| is_literal_query(&args.query));
     if concrete {
-        // When a tag_prefix is requested, fetch a larger pool so the
-        // post-filter has enough headroom to still return ~limit results
-        // after thinning. Cap at the same upper bound the underlying SQL
-        // path uses elsewhere (100).
-        let concrete_fetch_limit = if args.tag_prefix.is_some() {
+        // When a tag_prefix OR a source filter is requested, fetch a larger
+        // pool so the post-filter has enough headroom to still return ~limit
+        // results after thinning. Cap at the same upper bound the underlying
+        // SQL path uses elsewhere (100).
+        let concrete_fetch_limit = if args.tag_prefix.is_some() || source_filter.is_active() {
             (limit * 3).min(100)
         } else {
             limit
@@ -215,14 +270,15 @@ pub async fn execute(
         // Apply tag_prefix post-filter BEFORE strengthen-on-access so
         // results the caller did not actually receive do not get a
         // testing-effect boost.
-        let filtered_results: Vec<&vestige_core::SearchResult> = match args.tag_prefix.as_deref() {
-            Some(prefix) => results
-                .iter()
-                .filter(|r| tags_match_prefix(&r.node.tags, prefix))
-                .take(limit as usize)
-                .collect(),
-            None => results.iter().collect(),
-        };
+        let filtered_results: Vec<&vestige_core::SearchResult> = results
+            .iter()
+            .filter(|r| match args.tag_prefix.as_deref() {
+                Some(prefix) => tags_match_prefix(&r.node.tags, prefix),
+                None => true,
+            })
+            .filter(|r| node_matches_source(&r.node, &source_filter))
+            .take(limit as usize)
+            .collect();
 
         let ids: Vec<&str> = filtered_results
             .iter()
@@ -334,11 +390,15 @@ pub async fn execute(
         "exhaustive" => 5, // Deep overfetch for maximum recall
         _ => 3,            // Balanced default
     };
-    // When a tag_prefix filter is requested, double the overfetch (capped at
-    // the same 100 ceiling) so the post-filter has enough headroom to still
-    // return ~limit results after thinning.
-    let tag_prefix_multiplier = if args.tag_prefix.is_some() { 2 } else { 1 };
-    let overfetch_limit = (limit * overfetch_multiplier * tag_prefix_multiplier).min(100); // Cap at 100 to avoid excessive DB load
+    // When a tag_prefix OR source filter is requested, double the overfetch
+    // (capped at the same 100 ceiling) so the post-filter has enough headroom
+    // to still return ~limit results after thinning.
+    let post_filter_multiplier = if args.tag_prefix.is_some() || source_filter.is_active() {
+        2
+    } else {
+        1
+    };
+    let overfetch_limit = (limit * overfetch_multiplier * post_filter_multiplier).min(100); // Cap at 100 to avoid excessive DB load
 
     let results = storage
         .hybrid_search_filtered(
@@ -375,6 +435,10 @@ pub async fn execute(
     if let Some(prefix) = args.tag_prefix.as_deref() {
         filtered_results.retain(|r| tags_match_prefix(&r.node.tags, prefix));
     }
+    // #57 Phase 4 — source-aware investigation post-filter (same precedent).
+    if source_filter.is_active() {
+        filtered_results.retain(|r| node_matches_source(&r.node, &source_filter));
+    }
 
     // ====================================================================
     // Dedup: merge Stage 0 keyword-priority results into Stage 1 results
@@ -385,6 +449,10 @@ pub async fn execute(
         if let Some(prefix) = args.tag_prefix.as_deref()
             && !tags_match_prefix(&kp.node.tags, prefix)
         {
+            continue;
+        }
+        // Respect the source filter on re-inject for the same reason.
+        if source_filter.is_active() && !node_matches_source(&kp.node, &source_filter) {
             continue;
         }
         if let Some(existing) = filtered_results
@@ -850,6 +918,156 @@ fn is_literal_query(query: &str) -> bool {
 /// prefix-search should normalize tags at ingest time.
 fn tags_match_prefix(tags: &[String], prefix: &str) -> bool {
     tags.iter().any(|t| t.starts_with(prefix))
+}
+
+/// Validity filter for source-aware search (#57 Phase 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SourceStatus {
+    /// No validity constraint.
+    #[default]
+    Any,
+    /// Only currently-valid records.
+    Valid,
+    /// Only tombstoned records (no longer visible upstream, kept for audit).
+    Tombstoned,
+}
+
+/// Parsed source-aware investigation filter (#57 Phase 4).
+///
+/// All fields are optional; an all-empty filter matches every node (so search
+/// behavior is byte-for-byte unchanged when no source filter is supplied). Any
+/// source-scoped field being set excludes legacy/agent memories that have no
+/// `source_envelope`. Applied as a post-filter on the recalled nodes, mirroring
+/// the existing `tag_prefix` precedent (no SQL changes).
+#[derive(Debug, Clone, Default)]
+struct SourceFilter {
+    system: Option<String>,
+    project: Option<String>,
+    id: Option<String>,
+    source_type: Option<String>,
+    author: Option<String>,
+    updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    updated_before: Option<chrono::DateTime<chrono::Utc>>,
+    status: SourceStatus,
+}
+
+impl SourceFilter {
+    /// Build from raw args, hard-erroring on malformed timestamps / status enum
+    /// (consistent with how `detail_level` / `retrieval_mode` reject bad input —
+    /// a silently-`None` bound would widen the filter and return wrong rows).
+    fn from_args(args: &SearchArgs) -> Result<Self, String> {
+        let parse_ts = |s: &Option<String>,
+                        field: &str|
+         -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+            match s {
+                None => Ok(None),
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+                    .map_err(|_| format!("Invalid {field}: '{v}' is not an RFC3339 timestamp")),
+            }
+        };
+        let status = match args.source_status.as_deref() {
+            None | Some("any") => SourceStatus::Any,
+            Some("valid") => SourceStatus::Valid,
+            Some("tombstoned") => SourceStatus::Tombstoned,
+            Some(other) => {
+                return Err(format!(
+                    "Invalid source_status '{other}'. Must be 'any', 'valid', or 'tombstoned'."
+                ));
+            }
+        };
+        Ok(Self {
+            system: args.source_system.clone(),
+            project: args.source_project.clone(),
+            id: args.source_id.clone(),
+            source_type: args.source_type.clone(),
+            author: args.source_author.clone(),
+            updated_after: parse_ts(&args.source_updated_after, "source_updated_after")?,
+            updated_before: parse_ts(&args.source_updated_before, "source_updated_before")?,
+            status,
+        })
+    }
+
+    /// True when at least one filter is set (used to size the over-fetch pool).
+    fn is_active(&self) -> bool {
+        self.system.is_some()
+            || self.project.is_some()
+            || self.id.is_some()
+            || self.source_type.is_some()
+            || self.author.is_some()
+            || self.updated_after.is_some()
+            || self.updated_before.is_some()
+            || self.status != SourceStatus::Any
+    }
+}
+
+/// Predicate: does this node satisfy the source-aware investigation filter?
+/// An all-empty filter returns `true` for every node.
+fn node_matches_source(node: &vestige_core::KnowledgeNode, filter: &SourceFilter) -> bool {
+    // Validity check operates on the NODE (valid_until lives on the node).
+    match filter.status {
+        SourceStatus::Any => {}
+        SourceStatus::Valid if !node.is_currently_valid() => return false,
+        SourceStatus::Tombstoned if node.is_currently_valid() => return false,
+        _ => {}
+    }
+
+    // Any source-scoped field requires an envelope; legacy memories are out.
+    // This includes `source_status=valid`: otherwise a source-scoped query for
+    // valid connector records would also return ordinary valid agent memories.
+    let envelope_scoped = filter.system.is_some()
+        || filter.project.is_some()
+        || filter.id.is_some()
+        || filter.source_type.is_some()
+        || filter.author.is_some()
+        || filter.updated_after.is_some()
+        || filter.updated_before.is_some()
+        || filter.status != SourceStatus::Any;
+    if !envelope_scoped {
+        return true;
+    }
+    let Some(env) = node.source_envelope.as_ref() else {
+        return false;
+    };
+
+    let exact = |want: &Option<String>, have: &Option<String>| -> bool {
+        match want {
+            None => true,
+            Some(w) => have.as_deref() == Some(w.as_str()),
+        }
+    };
+    if !exact(&filter.system, &env.source_system) {
+        return false;
+    }
+    if !exact(&filter.project, &env.source_project) {
+        return false;
+    }
+    if !exact(&filter.id, &env.source_id) {
+        return false;
+    }
+    if !exact(&filter.source_type, &env.source_type) {
+        return false;
+    }
+    if !exact(&filter.author, &env.source_author) {
+        return false;
+    }
+    // Date bounds (inclusive) on the source-updated time.
+    if filter.updated_after.is_some() || filter.updated_before.is_some() {
+        let Some(ts) = env.source_updated_at else {
+            return false;
+        };
+        if let Some(after) = filter.updated_after
+            && ts < after
+        {
+            return false;
+        }
+        if let Some(before) = filter.updated_before
+            && ts > before
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Format a search result based on the requested detail level.
@@ -1878,6 +2096,167 @@ mod tests {
         // tag_prefix is NOT required.
         let required = schema_value["required"].as_array().unwrap();
         assert!(!required.contains(&serde_json::json!("tag_prefix")));
+    }
+
+    // ===================== #57 Phase 4 source filters =====================
+
+    /// Build a KnowledgeNode carrying a source envelope for filter tests.
+    fn node_with_source(
+        system: &str,
+        project: &str,
+        id: &str,
+        author: &str,
+        updated: &str,
+    ) -> vestige_core::KnowledgeNode {
+        let mut n = vestige_core::KnowledgeNode::default();
+        n.id = format!("{system}-{id}");
+        // SourceEnvelope is #[non_exhaustive]; build via Default + field set.
+        let mut env = vestige_core::SourceEnvelope::default();
+        env.source_system = Some(system.to_string());
+        env.source_id = Some(id.to_string());
+        env.source_url = Some(format!("https://x/{id}"));
+        env.source_updated_at = chrono::DateTime::parse_from_rfc3339(updated)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc));
+        env.content_hash = Some("h".to_string());
+        env.source_project = Some(project.to_string());
+        env.source_type = Some("issue".to_string());
+        env.source_author = Some(author.to_string());
+        n.source_envelope = Some(env);
+        n
+    }
+
+    fn filter_from(json: serde_json::Value) -> SourceFilter {
+        let mut v = json;
+        v["query"] = serde_json::json!("q");
+        let args: SearchArgs = serde_json::from_value(v).unwrap();
+        SourceFilter::from_args(&args).unwrap()
+    }
+
+    #[test]
+    fn source_filter_empty_matches_everything() {
+        let f = SourceFilter::default();
+        assert!(!f.is_active());
+        let gh = node_with_source("github", "o/r", "1", "octo", "2026-06-19T00:00:00Z");
+        let legacy = vestige_core::KnowledgeNode::default(); // no envelope
+        assert!(node_matches_source(&gh, &f));
+        assert!(node_matches_source(&legacy, &f), "no filter = unchanged");
+    }
+
+    #[test]
+    fn source_filter_exact_fields() {
+        let gh = node_with_source("github", "o/r", "57", "octo", "2026-06-19T00:00:00Z");
+        let rm = node_with_source("redmine", "infra", "57", "jane", "2026-06-19T00:00:00Z");
+
+        let by_system = filter_from(serde_json::json!({"sourceSystem": "github"}));
+        assert!(node_matches_source(&gh, &by_system));
+        assert!(!node_matches_source(&rm, &by_system));
+
+        let by_project = filter_from(serde_json::json!({"sourceProject": "infra"}));
+        assert!(node_matches_source(&rm, &by_project));
+        assert!(!node_matches_source(&gh, &by_project));
+
+        let by_author = filter_from(serde_json::json!({"sourceAuthor": "octo"}));
+        assert!(node_matches_source(&gh, &by_author));
+        assert!(!node_matches_source(&rm, &by_author));
+
+        // id + system together disambiguate across systems sharing an id.
+        let by_id_sys =
+            filter_from(serde_json::json!({"sourceSystem": "redmine", "sourceId": "57"}));
+        assert!(node_matches_source(&rm, &by_id_sys));
+        assert!(!node_matches_source(&gh, &by_id_sys));
+    }
+
+    #[test]
+    fn source_filter_excludes_legacy_memories_when_envelope_scoped() {
+        let legacy = vestige_core::KnowledgeNode::default();
+        let f = filter_from(serde_json::json!({"sourceSystem": "github"}));
+        assert!(
+            !node_matches_source(&legacy, &f),
+            "an envelope-scoped filter must exclude memories with no source"
+        );
+    }
+
+    #[test]
+    fn source_filter_date_bounds_inclusive() {
+        let n = node_with_source("github", "o/r", "1", "octo", "2026-06-15T12:00:00Z");
+        // After bound: inclusive at the exact instant, excludes earlier.
+        assert!(node_matches_source(
+            &n,
+            &filter_from(serde_json::json!({"sourceUpdatedAfter": "2026-06-15T12:00:00Z"}))
+        ));
+        assert!(!node_matches_source(
+            &n,
+            &filter_from(serde_json::json!({"sourceUpdatedAfter": "2026-06-16T00:00:00Z"}))
+        ));
+        // Before bound: inclusive, excludes later.
+        assert!(node_matches_source(
+            &n,
+            &filter_from(serde_json::json!({"sourceUpdatedBefore": "2026-06-15T12:00:00Z"}))
+        ));
+        assert!(!node_matches_source(
+            &n,
+            &filter_from(serde_json::json!({"sourceUpdatedBefore": "2026-06-15T00:00:00Z"}))
+        ));
+    }
+
+    #[test]
+    fn source_filter_status_valid_vs_tombstoned() {
+        let mut live = node_with_source("github", "o/r", "1", "octo", "2026-06-19T00:00:00Z");
+        let mut dead = node_with_source("github", "o/r", "2", "octo", "2026-06-19T00:00:00Z");
+        let legacy = vestige_core::KnowledgeNode::default();
+        // Tombstone `dead` by setting valid_until in the past.
+        dead.valid_until = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        live.valid_until = None;
+
+        let valid = filter_from(serde_json::json!({"sourceStatus": "valid"}));
+        assert!(node_matches_source(&live, &valid));
+        assert!(!node_matches_source(&dead, &valid));
+        assert!(
+            !node_matches_source(&legacy, &valid),
+            "source_status is source-scoped and must not include legacy memories"
+        );
+
+        let tomb = filter_from(serde_json::json!({"sourceStatus": "tombstoned"}));
+        assert!(!node_matches_source(&live, &tomb));
+        assert!(node_matches_source(&dead, &tomb));
+        assert!(!node_matches_source(&legacy, &tomb));
+    }
+
+    #[test]
+    fn source_filter_rejects_bad_timestamp_and_status() {
+        let mut v = serde_json::json!({"query": "q", "sourceUpdatedAfter": "not-a-date"});
+        let args: SearchArgs = serde_json::from_value(v.take()).unwrap();
+        assert!(SourceFilter::from_args(&args).is_err());
+
+        let mut v2 = serde_json::json!({"query": "q", "sourceStatus": "bogus"});
+        let args2: SearchArgs = serde_json::from_value(v2.take()).unwrap();
+        assert!(SourceFilter::from_args(&args2).is_err());
+    }
+
+    #[test]
+    fn test_schema_has_source_filters() {
+        let s = schema();
+        for prop in [
+            "source_system",
+            "source_project",
+            "source_id",
+            "source_type",
+            "source_author",
+            "source_updated_after",
+            "source_updated_before",
+            "source_status",
+        ] {
+            assert!(
+                s["properties"][prop].is_object(),
+                "schema must expose {prop}"
+            );
+        }
+        // None of the source filters are required.
+        let required = s["required"].as_array().unwrap();
+        for prop in ["source_system", "source_status"] {
+            assert!(!required.contains(&serde_json::json!(prop)));
+        }
     }
 
     /// Helper that ingests a memory with specific tags. The base

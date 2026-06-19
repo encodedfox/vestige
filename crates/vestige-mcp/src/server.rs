@@ -285,7 +285,7 @@ impl McpServer {
             // ================================================================
             ToolDescription {
                 name: "source_sync".to_string(),
-                description: Some("Index an external system (GitHub Issues) into Vestige as a durable, offline, semantically-searchable index that cites back to the canonical record. Provide 'repo' as 'owner/name'. Idempotent: re-running updates changed issues without duplicating; set reconcile=true to tombstone issues removed upstream. Auth via the GITHUB_TOKEN env var (optional for public repos).".to_string()),
+                description: Some("Index an external system into Vestige as a durable, offline, semantically-searchable index that cites back to the canonical record. GitHub: source='github', repo='owner/name' (auth via GITHUB_TOKEN env). Redmine: source='redmine', project='<id>' (host via REDMINE_URL, auth via REDMINE_API_KEY env). Idempotent: re-running updates changed issues without duplicating; set reconcile=true to tombstone issues removed upstream.".to_string()),
                 input_schema: tools::source_sync::schema(),
                 ..Default::default()
             },

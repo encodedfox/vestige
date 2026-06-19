@@ -10,11 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Bump `version` in the workspace `Cargo.toml`, both crates, `server.json`, and
 > `package.json` to `2.1.27` at release/tag time, and date this heading.
 
-Roadmap [#57](https://github.com/samvallad33/vestige/issues/57), **Phase 1–3**:
-Vestige can now act as a durable, local, semantically-searchable retrieval layer
-over an external system of record — starting with GitHub Issues — without
-replacing it. The external system stays canonical; Vestige **indexes, connects,
-retrieves, and cites back** to the source record.
+Roadmap [#57](https://github.com/samvallad33/vestige/issues/57), **Phases 1–4
+(complete)**: Vestige can now act as a durable, local, semantically-searchable
+retrieval layer over an external system of record — GitHub Issues and Redmine —
+without replacing it. The external system stays canonical; Vestige **indexes,
+connects, retrieves, and cites back** to the source record.
 
 Unlike a live ticket-system MCP proxy (which holds no state and is rate-limited
 per query), Vestige keeps a durable embedded index: searchable **offline**,
@@ -25,12 +25,22 @@ content-hash idempotent sync, and tombstoning of vanished records.
 
 ### Added
 
-- **`source_sync` MCP tool** — point Vestige at a GitHub repo
-  (`{"repo": "owner/name"}`) and it indexes every issue + its comments as
-  source-aware memories. Re-running updates changed issues in place (no
-  duplicates); `reconcile: true` tombstones issues no longer visible upstream.
-  Auth via the `GITHUB_TOKEN` (or `VESTIGE_GITHUB_TOKEN`) environment variable;
-  public repos work without a token at a lower rate limit.
+- **`source_sync` MCP tool** — index an external system into Vestige.
+  - GitHub: `{"source": "github", "repo": "owner/name"}` indexes every issue +
+    its comments. Auth via `GITHUB_TOKEN` (public repos work tokenless at a
+    lower rate limit).
+  - Redmine: `{"source": "redmine", "project": "<id>"}` indexes a project's
+    issues + journals (comments and status/assignment history). Host from
+    `REDMINE_URL`, auth from `REDMINE_API_KEY`.
+  - Re-running updates changed issues in place (no duplicates); `reconcile:
+    true` tombstones issues no longer visible upstream.
+- **Source-aware investigation filters on `search`** (Phase 4) — filter results
+  by `source_system`, `source_project`, `source_id`, `source_type`,
+  `source_author`, a `source_updated_after`/`source_updated_before` date range,
+  and `source_status` (`valid` / `tombstoned` / `any`). Status, tracker, and
+  priority remain filterable via the existing `tag_prefix` (the connectors emit
+  `status:`/`tracker:`/`priority:`/`label:` tags). Applied as post-filters;
+  non-connector memories are excluded from a source-scoped query.
 - **Source envelope** on every memory — structured, machine-readable provenance
   (`source_system`, `source_id`, `source_url`, `source_updated_at`,
   `content_hash`, `synced_at`, `source_project`, `source_type`, `source_author`)
@@ -44,10 +54,15 @@ content-hash idempotent sync, and tombstoning of vanished records.
   record is retained for audit but drops out of current retrieval).
 - **Connector contract** (`vestige_core::connectors`) — a small source-agnostic
   `Connector` trait + `run_sync` driver (cursor overlap window, incremental
-  paging, optional deletion reconcile) and a GitHub Issues reference connector
-  behind the optional `connectors` cargo feature (on by default in the MCP
-  server, off in the core library's default features so non-connector consumers
-  link no HTTP client).
+  paging, optional deletion reconcile) with two reference connectors behind the
+  optional `connectors` cargo feature (on by default in the MCP server, off in
+  the core library's default features so non-connector consumers link no HTTP
+  client):
+  - **GitHub Issues** — `state=all`, `since` cursor, Link-header pagination,
+    drops PRs, host-pinned next-url.
+  - **Redmine** — `status_id=*` (open + closed), hex-encoded `updated_on>=`
+    cursor, `offset` pagination, per-issue detail fetch for journals (the list
+    endpoint omits them), `X-Redmine-API-Key` header auth.
 
 ### Database
 
