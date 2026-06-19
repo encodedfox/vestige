@@ -682,6 +682,12 @@ impl SqliteMemoryStore {
         let valid_from_str = input.valid_from.map(|dt| dt.to_rfc3339());
         let valid_until_str = input.valid_until.map(|dt| dt.to_rfc3339());
 
+        // #57 Source envelope — flatten to nullable column values. A node with
+        // no external provenance leaves all nine columns NULL (legacy shape).
+        let env = input.source_envelope.clone().unwrap_or_default();
+        let env_source_updated_at = env.source_updated_at.map(|dt| dt.to_rfc3339());
+        let env_synced_at = env.synced_at.map(|dt| dt.to_rfc3339());
+
         {
             let writer = self
                 .writer
@@ -694,14 +700,18 @@ impl SqliteMemoryStore {
                     storage_strength, retrieval_strength, retention_strength,
                     sentiment_score, sentiment_magnitude, next_review, scheduled_days,
                     source, tags, valid_from, valid_until, has_embedding, embedding_model,
-                    domains, domain_scores
+                    domains, domain_scores,
+                    source_system, source_id, source_url, source_updated_at,
+                    content_hash, synced_at, source_project, source_type, source_author
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14,
                     ?15, ?16, ?17, ?18,
                     ?19, ?20, ?21, ?22, ?23, ?24,
-                    '[]', '{}'
+                    '[]', '{}',
+                    ?25, ?26, ?27, ?28,
+                    ?29, ?30, ?31, ?32, ?33
                 )",
                 params![
                     id,
@@ -728,6 +738,15 @@ impl SqliteMemoryStore {
                     valid_until_str,
                     0,
                     Option::<String>::None,
+                    env.source_system,
+                    env.source_id,
+                    env.source_url,
+                    env_source_updated_at,
+                    env.content_hash,
+                    env_synced_at,
+                    env.source_project,
+                    env.source_type,
+                    env.source_author,
                 ],
             )?;
         }
@@ -1257,6 +1276,33 @@ impl SqliteMemoryStore {
                 .ok()
         });
 
+        // #57 Source envelope columns (Migration V17). `.ok().flatten()` is
+        // tolerant of pre-V17 databases that lack these columns. Collapse an
+        // all-NULL envelope to `None` so legacy nodes serialize unchanged.
+        let parse_ts = |s: Option<String>| -> Option<DateTime<Utc>> {
+            s.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok()
+            })
+        };
+        let envelope = crate::memory::SourceEnvelope {
+            source_system: row.get("source_system").ok().flatten(),
+            source_id: row.get("source_id").ok().flatten(),
+            source_url: row.get("source_url").ok().flatten(),
+            source_updated_at: parse_ts(row.get("source_updated_at").ok().flatten()),
+            content_hash: row.get("content_hash").ok().flatten(),
+            synced_at: parse_ts(row.get("synced_at").ok().flatten()),
+            source_project: row.get("source_project").ok().flatten(),
+            source_type: row.get("source_type").ok().flatten(),
+            source_author: row.get("source_author").ok().flatten(),
+        };
+        let source_envelope = if envelope.is_empty() {
+            None
+        } else {
+            Some(envelope)
+        };
+
         Ok(KnowledgeNode {
             id: row.get("id")?,
             content: row.get("content")?,
@@ -1293,6 +1339,8 @@ impl SqliteMemoryStore {
             // v2.0.5 Active Forgetting
             suppression_count,
             suppressed_at,
+            // #57 Source envelope
+            source_envelope,
         })
     }
 
@@ -9416,6 +9464,336 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
 }
 
 // ============================================================================
+// CONNECTOR SYNC (#57) — idempotent external-source ingestion
+// ============================================================================
+
+/// What `upsert_by_source` did with one external record. Drives the
+/// created/updated/unchanged/tombstoned counts a connector reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceUpsertOutcome {
+    /// No memory existed for this `(source_system, source_id)` — inserted.
+    Created,
+    /// A memory existed and the `content_hash` changed — body + envelope updated
+    /// and the embedding regenerated.
+    Updated,
+    /// A memory existed with the same `content_hash` — nothing rewritten except
+    /// `synced_at` (so an incremental re-scan is free).
+    Unchanged,
+}
+
+/// Result of one `upsert_by_source` call.
+#[derive(Debug, Clone)]
+pub struct SourceUpsertResult {
+    pub outcome: SourceUpsertOutcome,
+    /// Memory id of the affected node (new or existing).
+    pub node_id: String,
+}
+
+/// Incremental-sync checkpoint for one `(source_system, scope)`.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorCursor {
+    pub source_system: String,
+    pub scope: String,
+    /// High-water mark on the source's update timestamp. `None` on first sync.
+    pub cursor_updated_at: Option<DateTime<Utc>>,
+    pub last_synced_at: Option<DateTime<Utc>>,
+    pub last_full_reconcile_at: Option<DateTime<Utc>>,
+    pub records_seen: i64,
+}
+
+/// Outcome of a tombstone reconciliation pass.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileReport {
+    /// Memory ids that were tombstoned (no longer visible upstream).
+    pub tombstoned: Vec<String>,
+    /// Number of local records considered for this scope.
+    pub considered: usize,
+}
+
+impl SqliteMemoryStore {
+    /// Idempotently upsert one external-source record, keyed on the envelope's
+    /// `(source_system, source_id)` (#57).
+    ///
+    /// This is the core primitive every connector calls per record. It makes
+    /// re-running a sync safe and cheap:
+    ///
+    /// - **No existing memory** for the key → insert (`Created`).
+    /// - **Existing memory, `content_hash` changed** → update content + envelope,
+    ///   stamp `updated_at`, regenerate the embedding (`Updated`).
+    /// - **Existing memory, `content_hash` unchanged** → touch only `synced_at`
+    ///   so the reconcile pass knows the record is still live (`Unchanged`).
+    ///
+    /// The caller MUST set `source_system`, `source_id`, and `content_hash` on
+    /// the input's `source_envelope`; otherwise this falls back to a plain
+    /// `ingest` (an un-keyed record can't be deduplicated).
+    pub fn upsert_by_source(&self, input: IngestInput) -> Result<SourceUpsertResult> {
+        let env = match input.source_envelope.clone() {
+            Some(e) if e.has_key() => e,
+            // No idempotency key — behave like a normal create.
+            _ => {
+                let node = self.ingest(input)?;
+                return Ok(SourceUpsertResult {
+                    outcome: SourceUpsertOutcome::Created,
+                    node_id: node.id,
+                });
+            }
+        };
+
+        let source_system = env.source_system.clone().unwrap_or_default();
+        let source_id = env.source_id.clone().unwrap_or_default();
+        let now = Utc::now();
+
+        // Look up the existing memory for this external record, if any.
+        let existing: Option<(String, Option<String>)> = {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            reader
+                .query_row(
+                    "SELECT id, content_hash FROM knowledge_nodes \
+                     WHERE source_system = ?1 AND source_id = ?2 LIMIT 1",
+                    params![source_system, source_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?
+        };
+
+        let Some((node_id, stored_hash)) = existing else {
+            // First time we've seen this record — plain insert carries the
+            // envelope through the existing ingest path.
+            let node = self.ingest(input)?;
+            return Ok(SourceUpsertResult {
+                outcome: SourceUpsertOutcome::Created,
+                node_id: node.id,
+            });
+        };
+
+        let new_hash = env.content_hash.clone();
+        let unchanged = match (&stored_hash, &new_hash) {
+            // Both present and equal → genuinely unchanged.
+            (Some(a), Some(b)) => a == b,
+            // Either side missing a hash → be conservative and treat as changed
+            // so we never silently skip a real update.
+            _ => false,
+        };
+
+        let env_source_updated_at = env.source_updated_at.map(|dt| dt.to_rfc3339());
+        let synced_at = now.to_rfc3339();
+
+        if unchanged {
+            // Cheapest path: only advance liveness + the source cursor field.
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            writer.execute(
+                // Un-tombstone fully: a reappearing record clears BOTH bitemporal
+                // markers (valid_until AND superseded_by), otherwise it would be
+                // resurrected as currently-valid yet still flagged as superseded,
+                // which permanently excludes it from merge/consolidation.
+                "UPDATE knowledge_nodes \
+                 SET synced_at = ?1, source_updated_at = COALESCE(?2, source_updated_at), \
+                     source_url = COALESCE(?3, source_url), \
+                     valid_until = NULL, superseded_by = NULL \
+                 WHERE id = ?4",
+                params![synced_at, env_source_updated_at, env.source_url, node_id],
+            )?;
+            return Ok(SourceUpsertResult {
+                outcome: SourceUpsertOutcome::Unchanged,
+                node_id,
+            });
+        }
+
+        // Content changed upstream → update body + full envelope, clear any
+        // prior tombstone (`valid_until`), then regenerate the embedding.
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            writer.execute(
+                // Clear BOTH bitemporal markers on update (see Unchanged branch).
+                "UPDATE knowledge_nodes SET \
+                    content = ?1, updated_at = ?2, synced_at = ?3, \
+                    content_hash = ?4, source_url = ?5, source_updated_at = ?6, \
+                    source_project = ?7, source_type = ?8, source_author = ?9, \
+                    valid_until = NULL, superseded_by = NULL \
+                 WHERE id = ?10",
+                params![
+                    input.content,
+                    now.to_rfc3339(),
+                    synced_at,
+                    env.content_hash,
+                    env.source_url,
+                    env_source_updated_at,
+                    env.source_project,
+                    env.source_type,
+                    env.source_author,
+                    node_id,
+                ],
+            )?;
+        }
+
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        {
+            if let Some(index) = self.vector_index.as_ref()
+                && let Ok(mut index) = index.lock()
+            {
+                let _ = index.remove(&node_id);
+            }
+            if let Err(e) = self.generate_embedding_for_node(&node_id, &input.content) {
+                tracing::warn!("Failed to regenerate embedding for {}: {}", node_id, e);
+            }
+        }
+
+        Ok(SourceUpsertResult {
+            outcome: SourceUpsertOutcome::Updated,
+            node_id,
+        })
+    }
+
+    /// Read the incremental-sync checkpoint for a `(source_system, scope)`.
+    /// Returns a zeroed cursor (no high-water mark) if none has been saved yet.
+    pub fn get_connector_cursor(&self, source_system: &str, scope: &str) -> Result<ConnectorCursor> {
+        let reader = self
+            .reader
+            .lock()
+            .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+        let row = reader
+            .query_row(
+                "SELECT cursor_updated_at, last_synced_at, last_full_reconcile_at, records_seen \
+                 FROM connector_cursors WHERE source_system = ?1 AND scope = ?2",
+                params![source_system, scope],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let parse = |s: Option<String>| -> Option<DateTime<Utc>> {
+            s.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .ok()
+            })
+        };
+
+        Ok(match row {
+            Some((cur, last, recon, seen)) => ConnectorCursor {
+                source_system: source_system.to_string(),
+                scope: scope.to_string(),
+                cursor_updated_at: parse(cur),
+                last_synced_at: parse(last),
+                last_full_reconcile_at: parse(recon),
+                records_seen: seen,
+            },
+            None => ConnectorCursor {
+                source_system: source_system.to_string(),
+                scope: scope.to_string(),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// Persist the incremental-sync checkpoint for a `(source_system, scope)`.
+    pub fn save_connector_cursor(&self, cursor: &ConnectorCursor) -> Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+        writer.execute(
+            "INSERT INTO connector_cursors \
+                (source_system, scope, cursor_updated_at, last_synced_at, \
+                 last_full_reconcile_at, records_seen) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(source_system, scope) DO UPDATE SET \
+                cursor_updated_at = excluded.cursor_updated_at, \
+                last_synced_at = excluded.last_synced_at, \
+                last_full_reconcile_at = excluded.last_full_reconcile_at, \
+                records_seen = excluded.records_seen",
+            params![
+                cursor.source_system,
+                cursor.scope,
+                cursor.cursor_updated_at.map(|d| d.to_rfc3339()),
+                cursor.last_synced_at.map(|d| d.to_rfc3339()),
+                cursor.last_full_reconcile_at.map(|d| d.to_rfc3339()),
+                cursor.records_seen,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reconcile deletions for a scope: tombstone every local memory in
+    /// `(source_system, source_project = scope)` whose `source_id` is NOT in the
+    /// caller-supplied set of currently-live ids (#57).
+    ///
+    /// Neither Redmine nor GitHub exposes a deletion feed, so an incremental
+    /// `updated_at` sync can never see a delete. The connector therefore
+    /// periodically enumerates the full set of live ids and calls this. We
+    /// **invalidate, don't purge** (Graphiti-style): the memory keeps its
+    /// content for audit but gets `valid_until = now`, so it falls out of
+    /// "currently valid" retrieval without losing history. A record that
+    /// reappears upstream is un-tombstoned by the next `upsert_by_source`
+    /// (which clears `valid_until`).
+    pub fn reconcile_source_tombstones(
+        &self,
+        source_system: &str,
+        scope: &str,
+        live_ids: &[String],
+    ) -> Result<ReconcileReport> {
+        let live: std::collections::HashSet<&str> = live_ids.iter().map(|s| s.as_str()).collect();
+
+        // All currently-valid local records for this scope.
+        let local: Vec<(String, String)> = {
+            let reader = self
+                .reader
+                .lock()
+                .map_err(|_| StorageError::Init("Reader lock poisoned".into()))?;
+            let mut stmt = reader.prepare(
+                "SELECT id, source_id FROM knowledge_nodes \
+                 WHERE source_system = ?1 AND source_project = ?2 \
+                   AND source_id IS NOT NULL AND valid_until IS NULL",
+            )?;
+            let rows = stmt.query_map(params![source_system, scope], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let considered = local.len();
+        let now = Utc::now().to_rfc3339();
+        let mut tombstoned = Vec::new();
+
+        {
+            let writer = self
+                .writer
+                .lock()
+                .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+            for (node_id, source_id) in &local {
+                if !live.contains(source_id.as_str()) {
+                    writer.execute(
+                        "UPDATE knowledge_nodes SET valid_until = ?1 WHERE id = ?2",
+                        params![now, node_id],
+                    )?;
+                    tombstoned.push(node_id.clone());
+                }
+            }
+        }
+
+        Ok(ReconcileReport {
+            tombstoned,
+            considered,
+        })
+    }
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -9441,6 +9819,234 @@ mod tests {
 
     fn create_test_storage_at(dir: &tempfile::TempDir, name: &str) -> Storage {
         Storage::new(Some(dir.path().join(name))).unwrap()
+    }
+
+    // ===================== Connector sync (#57) =========================
+
+    /// Build an `IngestInput` carrying a source envelope for a GitHub-ish issue.
+    fn source_input(id: &str, content: &str, hash: &str) -> IngestInput {
+        IngestInput {
+            content: content.to_string(),
+            node_type: "fact".to_string(),
+            source_envelope: Some(crate::memory::SourceEnvelope {
+                source_system: Some("github".to_string()),
+                source_id: Some(id.to_string()),
+                source_url: Some(format!("https://github.com/o/r/issues/{id}")),
+                content_hash: Some(hash.to_string()),
+                source_project: Some("o/r".to_string()),
+                source_type: Some("issue".to_string()),
+                source_author: Some("octocat".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn node_count(store: &Storage) -> i64 {
+        // Count rows for our test source so embeddings/other tests don't bleed in.
+        let reader = store.reader.lock().unwrap();
+        reader
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_nodes WHERE source_system = 'github'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn upsert_by_source_is_idempotent_across_reruns() {
+        let store = create_test_storage();
+
+        // First sync: a brand-new record → Created.
+        let r1 = store
+            .upsert_by_source(source_input("1", "Bug: crash on startup", "hash-a"))
+            .unwrap();
+        assert_eq!(r1.outcome, SourceUpsertOutcome::Created);
+        assert_eq!(node_count(&store), 1);
+
+        // Re-sync the SAME record with the SAME hash twice → Unchanged, no dupes.
+        for _ in 0..2 {
+            let r = store
+                .upsert_by_source(source_input("1", "Bug: crash on startup", "hash-a"))
+                .unwrap();
+            assert_eq!(r.outcome, SourceUpsertOutcome::Unchanged);
+            assert_eq!(r.node_id, r1.node_id, "must reuse the same memory id");
+        }
+        assert_eq!(node_count(&store), 1, "idempotent: still exactly one memory");
+    }
+
+    #[test]
+    fn upsert_by_source_updates_in_place_when_hash_changes() {
+        let store = create_test_storage();
+        let created = store
+            .upsert_by_source(source_input("7", "old body", "hash-old"))
+            .unwrap();
+
+        // Upstream edit: content + hash change → Updated, same id, new content.
+        let updated = store
+            .upsert_by_source(source_input("7", "new edited body", "hash-new"))
+            .unwrap();
+        assert_eq!(updated.outcome, SourceUpsertOutcome::Updated);
+        assert_eq!(updated.node_id, created.node_id);
+        assert_eq!(node_count(&store), 1, "update must not duplicate");
+
+        let node = store.get_node(&created.node_id).unwrap().unwrap();
+        assert_eq!(node.content, "new edited body");
+        let env = node.source_envelope.expect("envelope persisted");
+        assert_eq!(env.content_hash.as_deref(), Some("hash-new"));
+        assert_eq!(env.source_id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn upsert_by_source_without_key_falls_back_to_create() {
+        let store = create_test_storage();
+        // Envelope present but missing source_id → not keyed → plain create.
+        let input = IngestInput {
+            content: "loose note".to_string(),
+            node_type: "fact".to_string(),
+            source_envelope: Some(crate::memory::SourceEnvelope {
+                source_url: Some("https://example.com/x".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = store.upsert_by_source(input).unwrap();
+        assert_eq!(r.outcome, SourceUpsertOutcome::Created);
+    }
+
+    #[test]
+    fn connector_cursor_round_trips() {
+        let store = create_test_storage();
+        // Unknown scope → zeroed cursor.
+        let empty = store.get_connector_cursor("github", "o/r").unwrap();
+        assert!(empty.cursor_updated_at.is_none());
+        assert_eq!(empty.records_seen, 0);
+
+        let ts = Utc::now();
+        let cursor = ConnectorCursor {
+            source_system: "github".to_string(),
+            scope: "o/r".to_string(),
+            cursor_updated_at: Some(ts),
+            last_synced_at: Some(ts),
+            last_full_reconcile_at: None,
+            records_seen: 42,
+        };
+        store.save_connector_cursor(&cursor).unwrap();
+
+        let back = store.get_connector_cursor("github", "o/r").unwrap();
+        assert_eq!(back.records_seen, 42);
+        assert_eq!(
+            back.cursor_updated_at.map(|d| d.to_rfc3339()),
+            Some(ts.to_rfc3339())
+        );
+
+        // Upsert semantics: saving again replaces, never duplicates.
+        let mut c2 = cursor.clone();
+        c2.records_seen = 99;
+        store.save_connector_cursor(&c2).unwrap();
+        assert_eq!(store.get_connector_cursor("github", "o/r").unwrap().records_seen, 99);
+    }
+
+    #[test]
+    fn reconcile_tombstones_records_absent_from_live_set() {
+        let store = create_test_storage();
+        // Three synced issues in scope o/r.
+        for id in ["1", "2", "3"] {
+            store
+                .upsert_by_source(source_input(id, &format!("issue {id}"), &format!("h{id}")))
+                .unwrap();
+        }
+
+        // Reconcile: only 1 and 3 are still visible upstream → 2 is tombstoned.
+        let report = store
+            .reconcile_source_tombstones("github", "o/r", &["1".to_string(), "3".to_string()])
+            .unwrap();
+        assert_eq!(report.considered, 3);
+        assert_eq!(report.tombstoned.len(), 1, "exactly issue 2 tombstoned");
+
+        // Issue 2's memory is invalidated (valid_until set) but NOT purged —
+        // content retained for audit, just no longer currently-valid.
+        let two = {
+            let reader = store.reader.lock().unwrap();
+            reader
+                .query_row(
+                    "SELECT id, valid_until FROM knowledge_nodes WHERE source_id = '2'",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+        };
+        assert!(two.1.is_some(), "tombstoned record must have valid_until set");
+        let node = store.get_node(&two.0).unwrap().unwrap();
+        assert!(!node.is_currently_valid(), "tombstoned node is not valid now");
+        assert_eq!(node.content, "issue 2", "content retained for audit");
+
+        // A reappearing record un-tombstones on next upsert (clears valid_until).
+        store
+            .upsert_by_source(source_input("2", "issue 2", "h2"))
+            .unwrap();
+        let revived = store.get_node(&two.0).unwrap().unwrap();
+        assert!(revived.is_currently_valid(), "re-synced record is valid again");
+    }
+
+    #[test]
+    fn upsert_clears_superseded_by_when_record_reappears() {
+        // Regression: un-tombstoning must clear BOTH bitemporal markers. A
+        // connector node that was superseded/merged (valid_until + superseded_by
+        // both set) and then re-observed upstream must come back fully clean,
+        // otherwise it is currently-valid yet still flagged superseded and is
+        // permanently excluded from merge candidacy.
+        let store = create_test_storage();
+        let created = store
+            .upsert_by_source(source_input("9", "body v1", "h9a"))
+            .unwrap();
+
+        // Simulate the node having been superseded (as merge/supersede would).
+        {
+            let writer = store.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET valid_until = ?1, superseded_by = 'survivor-id' WHERE id = ?2",
+                    params![Utc::now().to_rfc3339(), created.node_id],
+                )
+                .unwrap();
+        }
+        assert!(
+            store.superseded_node_ids().unwrap().contains(&created.node_id),
+            "precondition: node is superseded"
+        );
+
+        // Re-sync with a content change → Updated branch must clear both markers.
+        let res = store
+            .upsert_by_source(source_input("9", "body v2 edited", "h9b"))
+            .unwrap();
+        assert_eq!(res.outcome, SourceUpsertOutcome::Updated);
+        assert!(
+            !store.superseded_node_ids().unwrap().contains(&created.node_id),
+            "superseded_by must be cleared on re-sync (no bitemporal zombie)"
+        );
+        let node = store.get_node(&created.node_id).unwrap().unwrap();
+        assert!(node.is_currently_valid());
+
+        // Also exercise the Unchanged branch: supersede again, re-sync same hash.
+        {
+            let writer = store.writer.lock().unwrap();
+            writer
+                .execute(
+                    "UPDATE knowledge_nodes SET valid_until = ?1, superseded_by = 'survivor-id' WHERE id = ?2",
+                    params![Utc::now().to_rfc3339(), created.node_id],
+                )
+                .unwrap();
+        }
+        let res2 = store
+            .upsert_by_source(source_input("9", "body v2 edited", "h9b"))
+            .unwrap();
+        assert_eq!(res2.outcome, SourceUpsertOutcome::Unchanged);
+        assert!(
+            !store.superseded_node_ids().unwrap().contains(&created.node_id),
+            "Unchanged branch must also clear superseded_by"
+        );
     }
 
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]

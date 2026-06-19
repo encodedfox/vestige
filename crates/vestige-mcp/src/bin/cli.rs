@@ -1817,6 +1817,7 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
             tags: memory.tags.unwrap_or_default(),
             valid_from: None,
             valid_until: None,
+            source_envelope: None,
         };
 
         match storage.ingest(input) {
@@ -2415,6 +2416,7 @@ fn run_ingest(
         tags: tag_list,
         valid_from: None,
         valid_until: None,
+        source_envelope: None,
     };
 
     let storage = open_storage()?;

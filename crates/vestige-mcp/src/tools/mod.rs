@@ -12,6 +12,8 @@ pub mod intention_unified;
 pub mod memory_unified;
 pub mod search_unified;
 pub mod smart_ingest;
+// #57: external-source connectors (GitHub Issues / Redmine retrieval layer)
+pub mod source_sync;
 
 // v1.2: Temporal query tools
 pub mod changelog;

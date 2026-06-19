@@ -889,6 +889,31 @@ pub fn apply_output_masks(results: &mut [Value], output_config: &OutputConfig) {
     }
 }
 
+/// Build a compact `source` object from a node's connector provenance (#57),
+/// or `Value::Null` when the memory has no external source envelope.
+///
+/// Surfacing `url` in search results is the whole point of the connector layer:
+/// the agent can follow the citation back to the canonical Redmine/GitHub record
+/// for authoritative detail. `tombstoned` flags records no longer visible
+/// upstream (kept for audit).
+fn source_provenance(node: &vestige_core::KnowledgeNode) -> Value {
+    let Some(env) = node.source_envelope.as_ref() else {
+        return Value::Null;
+    };
+    serde_json::json!({
+        "system": env.source_system,
+        "id": env.source_id,
+        "url": env.source_url,
+        "project": env.source_project,
+        "type": env.source_type,
+        "author": env.source_author,
+        "sourceUpdatedAt": env.source_updated_at.map(|dt| dt.to_rfc3339()),
+        "syncedAt": env.synced_at.map(|dt| dt.to_rfc3339()),
+        // A tombstoned (no-longer-visible) record has valid_until set in the past.
+        "tombstoned": !node.is_currently_valid(),
+    })
+}
+
 fn format_search_result(r: &vestige_core::SearchResult, detail_level: &str) -> Value {
     match detail_level {
         "brief" => serde_json::json!({
@@ -898,45 +923,65 @@ fn format_search_result(r: &vestige_core::SearchResult, detail_level: &str) -> V
             "retentionStrength": r.node.retention_strength,
             "combinedScore": r.combined_score,
         }),
-        "full" => serde_json::json!({
-            "id": r.node.id,
-            "content": r.node.content,
-            "combinedScore": r.combined_score,
-            "keywordScore": r.keyword_score,
-            "semanticScore": r.semantic_score,
-            "nodeType": r.node.node_type,
-            "tags": r.node.tags,
-            "retentionStrength": r.node.retention_strength,
-            "storageStrength": r.node.storage_strength,
-            "retrievalStrength": r.node.retrieval_strength,
-            "source": r.node.source,
-            "sentimentScore": r.node.sentiment_score,
-            "sentimentMagnitude": r.node.sentiment_magnitude,
-            "createdAt": r.node.created_at.to_rfc3339(),
-            "updatedAt": r.node.updated_at.to_rfc3339(),
-            "lastAccessed": r.node.last_accessed.to_rfc3339(),
-            "nextReview": r.node.next_review.map(|dt| dt.to_rfc3339()),
-            "stability": r.node.stability,
-            "difficulty": r.node.difficulty,
-            "reps": r.node.reps,
-            "lapses": r.node.lapses,
-            "validFrom": r.node.valid_from.map(|dt| dt.to_rfc3339()),
-            "validUntil": r.node.valid_until.map(|dt| dt.to_rfc3339()),
-            "matchType": format!("{:?}", r.match_type),
-        }),
+        "full" => {
+            let mut v = serde_json::json!({
+                "id": r.node.id,
+                "content": r.node.content,
+                "combinedScore": r.combined_score,
+                "keywordScore": r.keyword_score,
+                "semanticScore": r.semantic_score,
+                "nodeType": r.node.node_type,
+                "tags": r.node.tags,
+                "retentionStrength": r.node.retention_strength,
+                "storageStrength": r.node.storage_strength,
+                "retrievalStrength": r.node.retrieval_strength,
+                "source": r.node.source,
+                "sentimentScore": r.node.sentiment_score,
+                "sentimentMagnitude": r.node.sentiment_magnitude,
+                "createdAt": r.node.created_at.to_rfc3339(),
+                "updatedAt": r.node.updated_at.to_rfc3339(),
+                "lastAccessed": r.node.last_accessed.to_rfc3339(),
+                "nextReview": r.node.next_review.map(|dt| dt.to_rfc3339()),
+                "stability": r.node.stability,
+                "difficulty": r.node.difficulty,
+                "reps": r.node.reps,
+                "lapses": r.node.lapses,
+                "validFrom": r.node.valid_from.map(|dt| dt.to_rfc3339()),
+                "validUntil": r.node.valid_until.map(|dt| dt.to_rfc3339()),
+                "matchType": format!("{:?}", r.match_type),
+            });
+            attach_source_record(&mut v, &r.node);
+            v
+        }
         // "summary" (default) — includes dates so AI never has to guess when a memory is from
-        _ => serde_json::json!({
-            "id": r.node.id,
-            "content": r.node.content,
-            "combinedScore": r.combined_score,
-            "keywordScore": r.keyword_score,
-            "semanticScore": r.semantic_score,
-            "nodeType": r.node.node_type,
-            "tags": r.node.tags,
-            "retentionStrength": r.node.retention_strength,
-            "createdAt": r.node.created_at.to_rfc3339(),
-            "updatedAt": r.node.updated_at.to_rfc3339(),
-        }),
+        _ => {
+            let mut v = serde_json::json!({
+                "id": r.node.id,
+                "content": r.node.content,
+                "combinedScore": r.combined_score,
+                "keywordScore": r.keyword_score,
+                "semanticScore": r.semantic_score,
+                "nodeType": r.node.node_type,
+                "tags": r.node.tags,
+                "retentionStrength": r.node.retention_strength,
+                "createdAt": r.node.created_at.to_rfc3339(),
+                "updatedAt": r.node.updated_at.to_rfc3339(),
+            });
+            attach_source_record(&mut v, &r.node);
+            v
+        }
+    }
+}
+
+/// Inject a `sourceRecord` object into a result `Value` ONLY when the memory
+/// has external provenance, so legacy (agent/user-authored) memories keep their
+/// exact prior result shape.
+fn attach_source_record(value: &mut Value, node: &vestige_core::KnowledgeNode) {
+    let provenance = source_provenance(node);
+    if !provenance.is_null()
+        && let Value::Object(map) = value
+    {
+        map.insert("sourceRecord".to_string(), provenance);
     }
 }
 
@@ -950,36 +995,44 @@ pub fn format_node(node: &vestige_core::KnowledgeNode, detail_level: &str) -> Va
             "tags": node.tags,
             "retentionStrength": node.retention_strength,
         }),
-        "full" => serde_json::json!({
-            "id": node.id,
-            "content": node.content,
-            "nodeType": node.node_type,
-            "tags": node.tags,
-            "retentionStrength": node.retention_strength,
-            "storageStrength": node.storage_strength,
-            "retrievalStrength": node.retrieval_strength,
-            "source": node.source,
-            "sentimentScore": node.sentiment_score,
-            "sentimentMagnitude": node.sentiment_magnitude,
-            "createdAt": node.created_at.to_rfc3339(),
-            "updatedAt": node.updated_at.to_rfc3339(),
-            "lastAccessed": node.last_accessed.to_rfc3339(),
-            "nextReview": node.next_review.map(|dt| dt.to_rfc3339()),
-            "stability": node.stability,
-            "difficulty": node.difficulty,
-            "reps": node.reps,
-            "lapses": node.lapses,
-            "validFrom": node.valid_from.map(|dt| dt.to_rfc3339()),
-            "validUntil": node.valid_until.map(|dt| dt.to_rfc3339()),
-        }),
+        "full" => {
+            let mut v = serde_json::json!({
+                "id": node.id,
+                "content": node.content,
+                "nodeType": node.node_type,
+                "tags": node.tags,
+                "retentionStrength": node.retention_strength,
+                "storageStrength": node.storage_strength,
+                "retrievalStrength": node.retrieval_strength,
+                "source": node.source,
+                "sentimentScore": node.sentiment_score,
+                "sentimentMagnitude": node.sentiment_magnitude,
+                "createdAt": node.created_at.to_rfc3339(),
+                "updatedAt": node.updated_at.to_rfc3339(),
+                "lastAccessed": node.last_accessed.to_rfc3339(),
+                "nextReview": node.next_review.map(|dt| dt.to_rfc3339()),
+                "stability": node.stability,
+                "difficulty": node.difficulty,
+                "reps": node.reps,
+                "lapses": node.lapses,
+                "validFrom": node.valid_from.map(|dt| dt.to_rfc3339()),
+                "validUntil": node.valid_until.map(|dt| dt.to_rfc3339()),
+            });
+            attach_source_record(&mut v, node);
+            v
+        }
         // "summary" (default)
-        _ => serde_json::json!({
-            "id": node.id,
-            "content": node.content,
-            "nodeType": node.node_type,
-            "tags": node.tags,
-            "retentionStrength": node.retention_strength,
-        }),
+        _ => {
+            let mut v = serde_json::json!({
+                "id": node.id,
+                "content": node.content,
+                "nodeType": node.node_type,
+                "tags": node.tags,
+                "retentionStrength": node.retention_strength,
+            });
+            attach_source_record(&mut v, node);
+            v
+        }
     }
 }
 
@@ -1016,6 +1069,7 @@ mod tests {
             tags: vec![],
             valid_from: None,
             valid_until: None,
+            source_envelope: None,
         };
         let node = storage.ingest(input).unwrap();
         node.id
@@ -1839,6 +1893,7 @@ mod tests {
             tags: tags.into_iter().map(String::from).collect(),
             valid_from: None,
             valid_until: None,
+            source_envelope: None,
         };
         let node = storage.ingest(input).unwrap();
         node.id

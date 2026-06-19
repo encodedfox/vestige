@@ -84,6 +84,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "ADR 0001 Phase 1: embedding_model registry, domains/domain_scores columns, domains table",
         up: MIGRATION_V16_UP,
     },
+    Migration {
+        version: 17,
+        description: "#57 Source envelope: provenance columns + connector cursor checkpoints for idempotent external-source sync",
+        up: MIGRATION_V17_UP,
+    },
 ];
 
 /// A database migration
@@ -957,6 +962,73 @@ pub const MIGRATION_V16_ALTER_COLUMNS: &[&str] = &[
     "ALTER TABLE knowledge_nodes ADD COLUMN domain_scores TEXT NOT NULL DEFAULT '{}'",
 ];
 
+/// V17: #57 Source envelope — structured provenance for connector-ingested
+/// records, plus a per-connector cursor checkpoint table.
+///
+/// The provenance columns live directly on `knowledge_nodes` (rather than a
+/// side table) so search can filter and cite them with no join. They are all
+/// nullable and default-NULL, so every existing memory is untouched and the
+/// migration is purely additive — legacy rows simply have no envelope.
+///
+/// The `(source_system, source_id)` pair is the idempotency key for
+/// `upsert_by_source`; the unique index enforces one memory per external
+/// record. `content_hash` is the change detector. `connector_cursors` holds the
+/// incremental-sync high-water mark and last full-reconcile time per
+/// (source_system, scope).
+///
+/// The `ALTER TABLE ... ADD COLUMN` statements are split into
+/// `MIGRATION_V17_ALTER_COLUMNS` and run individually by the migration runner,
+/// because SQLite has no `ADD COLUMN IF NOT EXISTS`; duplicate-column errors are
+/// swallowed so replay stays idempotent.
+const MIGRATION_V17_UP: &str = r#"
+-- Idempotency key: at most one memory per (source_system, source_id).
+-- Partial unique index so the millions of envelope-less legacy rows (all NULL)
+-- don't collide and don't pay index cost.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_source_key
+    ON knowledge_nodes(source_system, source_id)
+    WHERE source_system IS NOT NULL AND source_id IS NOT NULL;
+
+-- Filter/scan support for source-aware search + reconciliation passes.
+CREATE INDEX IF NOT EXISTS idx_nodes_source_system
+    ON knowledge_nodes(source_system)
+    WHERE source_system IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_nodes_source_project
+    ON knowledge_nodes(source_project)
+    WHERE source_project IS NOT NULL;
+
+-- Per-connector incremental-sync checkpoint. One row per (source_system, scope)
+-- e.g. ('github', 'samvallad33/vestige'). `cursor_updated_at` is the
+-- high-water mark on the source's update timestamp; `last_full_reconcile_at`
+-- gates the (expensive) deletion-reconcile pass.
+CREATE TABLE IF NOT EXISTS connector_cursors (
+    source_system          TEXT NOT NULL,
+    scope                  TEXT NOT NULL,
+    cursor_updated_at      TEXT,
+    last_synced_at         TEXT,
+    last_full_reconcile_at TEXT,
+    records_seen           INTEGER NOT NULL DEFAULT 0,
+    config                 TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (source_system, scope)
+);
+
+UPDATE schema_version SET version = 17, applied_at = datetime('now');
+"#;
+
+/// The `ALTER TABLE` statements for V17. Run individually + idempotently by the
+/// migration runner (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+pub const MIGRATION_V17_ALTER_COLUMNS: &[&str] = &[
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_system TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_id TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_url TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_updated_at TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN content_hash TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN synced_at TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_project TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_type TEXT",
+    "ALTER TABLE knowledge_nodes ADD COLUMN source_author TEXT",
+];
+
 /// Apply pending migrations
 pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
     let current_version = get_current_version(conn)?;
@@ -994,6 +1066,15 @@ pub fn apply_migrations(conn: &rusqlite::Connection) -> rusqlite::Result<u32> {
                 }
             }
 
+            // V17 (#57) adds the source-envelope columns. Same idempotent
+            // ALTER handling as V16 — the unique index in the V17 batch
+            // references these columns, so they must exist before the batch.
+            if migration.version == 17 {
+                for stmt in MIGRATION_V17_ALTER_COLUMNS {
+                    add_column_if_missing(conn, stmt)?;
+                }
+            }
+
             // Use execute_batch to handle multi-statement SQL including triggers
             conn.execute_batch(migration.up)?;
 
@@ -1026,11 +1107,11 @@ mod tests {
         // Pre-requisite: schema_version must be bootstrapped by V1.
         apply_migrations(&conn).expect("apply_migrations succeeds");
 
-        // 1. schema_version advanced to V16
+        // 1. schema_version advanced to the latest migration
         let version = get_current_version(&conn).expect("read schema_version");
         assert_eq!(
-            version, 16,
-            "schema_version must be 16 after all migrations"
+            version, 17,
+            "schema_version must be 17 after all migrations"
         );
 
         // 2. knowledge_edges is gone (V11 drops it)
@@ -1151,11 +1232,11 @@ mod tests {
         // Replay V11 onward. V11 uses DROP TABLE IF EXISTS so it is idempotent.
         // V12/V13 tombstone tables use CREATE TABLE IF NOT EXISTS. V14/V16 ALTER
         // TABLE idempotency is handled by the migration runner.
-        apply_migrations(&conn).expect("V11..V16 replay must be idempotent");
+        apply_migrations(&conn).expect("V11..V17 replay must be idempotent");
 
         // After replaying from V10, the schema advances to the latest version.
         let version = get_current_version(&conn).expect("read schema_version");
-        assert_eq!(version, 16, "schema_version back at 16 after replay");
+        assert_eq!(version, 17, "schema_version back at latest after replay");
     }
 
     #[test]
@@ -1229,7 +1310,97 @@ mod tests {
         // V16 uses CREATE TABLE IF NOT EXISTS and idempotent ALTER handling.
         apply_migrations(&conn).expect("V16 replay must be idempotent");
         let version = get_current_version(&conn).expect("read version");
-        assert_eq!(version, 16, "schema_version must be 16 after replay");
+        assert_eq!(version, 17, "schema_version must be latest after replay");
+    }
+
+    #[test]
+    fn v17_adds_source_envelope_columns_and_cursor_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+
+        // All nine envelope columns must exist on knowledge_nodes.
+        let cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(knowledge_nodes)")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("query_map")
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for c in [
+            "source_system",
+            "source_id",
+            "source_url",
+            "source_updated_at",
+            "content_hash",
+            "synced_at",
+            "source_project",
+            "source_type",
+            "source_author",
+        ] {
+            assert!(
+                cols.iter().any(|x| x == c),
+                "knowledge_nodes must have `{c}` column after V17"
+            );
+        }
+
+        // connector_cursors table must exist.
+        let cursor_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='connector_cursors'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(cursor_rows, 1, "connector_cursors must be created by V17");
+    }
+
+    #[test]
+    fn v17_unique_source_key_index_allows_many_null_legacy_rows() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("apply_migrations");
+
+        // Two legacy rows with NULL source key must NOT collide on the partial
+        // unique index (the index only covers non-NULL keys).
+        for id in ["a", "b"] {
+            conn.execute(
+                "INSERT INTO knowledge_nodes (id, content, node_type, created_at, updated_at, last_accessed, \
+                 stability, difficulty, reps, lapses, learning_state, storage_strength, retrieval_strength, \
+                 retention_strength, next_review, scheduled_days, has_embedding) \
+                 VALUES (?1,'c','fact',datetime('now'),datetime('now'),datetime('now'),\
+                 1.0,0.3,0,0,'new',1.0,1.0,1.0,datetime('now'),1,0)",
+                [id],
+            )
+            .expect("insert legacy row");
+        }
+
+        // Two real connector rows that share (source_system, source_id) MUST
+        // collide — the unique index is the idempotency guarantee.
+        conn.execute(
+            "UPDATE knowledge_nodes SET source_system='github', source_id='1' WHERE id='a'",
+            [],
+        )
+        .expect("set source key on a");
+        let dup = conn.execute(
+            "UPDATE knowledge_nodes SET source_system='github', source_id='1' WHERE id='b'",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (source_system, source_id) must violate the unique index"
+        );
+    }
+
+    #[test]
+    fn v17_is_replayable() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        apply_migrations(&conn).expect("first apply");
+        conn.execute("UPDATE schema_version SET version = 16", [])
+            .expect("rewind to 16");
+        apply_migrations(&conn).expect("V17 replay must be idempotent");
+        let version = get_current_version(&conn).expect("read version");
+        assert_eq!(version, 17, "schema_version must be 17 after replay");
     }
 
     #[test]

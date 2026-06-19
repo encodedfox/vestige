@@ -1119,6 +1119,7 @@ mod tests {
                 tags: tags.iter().map(|s| s.to_string()).collect(),
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap()
             .id

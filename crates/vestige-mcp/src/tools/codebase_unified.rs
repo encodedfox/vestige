@@ -154,6 +154,7 @@ async fn execute_remember_pattern(
         tags,
         valid_from: None,
         valid_until: None,
+        source_envelope: None,
     };
 
     let node = storage.ingest(input).map_err(|e| e.to_string())?;
@@ -250,6 +251,7 @@ async fn execute_remember_decision(
         tags,
         valid_from: None,
         valid_until: None,
+        source_envelope: None,
     };
 
     let node = storage.ingest(input).map_err(|e| e.to_string())?;
