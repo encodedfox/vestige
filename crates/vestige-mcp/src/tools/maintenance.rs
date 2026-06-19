@@ -778,6 +778,7 @@ mod tests {
                     tags: vec![],
                     valid_from: None,
                     valid_until: None,
+                    source_envelope: None,
                 })
                 .unwrap();
         }
@@ -832,6 +833,7 @@ mod tests {
                         tags: vec![],
                         valid_from: None,
                         valid_until: None,
+                        source_envelope: None,
                     })
                     .unwrap();
             }
@@ -904,6 +906,7 @@ mod tests {
                 tags: vec!["schema-test".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap();
 
@@ -1015,6 +1018,7 @@ mod tests {
                 tags: vec!["portable".to_string()],
                 valid_from: None,
                 valid_until: None,
+                source_envelope: None,
             })
             .unwrap();
 

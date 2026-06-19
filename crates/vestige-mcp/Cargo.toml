@@ -10,9 +10,13 @@ categories = ["command-line-utilities", "database"]
 repository = "https://github.com/samvallad33/vestige"
 
 [features]
-default = ["embeddings", "ort-download", "vector-search"]
+default = ["embeddings", "ort-download", "vector-search", "connectors"]
 embeddings = ["vestige-core/embeddings"]
 vector-search = ["vestige-core/vector-search"]
+# External-source connectors (#57): GitHub Issues / Redmine indexing via the
+# `source_sync` MCP tool. On by default so the tool works out of the box; turn
+# off for a build with no HTTP client.
+connectors = ["vestige-core/connectors"]
 # Default ort backend: downloads prebuilt ONNX Runtime at build time.
 # Fails on targets without prebuilts (notably x86_64-apple-darwin).
 ort-download = ["embeddings", "vestige-core/ort-download"]

@@ -57,6 +57,12 @@ qwen3-embeddings = ["embeddings", "fastembed/qwen3", "dep:candle-core"]
 # Backwards-compatible feature alias from the original v2.1.0 naming.
 qwen3-reranker = ["qwen3-embeddings"]
 
+# External-source connectors (#57). The connector *contract*, normalization,
+# and content-hashing are always compiled (pure, no network). This feature adds
+# the network-backed reference connectors (GitHub Issues, …) via `reqwest`, so
+# the default local-first build never links an HTTP client.
+connectors = ["dep:reqwest"]
+
 # Metal GPU acceleration on Apple Silicon (significantly faster inference)
 metal = ["fastembed/metal"]
 
@@ -131,6 +137,14 @@ usearch = { version = "=2.23.0", default-features = false, optional = true }
 lru = "0.16"
 trait-variant = "0.1"
 blake3 = "1"
+
+# ============================================================================
+# OPTIONAL: External-source connectors (#57)
+# ============================================================================
+# HTTP client for network-backed reference connectors (GitHub Issues, Redmine).
+# rustls so connectors build with no system OpenSSL dependency. Behind the
+# `connectors` feature — the default local-first build does not link reqwest.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

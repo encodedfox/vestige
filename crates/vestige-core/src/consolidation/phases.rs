@@ -889,6 +889,7 @@ mod tests {
             embedding_model: None,
             suppression_count: 0,
             suppressed_at: None,
+            source_envelope: None,
         }
     }
 

@@ -10,7 +10,7 @@ mod node;
 mod strength;
 mod temporal;
 
-pub use node::{IngestInput, KnowledgeNode, NodeType, RecallInput, SearchMode};
+pub use node::{IngestInput, KnowledgeNode, NodeType, RecallInput, SearchMode, SourceEnvelope};
 pub use strength::{DualStrength, StrengthDecay};
 pub use temporal::{TemporalRange, TemporalValidity};
 

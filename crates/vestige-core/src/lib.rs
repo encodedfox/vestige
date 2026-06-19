@@ -82,6 +82,7 @@
 
 /// Optional `vestige.toml` configuration (Phase 2: Configurable Output).
 pub mod config;
+pub mod connectors;
 pub mod consolidation;
 pub mod embedder;
 pub mod fsrs;
@@ -134,6 +135,7 @@ pub use memory::{
     SearchMode,
     SearchResult,
     SimilarityResult,
+    SourceEnvelope,
     TableIntrospection,
     TemporalRange,
 };
@@ -166,6 +168,7 @@ pub use storage::{
     CompositionNeighborRecord,
     CompositionOutcomeRecord,
     ConnectionRecord,
+    ConnectorCursor,
     ConsolidationHistoryRecord,
     Domain,
     DreamHistoryRecord,
@@ -184,10 +187,13 @@ pub use storage::{
     PortableArchive,
     PortableImportMode,
     PortableImportReport,
+    ReconcileReport,
     Result,
     SchedulingState,
     SearchQuery,
     SmartIngestResult,
+    SourceUpsertOutcome,
+    SourceUpsertResult,
     SqliteMemoryStore,
     StateTransitionRecord,
     Storage,

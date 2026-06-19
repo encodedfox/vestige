@@ -19,9 +19,10 @@ pub use portable::{
 };
 pub use sqlite::{
     CompositionEventRecord, CompositionMemberRecord, CompositionNeighborRecord,
-    CompositionOutcomeRecord, ConnectionRecord, ConsolidationHistoryRecord, DreamHistoryRecord,
-    FilePortableSyncBackend, InsightRecord, IntentionRecord, NeverComposedCandidate,
-    PortableSyncBackend, PortableSyncReport, Result, SmartIngestResult, SqliteMemoryStore,
+    CompositionOutcomeRecord, ConnectionRecord, ConnectorCursor, ConsolidationHistoryRecord,
+    DreamHistoryRecord, FilePortableSyncBackend, InsightRecord, IntentionRecord,
+    NeverComposedCandidate, PortableSyncBackend, PortableSyncReport, ReconcileReport, Result,
+    SmartIngestResult, SourceUpsertOutcome, SourceUpsertResult, SqliteMemoryStore,
     StateTransitionRecord, StorageError,
 };
 

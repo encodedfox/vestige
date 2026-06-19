@@ -281,6 +281,15 @@ impl McpServer {
                 ..Default::default()
             },
             // ================================================================
+            // EXTERNAL-SOURCE CONNECTORS (#57)
+            // ================================================================
+            ToolDescription {
+                name: "source_sync".to_string(),
+                description: Some("Index an external system into Vestige as a durable, offline, semantically-searchable index that cites back to the canonical record. GitHub: source='github', repo='owner/name' (auth via GITHUB_TOKEN env). Redmine: source='redmine', project='<id>' (host via REDMINE_URL, auth via REDMINE_API_KEY env). Idempotent: re-running updates changed issues without duplicating; set reconcile=true to tombstone issues removed upstream.".to_string()),
+                input_schema: tools::source_sync::schema(),
+                ..Default::default()
+            },
+            // ================================================================
             // TEMPORAL TOOLS (v1.2+)
             // ================================================================
             ToolDescription {
@@ -592,6 +601,11 @@ impl McpServer {
                 tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
+
+            // ================================================================
+            // External-source connectors (#57)
+            // ================================================================
+            "source_sync" => tools::source_sync::execute(&self.storage, request.arguments).await,
 
             // ================================================================
             // DEPRECATED (v1.7): ingest → smart_ingest
@@ -1806,10 +1820,10 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // 33 tools: 25 from v2.1.21 + 7 Phase 3 merge/supersede tools:
-        // merge_candidates, plan_merge, plan_supersede, apply_plan, merge_undo,
-        // protect, merge_policy, composed_graph)
-        assert_eq!(tools.len(), 33, "Expected exactly 33 tools");
+        // 34 tools: 25 from v2.1.21 + 7 Phase 3 merge/supersede tools
+        // (merge_candidates, plan_merge, plan_supersede, apply_plan, merge_undo,
+        // protect, merge_policy, composed_graph) + 1 connector tool (source_sync, #57).
+        assert_eq!(tools.len(), 34, "Expected exactly 34 tools");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -1821,6 +1835,9 @@ mod tests {
 
         // Core memory (smart_ingest absorbs ingest + checkpoint in v1.7)
         assert!(tool_names.contains(&"smart_ingest"));
+
+        // External-source connectors (#57)
+        assert!(tool_names.contains(&"source_sync"));
         assert!(
             !tool_names.contains(&"ingest"),
             "ingest should be removed in v1.7"
