@@ -360,18 +360,24 @@ function injectConfig(ide, ideName, binaryPath) {
     // OpenCode uses top-level "mcp" entries with command arrays.
     if (!config.$schema) config.$schema = 'https://opencode.ai/config.json';
     if (!config.mcp) config.mcp = {};
-    if (config.mcp.vestige) {
-      console.log(`  [skip] ${ideName} — already configured`);
-      return false;
-    }
+    let migratedOpenCodeConfig = false;
     if (config.mcpServers && config.mcpServers.vestige) {
       delete config.mcpServers.vestige;
+      migratedOpenCodeConfig = true;
       if (Object.keys(config.mcpServers).length === 0) {
         delete config.mcpServers;
       }
       console.log(`  [migrate] ${ideName} — moved vestige from mcpServers to mcp`);
     }
-    config.mcp.vestige = buildOpenCodeConfig(binaryPath);
+    if (config.mcp.vestige) {
+      if (!migratedOpenCodeConfig) {
+        console.log(`  [skip] ${ideName} — already configured`);
+        return false;
+      }
+      // Preserve the valid OpenCode entry while still writing the stale-key cleanup.
+    } else {
+      config.mcp.vestige = buildOpenCodeConfig(binaryPath);
+    }
   } else {
     // Standard mcpServers format (Cursor, Claude Desktop, JetBrains, Windsurf)
     const key = ide.key || 'mcpServers';
