@@ -365,6 +365,36 @@ impl SqliteMemoryStore {
         None
     }
 
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn vector_search_available(&self) -> bool {
+        self.vector_index.is_some()
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+    fn vector_search_available(&self) -> bool {
+        false
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn regular_ingest_result(
+        &self,
+        input: IngestInput,
+        reason: impl Into<String>,
+    ) -> Result<SmartIngestResult> {
+        let node = self.ingest(input)?;
+        Ok(SmartIngestResult {
+            decision: "create".to_string(),
+            node,
+            superseded_id: None,
+            similarity: None,
+            prediction_error: Some(1.0),
+            reason: reason.into(),
+            previous_content: None,
+            merged_from: None,
+            merge_preview: None,
+        })
+    }
+
     fn data_dir_from_env() -> Option<PathBuf> {
         std::env::var_os(DATA_DIR_ENV).and_then(|value| {
             if value.is_empty() {
@@ -742,19 +772,17 @@ impl SqliteMemoryStore {
 
         // Generate embedding for new content
         if !self.embedding_service.is_ready() {
-            // Fall back to regular ingest if embeddings not available
-            let node = self.ingest(input)?;
-            return Ok(SmartIngestResult {
-                decision: "create".to_string(),
-                node,
-                superseded_id: None,
-                similarity: None,
-                prediction_error: Some(1.0),
-                reason: "Embeddings not available, falling back to regular ingest".to_string(),
-                previous_content: None,
-                merged_from: None,
-                merge_preview: None,
-            });
+            return self.regular_ingest_result(
+                input,
+                "Embeddings not available, falling back to regular ingest",
+            );
+        }
+
+        if !self.vector_search_available() {
+            return self.regular_ingest_result(
+                input,
+                "Vector search unavailable, falling back to regular ingest",
+            );
         }
 
         let new_embedding = self
@@ -1063,10 +1091,10 @@ impl SqliteMemoryStore {
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
             // Remove old embedding from index
-            if let Some(index) = self.vector_index.as_ref() {
-                if let Ok(mut index) = index.lock() {
-                    let _ = index.remove(id);
-                }
+            if let Some(index) = self.vector_index.as_ref()
+                && let Ok(mut index) = index.lock()
+            {
+                let _ = index.remove(id);
             }
             // Generate new embedding
             if let Err(e) = self.generate_embedding_for_node(id, new_content) {
@@ -1276,8 +1304,12 @@ impl SqliteMemoryStore {
             }
             #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             SearchMode::Semantic => {
-                let results = self.semantic_search(&input.query, input.limit, 0.3)?;
-                results.into_iter().map(|r| r.node).collect()
+                if !self.vector_search_available() {
+                    self.keyword_search(&input.query, input.limit, input.min_retention)?
+                } else {
+                    let results = self.semantic_search(&input.query, input.limit, 0.3)?;
+                    results.into_iter().map(|r| r.node).collect()
+                }
             }
             #[cfg(all(feature = "embeddings", feature = "vector-search"))]
             SearchMode::Hybrid => {
@@ -1456,36 +1488,36 @@ impl SqliteMemoryStore {
         // Content-aware cross-memory reinforcement: boost semantically similar neighbors
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
         {
-            if let Some(index) = self.vector_index.as_ref() {
-                if let Ok(Some(embedding)) = self.get_node_embedding(id) {
-                    let index = index.lock().map_err(|_| {
-                        StorageError::Init("Vector index lock poisoned".to_string())
-                    })?;
+            if let Some(index) = self.vector_index.as_ref()
+                && let Ok(Some(embedding)) = self.get_node_embedding(id)
+            {
+                let index = index
+                    .lock()
+                    .map_err(|_| StorageError::Init("Vector index lock poisoned".to_string()))?;
 
-                    // Query top-6 similar (one will be self, so we get ~5 neighbors)
-                    let neighbors_result = index.search(&embedding, 6);
-                    drop(index);
+                // Query top-6 similar (one will be self, so we get ~5 neighbors)
+                let neighbors_result = index.search(&embedding, 6);
+                drop(index);
 
-                    if let Ok(neighbors) = neighbors_result {
-                        let writer = self
-                            .writer
-                            .lock()
-                            .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
-                        for (neighbor_id, similarity) in neighbors {
-                            if neighbor_id == id || similarity < 0.7 {
-                                continue;
-                            }
-                            // Diminished boost: 0.02 * similarity (max ~0.02)
-                            let boost = 0.02 * similarity as f64;
-                            let retention_boost = 0.008 * similarity as f64;
-                            let _ = writer.execute(
-                                "UPDATE knowledge_nodes SET
-                                    retrieval_strength = MIN(1.0, retrieval_strength + ?1),
-                                    retention_strength = MIN(1.0, retention_strength + ?2)
-                                WHERE id = ?3",
-                                params![boost, retention_boost, neighbor_id],
-                            );
+                if let Ok(neighbors) = neighbors_result {
+                    let writer = self
+                        .writer
+                        .lock()
+                        .map_err(|_| StorageError::Init("Writer lock poisoned".into()))?;
+                    for (neighbor_id, similarity) in neighbors {
+                        if neighbor_id == id || similarity < 0.7 {
+                            continue;
                         }
+                        // Diminished boost: 0.02 * similarity (max ~0.02)
+                        let boost = 0.02 * similarity as f64;
+                        let retention_boost = 0.008 * similarity as f64;
+                        let _ = writer.execute(
+                            "UPDATE knowledge_nodes SET
+                                retrieval_strength = MIN(1.0, retrieval_strength + ?1),
+                                retention_strength = MIN(1.0, retention_strength + ?2)
+                            WHERE id = ?3",
+                            params![boost, retention_boost, neighbor_id],
+                        );
                     }
                 }
             }
@@ -2100,12 +2132,11 @@ impl SqliteMemoryStore {
 
         // Clean up vector index to prevent stale search results
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if rows > 0 {
-            if let Some(index) = self.vector_index.as_ref() {
-                if let Ok(mut index) = index.lock() {
-                    let _ = index.remove(id);
-                }
-            }
+        if rows > 0
+            && let Some(index) = self.vector_index.as_ref()
+            && let Ok(mut index) = index.lock()
+        {
+            let _ = index.remove(id);
         }
 
         Ok(rows > 0)
@@ -2224,10 +2255,10 @@ impl SqliteMemoryStore {
         tx.commit()?;
 
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if let Some(index) = self.vector_index.as_ref() {
-            if let Ok(mut index) = index.lock() {
-                let _ = index.remove(id);
-            }
+        if let Some(index) = self.vector_index.as_ref()
+            && let Ok(mut index) = index.lock()
+        {
+            let _ = index.remove(id);
         }
 
         Ok(PurgeReport {
@@ -2661,15 +2692,15 @@ impl SqliteMemoryStore {
         limit: i32,
         min_similarity: f32,
     ) -> Result<Vec<SimilarityResult>> {
-        if !self.embedding_service.is_ready() {
-            return Err(StorageError::Init("Embedding model not ready".to_string()));
-        }
-
         let Some(index_lock) = self.vector_index.as_ref() else {
             return Err(StorageError::Init(
                 "Vector search unavailable: disabled for this machine".to_string(),
             ));
         };
+
+        if !self.embedding_service.is_ready() {
+            return Err(StorageError::Init("Embedding model not ready".to_string()));
+        }
 
         let query_embedding = self.get_query_embedding(query)?;
 
@@ -2733,11 +2764,12 @@ impl SqliteMemoryStore {
             exclude_types,
         )?;
 
-        let semantic_results = if self.embedding_service.is_ready() {
-            self.semantic_search_raw(query, limit * overfetch_factor)?
-        } else {
-            vec![]
-        };
+        let semantic_results =
+            if self.vector_search_available() && self.embedding_service.is_ready() {
+                self.semantic_search_raw(query, limit * overfetch_factor)?
+            } else {
+                vec![]
+            };
 
         let combined = if !semantic_results.is_empty() {
             linear_combination(
@@ -2987,12 +3019,12 @@ impl SqliteMemoryStore {
     /// Semantic search returning scores
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     fn semantic_search_raw(&self, query: &str, limit: i32) -> Result<Vec<(String, f32)>> {
+        if !self.vector_search_available() {
+            return Ok(vec![]);
+        }
         if !self.embedding_service.is_ready() {
             return Ok(vec![]);
         }
-        self.vector_index.as_ref().ok_or_else(|| {
-            StorageError::Init("Vector search unavailable: disabled for this machine".to_string())
-        })?;
 
         // HyDE query expansion: for conceptual queries, embed expanded variants
         // and use the centroid for broader semantic coverage
@@ -7177,13 +7209,12 @@ impl SqliteMemoryStore {
 
         // Clean up vector index
         #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-        if deleted > 0 {
-            if let Some(index) = self.vector_index.as_ref() {
-                if let Ok(mut index) = index.lock() {
-                    for id in &doomed_ids {
-                        let _ = index.remove(id);
-                    }
-                }
+        if deleted > 0
+            && let Some(index) = self.vector_index.as_ref()
+            && let Ok(mut index) = index.lock()
+        {
+            for id in &doomed_ids {
+                let _ = index.remove(id);
             }
         }
 
@@ -9392,10 +9423,15 @@ impl crate::storage::memory_store::MemoryStoreSend for SqliteMemoryStore {
 mod tests {
     use super::*;
     use crate::advanced::{MatchClass, MergePolicy};
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use tempfile::tempdir;
     // The public struct was renamed from Storage to SqliteMemoryStore; this
     // alias keeps all existing tests compiling without modification.
     use SqliteMemoryStore as Storage;
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_test_storage() -> Storage {
         let dir = tempdir().unwrap();
@@ -9405,6 +9441,88 @@ mod tests {
 
     fn create_test_storage_at(dir: &tempfile::TempDir, name: &str) -> Storage {
         Storage::new(Some(dir.path().join(name))).unwrap()
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    fn with_vector_search_disabled<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var_os(VESTIGE_DISABLE_VECTOR_SEARCH);
+
+        // Tests serialize access with ENV_LOCK because process environment
+        // mutation is global and unsafe under Rust 2024.
+        unsafe {
+            std::env::set_var(VESTIGE_DISABLE_VECTOR_SEARCH, "1");
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(f));
+
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var(VESTIGE_DISABLE_VECTOR_SEARCH, value);
+            } else {
+                std::env::remove_var(VESTIGE_DISABLE_VECTOR_SEARCH);
+            }
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_runtime_vector_gate_env_disables_index_creation() {
+        with_vector_search_disabled(|| {
+            assert!(!Storage::vector_search_enabled_by_cpu());
+            assert_eq!(
+                Storage::vector_search_unavailable_reason(),
+                Some("disabled by VESTIGE_DISABLE_VECTOR_SEARCH")
+            );
+
+            let dir = tempdir().unwrap();
+            let storage = create_test_storage_at(&dir, "vector-disabled.db");
+
+            assert!(storage.vector_index.is_none());
+            assert!(storage.query_cache.is_none());
+
+            let stats = storage.get_stats().unwrap();
+            assert_eq!(stats.total_nodes, 0);
+
+            let schema = storage.schema_introspection().unwrap();
+            assert!(schema.schema_version >= 1);
+        });
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+    #[test]
+    fn test_runtime_vector_gate_disabled_hybrid_search_uses_keyword_fallback() {
+        with_vector_search_disabled(|| {
+            let dir = tempdir().unwrap();
+            let storage = create_test_storage_at(&dir, "vector-disabled-search.db");
+
+            storage
+                .ingest(IngestInput {
+                    content: "runtime gate fallback keyword anchor".to_string(),
+                    node_type: "fact".to_string(),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let results = storage
+                .hybrid_search("runtime gate fallback keyword", 10, 0.3, 0.7)
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].match_type, MatchType::Keyword);
+            assert!(results[0].semantic_score.is_none());
+            assert!(
+                results[0]
+                    .node
+                    .content
+                    .contains("runtime gate fallback keyword anchor")
+            );
+        });
     }
 
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
