@@ -10,6 +10,7 @@ mod memory_store;
 mod migrations;
 mod portable;
 mod sqlite;
+mod trace_store;
 
 #[cfg(feature = "cloud-sync")]
 pub use cloud_sync::HttpPortableSyncBackend;
@@ -32,6 +33,7 @@ pub use sqlite::{
     SmartIngestResult, SourceUpsertOutcome, SourceUpsertResult, SqliteMemoryStore,
     StateTransitionRecord, StorageError,
 };
+pub use trace_store::AgentRunSummary;
 
 /// Backwards-compatibility alias. Retained until Phase 4 completes so every
 /// existing `Arc<Storage>` call site keeps compiling. Scheduled for removal
