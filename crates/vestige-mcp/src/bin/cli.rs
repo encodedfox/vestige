@@ -258,6 +258,10 @@ enum Commands {
         /// Dry run: don't actually promote the surfaced cause
         #[arg(long)]
         no_promote: bool,
+        /// Demo mode: first show what a plain SEMANTIC SEARCH returns for the
+        /// failure (the lookalike, NOT the cause), then what Postdict surfaces.
+        #[arg(long)]
+        contrast: bool,
     },
 
     /// Start standalone HTTP MCP server (no stdio, for remote access)
@@ -342,7 +346,8 @@ fn main() -> anyhow::Result<()> {
             manual,
             lookback_days,
             no_promote,
-        } => run_backfill(failure_id, manual, lookback_days, !no_promote),
+            contrast,
+        } => run_backfill(failure_id, manual, lookback_days, !no_promote, contrast),
         Commands::Serve {
             port,
             dashboard,
@@ -2596,12 +2601,102 @@ fn run_backfill(
     manual: bool,
     lookback_days: i64,
     promote: bool,
+    contrast: bool,
 ) -> anyhow::Result<()> {
     let storage = std::sync::Arc::new(open_storage()?);
     #[cfg(feature = "embeddings")]
     {
         let _ = storage.init_embeddings();
     }
+
+    // Resolve the failure text up front (used by the contrast baseline).
+    let failure_text: Option<String> = match &failure_id {
+        Some(id) => storage.get_node(id).ok().flatten().map(|n| n.content),
+        None => storage
+            .get_all_nodes(500, 0)
+            .ok()
+            .and_then(|nodes| {
+                nodes.into_iter().find(|n| {
+                    let hay = n.content.to_lowercase();
+                    ["error", "crash", "500", "failed", "panic", "regression", "bug"]
+                        .iter()
+                        .any(|m| hay.contains(m))
+                })
+            })
+            .map(|n| n.content),
+    };
+
+    // CONTRAST: show what a SIMILARITY SEARCH returns for the failure first — the
+    // lookalike it ranks at the top, which is NOT the cause. Same store, same
+    // query. Uses semantic (hybrid) search when embeddings exist, else keyword
+    // search — either way it ranks by RESEMBLANCE, which is exactly the blind spot.
+    if contrast
+        && let Some(ftext) = &failure_text {
+            // Generic salient-words query: keep alphanumerics, drop a leading
+            // "<word>:" label if present (e.g. "Service crashed:"). No hardcoding.
+            let query = match ftext.split_once(": ") {
+                Some((lead, rest)) if lead.split_whitespace().count() <= 2 => rest,
+                _ => ftext.as_str(),
+            };
+
+            // Track which engine ACTUALLY ran so the label is honest (the audit's
+            // top finding: never present keyword search as "semantic").
+            let mut engine = "keyword (BM25)";
+            let mut shown = false;
+            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            {
+                if storage.is_embedding_ready()
+                    && let Ok(hits) = storage.hybrid_search(query, 6, 0.3, 0.7) {
+                        let others: Vec<_> =
+                            hits.iter().filter(|h| h.node.content != *ftext).take(3).collect();
+                        if !others.is_empty() {
+                            engine = "semantic (vector + BM25 hybrid)";
+                        }
+                    }
+            }
+            println!(
+                "{}",
+                format!("── 1. SIMILARITY SEARCH · {engine} ──").dimmed().bold()
+            );
+            println!("   query: {}", truncate(query, 60).dimmed());
+
+            // best OTHER match (exclude the failure itself, which trivially matches).
+            #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+            {
+                if storage.is_embedding_ready()
+                    && let Ok(hits) = storage.hybrid_search(query, 6, 0.3, 0.7) {
+                        let others: Vec<_> =
+                            hits.iter().filter(|h| h.node.content != *ftext).take(3).collect();
+                        for (i, h) in others.iter().enumerate() {
+                            let tag = if i == 0 { " ← top match".red().bold().to_string() } else { String::new() };
+                            println!("   {}. {}{}", i + 1, truncate(&h.node.content, 60).normal(), tag);
+                            shown = true;
+                        }
+                    }
+            }
+            if !shown {
+                // keyword/BM25 (always works) — still ranks by lexical resemblance.
+                if let Ok(hits) = storage.search(query, 6) {
+                    let others: Vec<_> =
+                        hits.iter().filter(|h| h.content != *ftext).take(3).collect();
+                    for (i, h) in others.iter().enumerate() {
+                        let tag = if i == 0 { " ← top match".red().bold().to_string() } else { String::new() };
+                        println!("   {}. {}{}", i + 1, truncate(&h.content, 60).normal(), tag);
+                        shown = true;
+                    }
+                }
+            }
+            if shown {
+                println!(
+                    "   {}",
+                    "→ ranked by RESEMBLANCE. its top hit is a lookalike, not the cause.".red()
+                );
+            } else {
+                println!("   {}", "(no lookalikes — nothing resembles the crash)".dimmed());
+            }
+            println!();
+            println!("{}", "── 2. POSTDICT (reach backward for the CAUSE) ──".magenta().bold());
+        }
 
     let args = serde_json::json!({
         "failure_id": failure_id,

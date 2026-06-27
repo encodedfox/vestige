@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::fsrs::{
     DEFAULT_DECAY, FSRSScheduler, FSRSState, LearningState, Rating, retrievability_with_decay,
 };
-use crate::fts::sanitize_fts5_query;
+use crate::fts::{sanitize_fts5_or_query, sanitize_fts5_query};
 use crate::memory::{
     ConsolidationResult, IngestInput, KnowledgeNode, MatchType, MemoryStats, RecallInput,
     SearchMode, SearchResult,
@@ -2420,7 +2420,12 @@ impl SqliteMemoryStore {
 
     /// Search with full-text search
     pub fn search(&self, query: &str, limit: i32) -> Result<Vec<KnowledgeNode>> {
-        let sanitized_query = sanitize_fts5_query(query);
+        // OR-of-tokens + BM25 rank: matches rows sharing ANY distinctive token,
+        // ranked by lexical relevance. (The old whole-string phrase match required
+        // all tokens adjacent and in order, so multi-word queries returned nothing.)
+        let Some(sanitized_query) = sanitize_fts5_or_query(query) else {
+            return Ok(Vec::new());
+        };
 
         let reader = self
             .reader
