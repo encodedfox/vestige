@@ -1,125 +1,129 @@
 # Postdict — the 60-second funding demo
 
 **Audience:** investors. **Goal:** they see a category, a moat, and a market — not a feature.
-**Thesis (say it in the first 10 seconds):** *the entire AI-memory industry is trapped in a category error.*
+**The thesis, in four words:** *relevance does not equal resemblance.*
 
 Format: live terminal, one take, you talking over it. ~60s. Punchy. No slides.
+**Rule:** the monologue earns ~20 seconds. The rest is the terminal *doing the impossible* on screen.
 
 ---
 
-## THE SCRIPT (with what's on screen + what you say)
+## THE SCRIPT (what's on screen · what you say)
 
-### [0:00–0:10] — THE CATEGORY ERROR (the hook that funds you)
+### [0:00–0:15] — THE FLAWED AXIOM (your cold open, verbatim)
 
-**On screen:** a clean terminal, one line of text:
-`Every AI memory company is solving the wrong problem.`
+**On screen:** a clean dark terminal, one line:
+`relevance ≠ resemblance`
 
 **You say:**
-> "Every AI memory company — Mem0, Zep, all of them — is built on vector
-> similarity search. They find what your problem *looks like*. But a root cause
-> **never** looks like the bug it creates. So the entire industry is
-> architecturally incapable of the one thing that matters most: finding *why*
-> something broke. That's not a bug in their products. It's a category error in
-> the whole field."
+> "Every major AI memory framework on Earth — every VC-backed startup, every
+> native platform layer — is built on one flawed assumption: that **relevance
+> equals resemblance.** They turn your text into vector embeddings, and when
+> something breaks, they search for memories that *look similar* to the problem.
+>
+> Here's what blows that foundation to pieces: **a root cause never looks like
+> the bug it creates.** So the entire industry is searching in the one place the
+> answer can never be."
 
-*(Pause. Let "category error" land. That's the sentence they'll repeat to their partners.)*
+*(Stop. Let it sit one beat. "Relevance equals resemblance" is the line they repeat to their partners.)*
 
 ---
 
-### [0:10–0:25] — THE SETUP (make the impossible concrete)
+### [0:15–0:28] — MAKE IT CONCRETE (type it live)
 
-**On screen:** type these, real (this is a realistic history — a config change, an
-old unrelated incident, and today's crash):
+**On screen:**
 ```
-$ vestige ingest "Set API_TIMEOUT=2 in the deploy env" --ago-days 3            # the quiet cause
-$ vestige ingest "500 error in the billing service" --ago-days 20             # an old lookalike
-$ vestige ingest "Service crashed: 500 on the auth endpoint"                  # today's crash
+$ vestige ingest "Set API_TIMEOUT=2 in the deploy env" --ago-days 3     # the quiet cause
+$ vestige ingest "500 error in the billing service" --ago-days 20       # an old lookalike
+$ vestige ingest "Service crashed: 500 on the auth endpoint"            # today's crash
 ```
 
 **You say:**
-> "Watch. Three days ago, a one-line config change — boring, forgotten. There's
-> also an old 500 error in a different service, weeks back. And today, the auth
-> service crashes. Now — which of those past memories caused today's crash? A
-> vector database ranks by *resemblance*: today's crash *looks* most like that
-> old billing 500. That's the trap. The thing that actually *looks* similar is
-> never the cause."
+> "Watch. A one-line config change three days ago — forgotten. An old, unrelated
+> 500 error weeks back. And today, the auth service crashes. Now ask: which past
+> memory *caused* today's crash? A vector database ranks by resemblance — so to
+> it, today's crash looks most like that old billing 500. **The thing that looks
+> similar is never the thing that caused it.**"
 
 ---
 
-### [0:25–0:45] — THE PROOF (split screen, the money shot)
+### [0:28–0:45] — THE PROOF (the money shot · slow down here)
 
-**On screen:** `$ vestige backfill --contrast`  → it prints:
+**On screen:** `$ vestige backfill --contrast` →
 ```
 ── 1. SIMILARITY SEARCH · keyword (BM25) ──
+   1. 500 error in the billing service          ← top match   (WRONG)
    → ranked by RESEMBLANCE. its top hit is a lookalike, not the cause.
 
 ── 2. POSTDICT (reach backward for the CAUSE) ──
    #1 Set API_TIMEOUT=2 in the deploy env
       ↩ reached back 3.0 days before the failure
-      🔗 causal join: api_timeout
+      🔗 causal join: api_timeout                            (RIGHT)
 ```
 
-**You say (slow down here — this is the "holy shit" beat):**
-> "Same query, same database. Similarity search returns the lookalike — it's
-> confidently wrong. Postdict reaches **backward three days** and finds the
-> actual cause. Not because it's *similar* — because it's *causally upstream*.
-> This is memory with **hindsight**. The 'ohhh, *that's* why' moment — automatic."
+**You say (let the `↩ reached back 3.0 days` line hold in silence for a full beat):**
+> "Same database. Same query. Similarity search returns the lookalike — confident,
+> and wrong. Postdict reaches **backward three days** and finds the actual cause.
+> Not because it's similar — because it's **causally upstream.** This is memory
+> with hindsight: the 'ohhh, *that's* why' moment, automatic."
 
 ---
 
-### [0:45–0:55] — THE MOAT (why this isn't copyable in a weekend)
+### [0:45–0:55] — THE MOAT (kill the "can't they just add this?" objection)
 
 **You say:**
-> "Two things make this defensible. One: it's a faithful port of a 2024 *Nature*
-> result — the brain reaches backward in time to find causes, and it's
-> *backward-only*, which is exactly correct because a root cause is always in the
-> past. We didn't invent this. We ported the algorithm evolution already
-> perfected. Two: the incumbents can't bolt this on — their entire architecture
-> *is* the category error. To do this, you have to rebuild memory from the
-> cognitive science up. We already did."
+> "Two reasons this is defensible. One: it's a faithful port of a 2024 *Nature*
+> result — the brain reaches *backward* in time to find causes, and it's
+> backward-*only*, which is exactly right, because a root cause is always in the
+> past. We didn't invent this; we ported the algorithm evolution already
+> perfected. Two: the incumbents can't bolt this on. Their entire architecture
+> **is** the flawed axiom. To do this you rebuild memory from the cognitive
+> science up — which we already did, and it's running locally, today."
 
 ---
 
-### [0:55–1:00] — THE ASK (category, market, check)
+### [0:55–1:00] — THE MARKET + THE ASK
 
 **On screen:** `the first memory that finds the cause, not the lookalike.`
 
 **You say:**
-> "Every agent that writes code, runs infra, or touches production hits root
-> causes it can't explain — that's the entire agentic-AI market, and it's on
-> fire. We're not a better memory. We're the first memory that *reasons backward*.
-> It's local-first, running today, and the repo is reproducible. We're raising
-> [X] to make every AI agent debug like a senior engineer. Run it yourself —
-> the seed's in the repo."
+> "Every AI agent that writes code, runs infrastructure, or touches production
+> hits root causes it can't explain. That's the entire agentic market, and it's
+> on fire. We're not a better memory — we're the first memory that **reasons
+> backward.** Local-first, reproducible, running now. We're raising [X] to make
+> every agent debug like a senior engineer. The seed's in the repo — run it
+> yourself."
 
 ---
 
-## DELIVERY NOTES (the difference between "neat" and "funded")
+## WHY THIS OPENING IS STRONGER (and how to deliver it)
 
-1. **Lead with the category error, not the feature.** Investors fund categories.
-   "The whole industry is wrong" is a thesis; "we reach back in time" is a feature.
-   Say the thesis first, prove it with the feature.
+Your framing beats "category error" because it names the **mechanism** of the
+error, not just that one exists:
 
-2. **The one sentence to nail:** *"A root cause never looks like the bug it
-   creates."* Memorize it. It's the entire investment thesis in nine words. It
-   reframes a crowded market ("another memory startup") into an empty one ("the
-   only one that finds causes").
+- **"Relevance equals resemblance"** is a *diagnosis* — it tells the investor
+  precisely what's broken (the axiom) in four words. "Category error" only says
+  *that* something's broken.
+- **The one-two punch:** state the flawed axiom → detonate it with the fact
+  ("a root cause never looks like the bug it creates"). The investor *feels* the
+  foundation crack. That's the moment they lean in.
 
-3. **Slow down at 0:25–0:45.** The contrast is the proof. Let the
-   `↩ reached back 3.0 days` line sit on screen for a full beat in silence.
-
-4. **The moat answer is what closes.** Every investor will think "can't Mem0 just
-   add this?" Answer it *before* they ask: their architecture IS the problem.
-   That's why it took a from-scratch, neuroscience-grounded rebuild.
-
-5. **End on market size, not the demo.** "Every agent that touches production" =
-   the whole agentic market. The demo earns the right to say that; don't bury it.
-
-6. **Reproducibility is the trust close.** "Run it yourself, seed's in the repo"
-   is what separates you from every cherry-picked AI demo they've been burned by.
+**Delivery rules:**
+1. **The monologue is 20 seconds, max.** Investors fund what they *see* work, not
+   what they hear claimed. Get to the terminal fast; let the contrast carry the
+   weight.
+2. **Memorize two sentences.** The axiom: *"They believe relevance equals
+   resemblance."* The detonation: *"A root cause never looks like the bug it
+   creates."* Everything else can be loose.
+3. **Silence is the tool at 0:28–0:45.** When `↩ reached back 3.0 days` hits the
+   screen, say nothing for a full second. The image does the selling.
+4. **The moat answer is non-optional.** Every investor thinks "can't Mem0 add
+   this?" Answer it *before* they ask — their architecture is the axiom. That's
+   what converts "neat" into "fundable."
+5. **End on the market, not the demo.** "Every agent that touches production" is
+   the TAM. The demo earns the right to say it; don't bury it under the feature.
 
 ## THE THREE LINES THAT DO THE WORK
-
-- **The hook:** "The entire AI-memory industry is trapped in a category error."
-- **The thesis:** "A root cause never looks like the bug it creates."
-- **The category:** "We're not a better memory. We're the first memory that reasons backward."
+- **The axiom (the hook):** "Every AI memory framework believes relevance equals resemblance."
+- **The detonation (the thesis):** "A root cause never looks like the bug it creates."
+- **The category (the close):** "We're not a better memory. We're the first memory that reasons backward."
