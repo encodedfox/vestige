@@ -110,7 +110,7 @@ enum Commands {
 
     /// Update Vestige binaries from the latest GitHub release
     Update {
-        /// Install a specific release tag instead of latest (example: v2.1.21)
+        /// Install a specific release tag instead of latest (example: v2.1.27)
         #[arg(long)]
         version: Option<String>,
 
@@ -237,6 +237,27 @@ enum Commands {
         /// Source reference
         #[arg(long)]
         source: Option<String>,
+        /// Backdate this memory N days in the past (for demos / seeding history)
+        #[arg(long)]
+        ago_days: Option<i64>,
+    },
+
+    /// Retroactive Salience Backfill — reach BACKWARD from a failure and surface
+    /// the quiet earlier memory that caused it (the root cause a vector search
+    /// can't find). Cai 2024 Nature. "Memory with hindsight."
+    Backfill {
+        /// ID of the failure memory; if omitted, the latest failure-like memory is used
+        #[arg(long)]
+        failure_id: Option<String>,
+        /// Force the backfill even if the event isn't auto-detected as salient
+        #[arg(long)]
+        manual: bool,
+        /// How many days back to reach
+        #[arg(long, default_value = "30")]
+        lookback_days: i64,
+        /// Dry run: don't actually promote the surfaced cause
+        #[arg(long)]
+        no_promote: bool,
     },
 
     /// Start standalone HTTP MCP server (no stdio, for remote access)
@@ -314,7 +335,14 @@ fn main() -> anyhow::Result<()> {
             tags,
             node_type,
             source,
-        } => run_ingest(content, tags, node_type, source),
+            ago_days,
+        } => run_ingest(content, tags, node_type, source, ago_days),
+        Commands::Backfill {
+            failure_id,
+            manual,
+            lookback_days,
+            no_promote,
+        } => run_backfill(failure_id, manual, lookback_days, !no_promote),
         Commands::Serve {
             port,
             dashboard,
@@ -2207,11 +2235,7 @@ fn run_portable_import(input: PathBuf, merge: bool) -> anyhow::Result<()> {
 }
 
 /// Run file-backed two-way sync.
-fn run_sync(
-    archive: Option<PathBuf>,
-    cloud: bool,
-    endpoint: Option<String>,
-) -> anyhow::Result<()> {
+fn run_sync(archive: Option<PathBuf>, cloud: bool, endpoint: Option<String>) -> anyhow::Result<()> {
     if cloud {
         run_sync_cloud(endpoint)
     } else {
@@ -2482,6 +2506,7 @@ fn run_ingest(
     tags: Option<String>,
     node_type: String,
     source: Option<String>,
+    ago_days: Option<i64>,
 ) -> anyhow::Result<()> {
     if content.trim().is_empty() {
         anyhow::bail!("Content cannot be empty");
@@ -2515,6 +2540,10 @@ fn run_ingest(
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
     {
         let result = storage.smart_ingest(input)?;
+        if let Some(days) = ago_days {
+            let when = chrono::Utc::now() - chrono::Duration::days(days);
+            storage.set_created_at(&result.node.id, when)?;
+        }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
         println!();
         println!("{}: {}", "Decision".white().bold(), result.decision.green());
@@ -2524,6 +2553,9 @@ fn run_ingest(
         }
         if let Some(pe) = result.prediction_error {
             println!("{}: {:.3}", "Prediction Error".white().bold(), pe);
+        }
+        if let Some(days) = ago_days {
+            println!("{}: {} days ago", "Backdated".white().bold(), days);
         }
         println!("{}: {}", "Reason".white().bold(), result.reason);
         println!();
@@ -2538,6 +2570,10 @@ fn run_ingest(
     #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
     {
         let node = storage.ingest(input)?;
+        if let Some(days) = ago_days {
+            let when = chrono::Utc::now() - chrono::Duration::days(days);
+            storage.set_created_at(&node.id, when)?;
+        }
         println!("{}", "=== Vestige Ingest ===".cyan().bold());
         println!();
         println!("{}: create", "Decision".white().bold());
@@ -2551,6 +2587,86 @@ fn run_ingest(
         );
     }
 
+    Ok(())
+}
+
+/// Run Retroactive Salience Backfill from the CLI (the demo's payoff command).
+fn run_backfill(
+    failure_id: Option<String>,
+    manual: bool,
+    lookback_days: i64,
+    promote: bool,
+) -> anyhow::Result<()> {
+    let storage = std::sync::Arc::new(open_storage()?);
+    #[cfg(feature = "embeddings")]
+    {
+        let _ = storage.init_embeddings();
+    }
+
+    let args = serde_json::json!({
+        "failure_id": failure_id,
+        "manual": manual,
+        "lookback_days": lookback_days,
+        "promote": promote,
+    });
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt
+        .block_on(vestige_mcp::tools::backfill::execute(&storage, Some(args)))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    println!("{}", "=== Retroactive Salience Backfill ===".magenta().bold());
+    println!();
+    if result["triggered"] != serde_json::json!(true) {
+        println!(
+            "{} {}",
+            "Not triggered:".yellow().bold(),
+            result["reason"].as_str().unwrap_or("event not salient")
+        );
+        return Ok(());
+    }
+    if let Some(f) = result["failure"].as_object() {
+        println!(
+            "{} {}",
+            "Failure:".red().bold(),
+            f.get("content_preview").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
+    println!();
+    println!("{}", "Reached BACKWARD and surfaced the cause(s) a vector search would miss:".white());
+    println!();
+    if let Some(causes) = result["causes"].as_array() {
+        for (i, c) in causes.iter().enumerate() {
+            let age = c["age_days_before_failure"].as_f64().unwrap_or(0.0);
+            let rank = c["similarity_rank"].as_u64();
+            println!(
+                "  {} {}",
+                format!("#{}", i + 1).cyan().bold(),
+                c["content_preview"].as_str().unwrap_or("").green().bold()
+            );
+            println!(
+                "     {} {:.1} days before the failure",
+                "↩ reached back".magenta(),
+                age
+            );
+            if let Some(shared) = c["shared_entities"].as_array() {
+                let ents: Vec<&str> = shared.iter().filter_map(|e| e.as_str()).collect();
+                println!("     {} {}", "🔗 causal join:".magenta(), ents.join(", "));
+            }
+            if let Some(r) = rank {
+                println!(
+                    "     {} ranked #{} on similarity {}",
+                    "🔍".magenta(),
+                    r,
+                    "(so semantic search would NOT have surfaced it)".dimmed()
+                );
+            }
+            if c["promoted"] == serde_json::json!(true) {
+                println!("     {} promoted — it will resurface next time", "✅".green());
+            }
+            println!();
+        }
+    }
     Ok(())
 }
 
