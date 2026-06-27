@@ -26,6 +26,7 @@ pub mod intent;
 pub mod merge_supersede;
 pub mod prediction_error;
 pub mod reconsolidation;
+pub mod retroactive_backfill;
 pub mod speculative;
 
 // Re-exports for convenient access
@@ -76,5 +77,8 @@ pub use reconsolidation::{
     AccessContext, AccessTrigger, AppliedModification, ChangeSummary, LabileState, MemorySnapshot,
     Modification, ReconsolidatedMemory, ReconsolidationManager, ReconsolidationStats,
     RelationshipType, RetrievalRecord,
+};
+pub use retroactive_backfill::{
+    BackfillCandidate, BackfillResult, BackfilledCause, FailureEvent, RetroactiveBackfill,
 };
 pub use speculative::{PredictedMemory, PredictionContext, SpeculativeRetriever, UsagePattern};
