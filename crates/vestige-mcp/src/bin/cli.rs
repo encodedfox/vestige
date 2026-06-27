@@ -2610,18 +2610,17 @@ fn run_backfill(
     }
 
     // Resolve the failure text up front (used by the contrast baseline).
+    // Use the SAME failure detector the backfill tool uses (content + tags, full
+    // marker list) so the CLI's pick and the tool's pick never diverge.
     let failure_text: Option<String> = match &failure_id {
         Some(id) => storage.get_node(id).ok().flatten().map(|n| n.content),
         None => storage
             .get_all_nodes(500, 0)
             .ok()
             .and_then(|nodes| {
-                nodes.into_iter().find(|n| {
-                    let hay = n.content.to_lowercase();
-                    ["error", "crash", "500", "failed", "panic", "regression", "bug"]
-                        .iter()
-                        .any(|m| hay.contains(m))
-                })
+                nodes
+                    .into_iter()
+                    .find(vestige_mcp::tools::backfill::looks_like_failure)
             })
             .map(|n| n.content),
     };

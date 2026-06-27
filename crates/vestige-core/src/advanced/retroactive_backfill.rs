@@ -53,6 +53,9 @@ pub const FAILURE_MARKERS: &[&str] = &[
     "error", "bug", "crash", "crashed", "regression", "broke", "broken",
     "failure", "failed", "panic", "exception", "fault", "outage", "incident",
     "500", "timeout", "deadlock", "leak", "corrupt", "stack overflow",
+    // performance/degradation failures (an agent should backfill from these too)
+    "spiked", "latency", "degraded", "slow", "hang", "hung", "throttled",
+    "oom", "502", "503", "504", "rejected", "denied", "flaky",
 ];
 
 /// How strongly to promote the backfilled cause: multiply its stability by this

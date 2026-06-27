@@ -91,8 +91,10 @@ fn extract_entities(node: &KnowledgeNode) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Heuristic: does this memory read like a failure/"aversive event"?
-fn looks_like_failure(node: &KnowledgeNode) -> bool {
+/// Heuristic: does this memory read like a failure/"aversive event"? Checks both
+/// content AND tags against the full FAILURE_MARKERS list. Public so the CLI and
+/// any caller share ONE failure-detection definition (no drifting subsets).
+pub fn looks_like_failure(node: &KnowledgeNode) -> bool {
     let hay = node.content.to_lowercase();
     vestige_core::advanced::retroactive_backfill::FAILURE_MARKERS
         .iter()
