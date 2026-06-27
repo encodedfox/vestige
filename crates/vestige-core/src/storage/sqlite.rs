@@ -1840,6 +1840,20 @@ impl SqliteMemoryStore {
         }
     }
 
+    /// Backdate a node's `created_at`. Intended for tests and demo seeding (e.g.
+    /// to simulate a memory formed days ago so Retroactive Salience Backfill can
+    /// reach back to it). Cross-crate `pub` so the MCP backfill test + demo
+    /// harness can plant a dated cause. Returns Ok(()) on success.
+    pub fn set_created_at(&self, id: &str, when: DateTime<Utc>) -> Result<()> {
+        if let Ok(writer) = self.writer.lock() {
+            writer.execute(
+                "UPDATE knowledge_nodes SET created_at = ?1 WHERE id = ?2",
+                params![when.to_rfc3339(), id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Count memories currently in a suppressed state (suppression_count > 0).
     pub fn count_suppressed(&self) -> Result<usize> {
         let reader = self

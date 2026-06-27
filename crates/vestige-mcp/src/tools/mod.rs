@@ -50,6 +50,9 @@ pub mod cross_reference;
 // v2.0.5: Active Forgetting — Anderson 2025 + Davis Rac1
 pub mod suppress;
 
+// Retroactive Salience Backfill — Cai 2024 Nature (memory with hindsight)
+pub mod backfill;
+
 // Internal/backwards-compat tools still dispatched by server.rs for specific
 // tool names. Each module below has live callers via string dispatch in
 // `server.rs` (match arms on request.name). The #[allow(dead_code)]
