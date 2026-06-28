@@ -1,104 +1,77 @@
-# Vestige — THE PITCH (final, line-by-line workshopped)
+# Vestige — THE PITCH THAT CHANGED EVERYTHING (final, condensed cut)
 
-Sam's canonical 60-second spoken pitch. Solo founder, first person, on a stage to
-50-100 engineers/founders/investors. No terminal, no slides — voice only.
-Every line workshopped sentence-by-sentence on Jun 27 2026. Two seams closed from
-Sam's assembly: "hours"→"days" (matches "three days ago"), and the reveal names
-"Vestige" (was naked "memory"). NAME = Vestige (Sam's call — natural, live/loved,
-"vestige = a trace of the past" is on-thesis).
+Sam's stage pitch — ~45-50s spoken, for a multi-pitch event with a separate
+networking hour afterward. Solo founder, first person, no slides/terminal on
+stage (the demo happens 1:1 at networking on Sam's pre-loaded laptop). Two seams
+closed from the draft: opener "hours"->"days" (matches "days ago"), and "AI
+agents that touch" (plural). NAME = Vestige.
 
 ---
 
 ## THE PITCH
 
-> Your bug was born days before it crashed. You just can't remember where.
+> Your bug was born days before it crashed — but you just can't remember where.
+>
+> When production breaks, you lose days hunting a bug. The cause is usually a
+> quiet change you made days ago that looks nothing like the error it created.
+>
+> Today's memory systems fail here, because they look for what *looks like* the
+> problem. But a root cause never looks like the bug it creates.
 >
 > **[beat]**
 >
-> Here's how it always goes: production breaks. You burn hours hunting. And the
-> cause turns out to be one line you changed three days ago and forgot.
+> It's like blaming a goalie for a 90th-minute World Cup goal — when the real
+> failure was a silent midfield turnover fifteen minutes earlier. They're
+> searching the goal line. Vestige traces the match backward.
 >
-> The bug looked nothing like that change. So you never connected them — and you
-> lost a day to something you already knew.
->
-> Now we've handed that exact job to AI agents. And every memory system built to
-> help them — Mem0, Zep, all of them —
->
-> because they're built on one assumption: that relevance equals resemblance.
-> They search your memory for whatever looks like the problem.
->
-> **[slow down]**
->
-> But a root cause never looks like the bug it creates.
->
-> **[full stop — let it hang two seconds]**
->
-> The entire industry is searching in the one place the answer can never be.
->
-> I built the opposite.
->
-> When your agent hits a failure, Vestige reaches backward in time and finds the
-> quiet change, days earlier, that actually caused it. The one no similarity
-> search could ever find — because it isn't similar. It's upstream.
->
-> I didn't invent this. I ported it from real cognitive neuroscience.
->
-> There's a 2024 Nature paper: the brain links a later shock backward in time to
-> the quiet memory that set it up — backward only, never forward, because a cause
-> is always in the past. I realized that's root-cause analysis. So I turned it
-> into software. It runs locally. Today.
->
-> And Mem0, Zep — they can't copy this. Their entire architecture is the wrong
-> assumption — vector search all the way down. To add what I built, they'd have
-> to tear it out and start over. From the brain up. And no funded company rips
-> out its own foundation.
+> A 2024 Nature paper proved the human brain rewinds time to link a sudden shock
+> to the quiet memory that caused it. Vestige does the exact same thing for
+> software.
 >
 > Everyone else built a memory that remembers. I built the first one that
-> *realizes.* Every AI agent that touches production will hit this wall — and
-> there are about to be millions of them. That's not a feature. That's the next
-> layer of the stack.
+> *realizes.* Millions of AI agents that touch production will hit this wall.
+> That's not a feature — that's the next layer of the dev stack.
 >
-> I'm Sam. I built Vestige alone, from a tiny apartment in Chicago — the first
-> memory that finds the cause, not the lookalike.
+> I'm Sam. I created Vestige from my tiny Chicago apartment — the first memory
+> that finds the cause, not the lookalike.
 >
-> I've got a laptop right here. Bring me your worst bug, and I'll find the cause
-> in thirty seconds. Come prove me wrong.
+> Come find me after. I'll show you in thirty seconds.
 
 ---
 
-## THE LINES THAT WIN THE ROOM (memorize cold, improvise the rest)
-- **The opener (pattern interrupt):** "Your bug was born days before it crashed. You just can't remember where."
-- **The wound (callback seed):** "...you lost a day to something you already knew."
-- **The detonation (THE line):** "A root cause never looks like the bug it creates." → walk toward them, STOP, two seconds of silence.
-- **The proof (kills the skeptic):** "No similarity search could ever find it — because it isn't similar. It's upstream."
-- **The moat (the investor magnet):** "No funded company rips out its own foundation."
+## THE LINES THAT WIN THE ROOM
+- **Opener (pattern interrupt):** "Your bug was born days before it crashed — but you just can't remember where."
+- **The detonation (THE line):** "A root cause never looks like the bug it creates." → beat of silence after.
+- **The soccer proof (the secret weapon — makes ANYONE get it):** "...blaming the goalie for a 90th-minute goal when the real failure was a midfield turnover fifteen minutes earlier. They're searching the goal line. Vestige traces the match backward."
 - **The category (the quotable):** "Everyone else built a memory that remembers. I built the first one that realizes."
-- **The TAM (the money line):** "That's not a feature. That's the next layer of the stack."
-- **The closer (the dare):** "Bring me your worst bug. Come prove me wrong."
+- **The TAM (the money line):** "That's not a feature — that's the next layer of the dev stack."
+- **The closer (fits the networking format):** "Come find me after. I'll show you in thirty seconds."
 
 ## STAGE RULES
-1. NEVER open with "Hi, I'm Sam, thanks for having me" — it habituates attention to
-   zero. Walk out, hold the room with your eyes one beat, THEN the opener. Name
-   comes near the END, after they're sold.
-2. First 15 seconds is THEIR pain, not your product. Get the nods first.
-3. The detonation line is the whole pitch — the silence after it does the selling.
-   Don't rush the two seconds.
-4. Say "relevance equals resemblance" slower than everything around it — like a
-   law of physics.
-5. "I built this alone, from a Chicago apartment" is a flex, not a weakness. Own it.
-6. Don't demo on stage — DARE them. "Bring me your worst bug, come prove me wrong"
-   turns skepticism into the reason they walk up. The skeptics who try to break it
-   and can't are your first customers.
-7. End on "come prove me wrong." Do NOT say thank you. Let the dare hang.
+1. NEVER open with "Hi, I'm Sam, thanks." Walk out, hold the room one beat, THEN
+   the opener. Your name comes near the END.
+2. The detonation line — say it, then a real beat of silence before the soccer line.
+3. The soccer analogy is your weapon — deliver it conversationally, like you're
+   explaining it to a friend. It's what makes a NON-engineer get it instantly.
+4. "Built it alone, from a Chicago apartment" is a flex. Own it.
+5. End on "I'll show you in thirty seconds." Don't say thank you. Let it hang.
 
-## DELIVERY MAP (where to slow / pause / drop voice)
+## NETWORKING (the demo happens HERE, not on stage)
+- The stage pitch's only job: be the MOST memorable founder so they seek you out
+  in the networking hour, out of all the other pitches.
+- Have the seeded demo (`./demo/postdict-demo.sh`) ALREADY RUNNING / pre-warmed on
+  your laptop so when someone walks up you show it in ~10 seconds, no boot fumble.
+- Demo from STRENGTH: show YOUR seeded scenario (instant, reproducible). Do NOT
+  promise to debug their codebase live — Vestige has to be recording their history
+  first. If asked "does it work on mine?": "it has to record your history first —
+  give me your repo for a day and I'll show you it catch a real one." (That's the
+  pilot hook, said 1:1, never from stage.)
+
+## DELIVERY MAP
 - "born days before it crashed" — land "born" with weight.
-- "...something you already knew." — drop voice, quiet. The ache.
-- "Mem0, Zep, all of them" — tiny pause after. You named names; let it register.
-- "relevance... equals... resemblance" — three separate beats, slow.
-- "a root cause never looks like the bug it creates" — **then 2 full seconds of silence.**
-- "It's upstream." — hit "upstream" hardest. It's the word they walk out with.
-- "It runs locally. Today." — three hard stops. "Today" is a mic-drop.
-- "no funded company rips out its own foundation" — flat, certain, like gravity.
-- "the next layer of the stack" — slow, final. Second mic-drop.
-- "Come prove me wrong." — quiet, almost a smile. Then stop.
+- "a root cause never looks like the bug it creates" — then a real beat of silence.
+- soccer line — conversational, build to "Vestige traces the match backward."
+- "It runs locally" energy on "Vestige does the exact same thing for software."
+- "the first one that realizes" — let it land.
+- "the next layer of the dev stack" — slow, final. Mic-drop.
+- "I'll show you in thirty seconds." — quiet, confident, then stop.
