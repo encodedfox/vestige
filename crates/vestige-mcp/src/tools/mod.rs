@@ -22,6 +22,10 @@ pub mod timeline;
 // v1.2: Maintenance tools
 pub mod maintenance;
 
+// v2.2: Unified status surface — folds system_status + memory_health +
+// memory_timeline + memory_changelog into one view-dispatched tool.
+pub mod memory_status;
+
 // v1.3: Auto-save and dedup tools
 pub mod dedup;
 pub mod importance;

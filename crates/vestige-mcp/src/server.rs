@@ -290,29 +290,19 @@ impl McpServer {
                 ..Default::default()
             },
             // ================================================================
-            // TEMPORAL TOOLS (v1.2+)
+            // STATUS / TEMPORAL — unified `memory_status` tool (v2.2)
+            // Folds system_status + memory_health + memory_timeline +
+            // memory_changelog into one view-dispatched surface.
             // ================================================================
             ToolDescription {
-                name: "memory_timeline".to_string(),
-                description: Some("Browse memories chronologically. Returns memories in a time range, grouped by day. Defaults to last 7 days.".to_string()),
-                input_schema: tools::timeline::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "memory_changelog".to_string(),
-                description: Some("View audit trail of memory changes. Per-memory: state transitions. System-wide: consolidations + recent state changes.".to_string()),
-                input_schema: tools::changelog::schema(),
+                name: "memory_status".to_string(),
+                description: Some("Memory status & history. Views: 'health' (default — full system health + stats + FSRS preview + cognitive-module health + warnings + recommendations), 'retention' (lightweight retention dashboard: avg, distribution, trend), 'timeline' (browse memories chronologically, grouped by day), 'changelog' (audit trail of memory state changes — per-memory transitions or system-wide).".to_string()),
+                input_schema: tools::memory_status::schema(),
                 ..Default::default()
             },
             // ================================================================
             // MAINTENANCE TOOLS (v1.7: system_status replaces health_check + stats)
             // ================================================================
-            ToolDescription {
-                name: "system_status".to_string(),
-                description: Some("Combined system health and statistics. Returns status (healthy/degraded/critical/empty), full stats, FSRS preview, cognitive module health, state distribution, warnings, and recommendations.".to_string()),
-                input_schema: tools::maintenance::system_status_schema(),
-                ..Default::default()
-            },
             ToolDescription {
                 name: "consolidate".to_string(),
                 description: Some("Run FSRS-6 memory consolidation cycle. Applies decay, generates embeddings, and performs maintenance. Use when memories seem stale.".to_string()),
@@ -399,13 +389,8 @@ impl McpServer {
             },
             // ================================================================
             // AUTONOMIC TOOLS (v1.9+)
+            // (memory_health folded into `memory_status` view='retention' in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "memory_health".to_string(),
-                description: Some("Retention dashboard. Returns avg retention, retention distribution (buckets: 0-20%, 20-40%, etc.), trend (improving/declining/stable), and recommendation. Lightweight alternative to full system_status focused on memory quality.".to_string()),
-                input_schema: tools::health::schema(),
-                ..Default::default()
-            },
             ToolDescription {
                 name: "memory_graph".to_string(),
                 description: Some("Subgraph export for visualization. Input: center_id or query, depth (1-3), max_nodes. Returns nodes with force-directed layout positions and edges with weights. Powers memory graph visualization.".to_string()),
@@ -473,7 +458,7 @@ impl McpServer {
         for tool in tools.iter_mut() {
             let max_chars: Option<u64> = match tool.name.as_str() {
                 "search" => Some(300_000),
-                "memory_timeline" => Some(200_000),
+                "memory_status" => Some(200_000),
                 "memory" => Some(100_000),
                 "codebase" => Some(100_000),
                 // v2.2: dedup action='scan' returns duplicate clusters +
@@ -649,9 +634,23 @@ impl McpServer {
             }
 
             // ================================================================
-            // SYSTEM STATUS (v1.7: replaces health_check + stats)
+            // MEMORY STATUS — unified status/temporal tool (v2.2)
+            // view = health (default) | retention | timeline | changelog
             // ================================================================
+            "memory_status" => {
+                tools::memory_status::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+
+            // DEPRECATED (v2.2): folded into `memory_status`. Hidden aliases —
+            // each calls the same underlying handler verbatim.
             "system_status" => {
+                warn!("Tool 'system_status' is deprecated in v2.2. Use 'memory_status' (view='health').");
                 tools::maintenance::execute_system_status(
                     &self.storage,
                     &self.cognitive,
@@ -939,13 +938,18 @@ impl McpServer {
             }
 
             // ================================================================
-            // TEMPORAL TOOLS (v1.2+)
+            // TEMPORAL TOOLS (v1.2+) — DEPRECATED (v2.2): folded into
+            // `memory_status` (view='timeline' / view='changelog'). Hidden aliases.
             // ================================================================
             "memory_timeline" => {
+                warn!("Tool 'memory_timeline' is deprecated in v2.2. Use 'memory_status' (view='timeline').");
                 tools::timeline::execute(&self.storage, &self.output_config, request.arguments)
                     .await
             }
-            "memory_changelog" => tools::changelog::execute(&self.storage, request.arguments).await,
+            "memory_changelog" => {
+                warn!("Tool 'memory_changelog' is deprecated in v2.2. Use 'memory_status' (view='changelog').");
+                tools::changelog::execute(&self.storage, request.arguments).await
+            }
 
             // ================================================================
             // MAINTENANCE TOOLS (v1.2+, non-deprecated)
@@ -1043,7 +1047,11 @@ impl McpServer {
             // ================================================================
             // AUTONOMIC TOOLS (v1.9+)
             // ================================================================
-            "memory_health" => tools::health::execute(&self.storage, request.arguments).await,
+            // DEPRECATED (v2.2): folded into `memory_status` (view='retention').
+            "memory_health" => {
+                warn!("Tool 'memory_health' is deprecated in v2.2. Use 'memory_status' (view='retention').");
+                tools::health::execute(&self.storage, request.arguments).await
+            }
             "memory_graph" => tools::graph::execute(&self.storage, request.arguments).await,
             "composed_graph" => {
                 tools::composed_graph::execute(&self.storage, request.arguments).await
@@ -1815,7 +1823,11 @@ mod tests {
         // v2.2 Tool Consolidation (Layer 1): 34 → 27 after `dedup` folds
         // find_duplicates + the 7 Phase-3 merge tools (8 → 1). Old names remain
         // dispatchable as hidden back-compat aliases but drop off the advertised list.
-        assert_eq!(tools.len(), 27, "Expected exactly 27 tools after dedup consolidation");
+        assert_eq!(
+            tools.len(),
+            24,
+            "Expected exactly 24 tools after dedup + memory_status consolidation"
+        );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -1849,12 +1861,21 @@ mod tests {
             "demote_memory should be removed in v1.7"
         );
 
-        // Temporal tools (v1.2)
-        assert!(tool_names.contains(&"memory_timeline"));
-        assert!(tool_names.contains(&"memory_changelog"));
-
-        // Maintenance tools (v1.7: system_status replaces health_check + stats)
-        assert!(tool_names.contains(&"system_status"));
+        // Status / temporal — unified `memory_status` tool (v2.2).
+        // system_status + memory_health + memory_timeline + memory_changelog
+        // folded in; old names dispatch as hidden aliases but are off the list.
+        assert!(tool_names.contains(&"memory_status"));
+        for old in [
+            "system_status",
+            "memory_health",
+            "memory_timeline",
+            "memory_changelog",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'memory_status' in v2.2"
+            );
+        }
         assert!(
             !tool_names.contains(&"health_check"),
             "health_check should be removed in v1.7"
@@ -1904,8 +1925,7 @@ mod tests {
             "session_context renamed to 'session_start' in v2.2"
         );
 
-        // Autonomic tools (v1.9)
-        assert!(tool_names.contains(&"memory_health"));
+        // Autonomic tools (v1.9) — memory_health folded into memory_status (v2.2)
         assert!(tool_names.contains(&"memory_graph"));
         assert!(tool_names.contains(&"composed_graph"));
 
@@ -1953,6 +1973,41 @@ mod tests {
                     err.message
                 );
             }
+        }
+    }
+
+    /// v2.2: the 4 tools folded into `memory_status` must still dispatch, and
+    /// each `view` of the new tool must resolve.
+    #[tokio::test]
+    async fn test_memory_status_views_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch.
+            ("system_status", serde_json::json!({})),
+            ("memory_health", serde_json::json!({})),
+            ("memory_timeline", serde_json::json!({})),
+            ("memory_changelog", serde_json::json!({})),
+            // New unified views.
+            ("memory_status", serde_json::json!({})), // default view = health
+            ("memory_status", serde_json::json!({"view": "retention"})),
+            ("memory_status", serde_json::json!({"view": "timeline"})),
+            ("memory_status", serde_json::json!({"view": "changelog"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            assert!(
+                response.error.is_none(),
+                "'{name}' {args} should resolve, got error: {:?}",
+                response.error
+            );
         }
     }
 
@@ -2171,7 +2226,9 @@ mod tests {
     fn expected_max_result_size(name: &str) -> Option<u64> {
         match name {
             "search" => Some(300_000),
-            "memory_timeline" => Some(200_000),
+            // v2.2: memory_timeline folded into memory_status (view='timeline');
+            // the high-payload annotation moved with it.
+            "memory_status" => Some(200_000),
             "memory" => Some(100_000),
             "codebase" => Some(100_000),
             // v2.2: dedup action='scan' returns clusters + candidates + policy.
@@ -2191,7 +2248,7 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        for name in ["search", "memory_timeline", "memory", "codebase", "dedup"] {
+        for name in ["search", "memory_status", "memory", "codebase", "dedup"] {
             let tool = tools
                 .iter()
                 .find(|t| t["name"].as_str() == Some(name))
