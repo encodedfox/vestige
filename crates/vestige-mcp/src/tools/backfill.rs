@@ -14,11 +14,10 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use vestige_core::advanced::retroactive_backfill::{
-    BackfillCandidate, FailureEvent, RetroactiveBackfill,
+    self, BackfillCandidate, FailureEvent, RetroactiveBackfill,
 };
 use vestige_core::advanced::prediction_error::cosine_similarity;
 use vestige_core::{KnowledgeNode, Storage};
@@ -70,41 +69,23 @@ struct Args {
 }
 
 /// Pull entities out of a memory: its tags, plus heuristic code-ish tokens from
-/// content (UPPER_SNAKE env vars, dotted/slashed file paths, FooBar identifiers).
-/// These are the shared-entity join keys the backward reach follows.
+/// content (UPPER_SNAKE env vars, dotted/slashed file paths). These are the
+/// shared-entity join keys the backward reach follows.
+///
+/// Thin `&KnowledgeNode` adapter over the single core definition
+/// [`retroactive_backfill::extract_entities`] so the MCP tool, CLI, and the
+/// offline consolidation pass all extract entities identically (no drift).
 fn extract_entities(node: &KnowledgeNode) -> Vec<String> {
-    let mut set: HashSet<String> = node.tags.iter().map(|t| t.to_lowercase()).collect();
-    for raw in node.content.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-')) {
-        let tok = raw.trim_matches(|c: char| c == '.' || c == '/' || c == '-');
-        if tok.len() < 3 {
-            continue;
-        }
-        let is_env = tok.len() >= 3
-            && tok.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
-            && tok.chars().any(|c| c.is_ascii_uppercase());
-        let is_path = (tok.contains('/') || tok.contains('.'))
-            && tok.chars().any(|c| c.is_ascii_alphabetic());
-        if is_env || is_path {
-            set.insert(tok.to_lowercase());
-        }
-    }
-    set.into_iter().collect()
+    retroactive_backfill::extract_entities(&node.content, &node.tags)
 }
 
 /// Heuristic: does this memory read like a failure/"aversive event"? Checks both
 /// content AND tags against the full FAILURE_MARKERS list. Public so the CLI and
 /// any caller share ONE failure-detection definition (no drifting subsets).
+///
+/// Thin `&KnowledgeNode` adapter over [`retroactive_backfill::looks_like_failure`].
 pub fn looks_like_failure(node: &KnowledgeNode) -> bool {
-    let hay = node.content.to_lowercase();
-    vestige_core::advanced::retroactive_backfill::FAILURE_MARKERS
-        .iter()
-        .any(|m| hay.contains(m))
-        || node.tags.iter().any(|t| {
-            let tl = t.to_lowercase();
-            vestige_core::advanced::retroactive_backfill::FAILURE_MARKERS
-                .iter()
-                .any(|m| tl.contains(m))
-        })
+    retroactive_backfill::looks_like_failure(&node.content, &node.tags)
 }
 
 pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Value, String> {
@@ -112,9 +93,13 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         Some(v) => serde_json::from_value(v).map_err(|e| e.to_string())?,
         None => Args::default(),
     };
-    let lookback = args.lookback_days.unwrap_or(30);
+    // Clamp numeric inputs to the documented schema bounds. The MCP dispatch
+    // layer does NOT enforce the JSON-schema min/max, so a caller can send
+    // scan_limit=-1 (SQLite treats a negative LIMIT as unbounded => full-table
+    // fetch = DoS) or values above the 5000 cap. Clamp rather than trust.
+    let lookback = args.lookback_days.unwrap_or(30).clamp(1, 365);
     let promote = args.promote.unwrap_or(true);
-    let scan_limit = args.scan_limit.unwrap_or(500);
+    let scan_limit = args.scan_limit.unwrap_or(500).clamp(10, 5000);
 
     // 1. Resolve the failure event.
     let failure_node = match &args.failure_id {
@@ -146,6 +131,7 @@ pub async fn execute(storage: &Arc<Storage>, args: Option<Value>) -> Result<Valu
         id: failure_node.id.clone(),
         content: failure_node.content.clone(),
         entities: failure_entities.clone(),
+        tags: failure_node.tags.clone(),
         prediction_error: pe,
         manual: args.manual,
     };
