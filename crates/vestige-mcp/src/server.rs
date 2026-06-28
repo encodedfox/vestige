@@ -357,16 +357,14 @@ impl McpServer {
                 input_schema: tools::dream::schema(),
                 ..Default::default()
             },
+            // ================================================================
+            // GRAPH — unified graph/association/prediction tool (v2.2)
+            // Folds explore_connections + predict + memory_graph + composed_graph.
+            // ================================================================
             ToolDescription {
-                name: "explore_connections".to_string(),
-                description: Some("Graph exploration tool for memory connections. Actions: 'chain' (build reasoning path between memories), 'associations' (find related memories via spreading activation + hippocampal index), 'bridges' (find connecting memories between two nodes).".to_string()),
-                input_schema: tools::explore::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "predict".to_string(),
-                description: Some("Proactive memory prediction — predicts what memories you'll need next based on context, recent activity, and learned patterns. Returns predictions, suggestions, and speculative retrievals.".to_string()),
-                input_schema: tools::predict::schema(),
+                name: "graph".to_string(),
+                description: Some("Memory graph & associations. Actions: 'chain' (reasoning path from→to), 'associations' (related memories via spreading activation, needs 'from'), 'bridges' (connectors between from/to), 'predict' (what memories you'll need next, from 'context'), 'memory_graph' (force-directed subgraph for viz, from center_id or query), 'recent'/'get'/'memory'/'neighbors'/'never_composed'/'bounty_mode' (composition topology), 'label' (record a composition outcome — the only write).".to_string()),
+                input_schema: tools::graph_unified::schema(),
                 ..Default::default()
             },
             // ================================================================
@@ -389,20 +387,9 @@ impl McpServer {
             },
             // ================================================================
             // AUTONOMIC TOOLS (v1.9+)
-            // (memory_health folded into `memory_status` view='retention' in v2.2)
+            // (memory_health → `memory_status` view='retention';
+            //  memory_graph + composed_graph → `graph`, all in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "memory_graph".to_string(),
-                description: Some("Subgraph export for visualization. Input: center_id or query, depth (1-3), max_nodes. Returns nodes with force-directed layout positions and edges with weights. Powers memory graph visualization.".to_string()),
-                input_schema: tools::graph::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "composed_graph".to_string(),
-                description: Some("ComposedGraph memory topology. Reads durable composition events, members, and outcome labels; returns recent/already-composed lanes, neighbors, never-composed pairs, bounty-mode lanes, and lets users label outcomes such as helpful, submitted, accepted, rejected, duplicate_risk, needs_poc, or dead_end.".to_string()),
-                input_schema: tools::composed_graph::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // DEEP REFERENCE (v2.0.4+) — replaces cross_reference
             // ================================================================
@@ -464,6 +451,9 @@ impl McpServer {
                 // v2.2: dedup action='scan' returns duplicate clusters +
                 // merge candidates + policy in one payload.
                 "dedup" => Some(150_000),
+                // v2.2: graph action='memory_graph' (force-directed layout) and
+                // 'bounty_mode' pagination can both produce large payloads.
+                "graph" => Some(250_000),
                 _ => None,
             };
             if let Some(n) = max_chars {
@@ -1012,10 +1002,20 @@ impl McpServer {
                 });
                 tools::dream::execute(&self.storage, &self.cognitive, request.arguments).await
             }
+            // ================================================================
+            // GRAPH — unified graph/association/prediction tool (v2.2)
+            // ================================================================
+            "graph" => {
+                tools::graph_unified::execute(&self.storage, &self.cognitive, request.arguments)
+                    .await
+            }
+            // DEPRECATED (v2.2): folded into `graph`. Hidden aliases.
             "explore_connections" => {
+                warn!("Tool 'explore_connections' is deprecated in v2.2. Use 'graph' (action='chain'|'associations'|'bridges').");
                 tools::explore::execute(&self.storage, &self.cognitive, request.arguments).await
             }
             "predict" => {
+                warn!("Tool 'predict' is deprecated in v2.2. Use 'graph' (action='predict').");
                 tools::predict::execute(&self.storage, &self.cognitive, request.arguments).await
             }
             "restore" => tools::restore::execute(&self.storage, request.arguments).await,
@@ -1052,8 +1052,13 @@ impl McpServer {
                 warn!("Tool 'memory_health' is deprecated in v2.2. Use 'memory_status' (view='retention').");
                 tools::health::execute(&self.storage, request.arguments).await
             }
-            "memory_graph" => tools::graph::execute(&self.storage, request.arguments).await,
+            // DEPRECATED (v2.2): folded into `graph`. Hidden aliases.
+            "memory_graph" => {
+                warn!("Tool 'memory_graph' is deprecated in v2.2. Use 'graph' (action='memory_graph').");
+                tools::graph::execute(&self.storage, request.arguments).await
+            }
             "composed_graph" => {
+                warn!("Tool 'composed_graph' is deprecated in v2.2. Use 'graph' (action='recent'|'get'|'memory'|'neighbors'|'never_composed'|'bounty_mode'|'label').");
                 tools::composed_graph::execute(&self.storage, request.arguments).await
             }
             "deep_reference" | "cross_reference" => {
@@ -1825,8 +1830,8 @@ mod tests {
         // dispatchable as hidden back-compat aliases but drop off the advertised list.
         assert_eq!(
             tools.len(),
-            24,
-            "Expected exactly 24 tools after dedup + memory_status consolidation"
+            21,
+            "Expected exactly 21 tools after dedup + memory_status + graph consolidation"
         );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1913,9 +1918,8 @@ mod tests {
         }
 
         // Cognitive tools (v1.5)
+        // (explore_connections + predict folded into `graph` in v2.2)
         assert!(tool_names.contains(&"dream"));
-        assert!(tool_names.contains(&"explore_connections"));
-        assert!(tool_names.contains(&"predict"));
         assert!(tool_names.contains(&"restore"));
 
         // Context packets (v1.8) — renamed session_context → session_start (v2.2)
@@ -1925,9 +1929,21 @@ mod tests {
             "session_context renamed to 'session_start' in v2.2"
         );
 
-        // Autonomic tools (v1.9) — memory_health folded into memory_status (v2.2)
-        assert!(tool_names.contains(&"memory_graph"));
-        assert!(tool_names.contains(&"composed_graph"));
+        // Graph — unified `graph` tool (v2.2). explore_connections + predict +
+        // memory_graph + composed_graph folded in; old names dispatch as hidden
+        // aliases but are off the advertised list. (memory_health → memory_status.)
+        assert!(tool_names.contains(&"graph"));
+        for old in [
+            "explore_connections",
+            "predict",
+            "memory_graph",
+            "composed_graph",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'graph' in v2.2"
+            );
+        }
 
         // Deep reference + cross_reference alias (v2.0.4)
         assert!(tool_names.contains(&"deep_reference"));
@@ -2008,6 +2024,43 @@ mod tests {
                 "'{name}' {args} should resolve, got error: {:?}",
                 response.error
             );
+        }
+    }
+
+    /// v2.2: the 4 tools folded into `graph` must still dispatch, and the
+    /// read-only `graph` actions must resolve. (memory_graph is sync — this also
+    /// guards the no-`.await` facade branch.)
+    #[tokio::test]
+    async fn test_graph_actions_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch (not unknown-tool).
+            ("predict", serde_json::json!({})),
+            ("memory_graph", serde_json::json!({})),
+            ("composed_graph", serde_json::json!({"action": "recent"})),
+            // New unified actions (read-only).
+            ("graph", serde_json::json!({"action": "predict"})),
+            ("graph", serde_json::json!({"action": "memory_graph"})),
+            ("graph", serde_json::json!({"action": "recent"})),
+            ("graph", serde_json::json!({"action": "never_composed"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            if let Some(err) = response.error {
+                assert_ne!(
+                    err.code, -32602,
+                    "'{name}' {args} should dispatch (not unknown-tool): {}",
+                    err.message
+                );
+            }
         }
     }
 
@@ -2233,6 +2286,8 @@ mod tests {
             "codebase" => Some(100_000),
             // v2.2: dedup action='scan' returns clusters + candidates + policy.
             "dedup" => Some(150_000),
+            // v2.2: graph memory_graph layout + bounty_mode pagination.
+            "graph" => Some(250_000),
             _ => None,
         }
     }
@@ -2248,7 +2303,7 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        for name in ["search", "memory_status", "memory", "codebase", "dedup"] {
+        for name in ["search", "memory_status", "memory", "codebase", "dedup", "graph"] {
             let tool = tools
                 .iter()
                 .find(|t| t["name"].as_str() == Some(name))
