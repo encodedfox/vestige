@@ -829,9 +829,19 @@ fn install_launchd_job(source_root: &Path, home: &Path, model: &str) -> anyhow::
         .join("com.vestige.mlx-server.plist.template");
     let template = fs::read_to_string(&template_path)
         .with_context(|| format!("failed to read {}", template_path.display()))?;
+    // XML-escape interpolated values: this plist is XML, and an unescaped model
+    // string containing &, <, >, " or ' would corrupt the plist (or inject
+    // elements). Escape before substitution.
+    let xml_escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+    };
     let rendered = template
-        .replace("__HOME__", &home.display().to_string())
-        .replace("__MODEL__", model);
+        .replace("__HOME__", &xml_escape(&home.display().to_string()))
+        .replace("__MODEL__", &xml_escape(model));
 
     let plist = launchd_dir.join("com.vestige.mlx-server.plist");
     fs::write(&plist, rendered)?;
@@ -2452,7 +2462,7 @@ fn run_gc(
         let age_days = (now - node.created_at).num_days();
         println!(
             "  {} [ret={:.3}, age={}d] {}",
-            node.id[..8].dimmed(),
+            node.id.get(..8).unwrap_or(&node.id).dimmed(),
             node.retention_strength,
             age_days,
             truncate(&node.content, 60).dimmed()
@@ -2513,7 +2523,7 @@ fn run_gc(
                 eprintln!(
                     "  {} Failed to delete {}: {}",
                     "ERR".red(),
-                    &node.id[..8],
+                    node.id.get(..8).unwrap_or(&node.id),
                     e
                 );
                 errors += 1;
