@@ -209,9 +209,12 @@ impl KnowledgeEdge {
         }
     }
 
-    /// Check if the edge is currently valid
+    /// Check if the edge is currently valid (within its [valid_from, valid_until)
+    /// window). Delegates to the bi-temporal check so a not-yet-active edge
+    /// (future valid_from) or an expired one is correctly reported invalid —
+    /// the old version only checked valid_until and ignored valid_from.
     pub fn is_valid(&self) -> bool {
-        self.valid_until.is_none()
+        self.was_valid_at(chrono::Utc::now())
     }
 
     /// Check if the edge was valid at a given time
@@ -359,6 +362,10 @@ pub struct ConsolidationResult {
     pub activations_computed: i64,
     /// Personalized w20 if optimized this cycle
     pub w20_optimized: Option<f64>,
+    /// Retroactive Salience Backfill: number of quiet earlier *causes* promoted
+    /// because a recent salient failure reached backward and surfaced them
+    /// (root-cause memories a semantic search would have missed).
+    pub backfilled_causes: i64,
 }
 
 // ============================================================================
