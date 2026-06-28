@@ -1,136 +1,108 @@
-# Postdict — the 60-second "blow it wide open" script
+# Postdict — the 60-second SPOKEN pitch
 
-**Audience:** investors. **Goal:** they feel the pain, see the flawed axiom crack,
-watch the impossible happen live, and understand the market is *everything*.
-**Format:** live terminal, one take, you talking over it. ~60s.
-**Rule:** ~20s of talk. The rest is the terminal doing the impossible.
+**This is a SPEECH.** You, on stage, looking at 50-100 engineers / founders /
+investors. No terminal. No slides. No screen. Just your voice and the room.
 
-> Why NOT "X companies got hacked": it's a commodity security-FUD hook, it needs a
-> stat you can't cite live (which torches your credibility — your whole moat is
-> *honest + reproducible*), and it shrinks you from "every agent in production" to
-> "security." Instead, open with the wound every engineer in the room has lived.
+Built for the *ear*: short sentences, hard stops, one line they'll repeat in the
+hallway. Read the **[beats]** as pauses — silence is your loudest move on stage.
 
 ---
 
-## THE SCRIPT (what's on screen · what you say)
+## THE PITCH (≈60 seconds, spoken)
 
-### [0:00–0:12] — THE WOUND (make them feel it personally)
-
-**On screen:** a clean dark terminal, blinking cursor. Nothing else yet.
-
-**You say (calm, then sharper):**
-> "Every engineer in this room has lost a day to this: production breaks, and the
-> cause turns out to be a one-line change you made days ago and never thought
-> about again. The bug looked nothing like that change — so you never connected
-> them. You just *suffered* until you stumbled onto it.
+> Every engineer in this room has lost a day to the same thing.
 >
-> Now we've handed that exact job to AI agents. And here's the problem—"
+> Production breaks. You burn hours hunting. And the cause turns out to be one
+> line you changed three days ago — and forgot.
+>
+> **[pause]**
+>
+> The bug looked nothing like that change. So you never connected them. You just
+> suffered until you stumbled onto it.
+>
+> **[pause]**
+>
+> Now we've handed that exact job — debugging — to AI agents. And every AI memory
+> system on Earth is about to fail at it. Mem0, Zep, all of them. Because they're
+> built on one assumption: that *relevance equals resemblance.* They search your
+> memory for whatever *looks like* the problem.
+>
+> **[slow down — this is the line]**
+>
+> But a root cause never looks like the bug it creates.
+>
+> **[full stop. let it hang.]**
+>
+> So the entire industry is searching in the one place the answer can never be.
+>
+> **[pause]**
+>
+> We built the opposite. When your agent hits a failure, our memory reaches
+> *backward in time* — and finds the quiet change, days earlier, that actually
+> caused it. The one no similarity search will ever surface, because it isn't
+> *similar* — it's *upstream.*
+>
+> We didn't invent this. We ported it from your brain. There's a 2024 *Nature*
+> paper: when something goes wrong, the brain reaches backward to find the cause
+> — backward only, because a cause is always in the past. We turned that into
+> software. It runs locally. Today.
+>
+> **[pause]**
+>
+> And the incumbents can't copy it — their whole architecture *is* the wrong
+> assumption. To do this, you rebuild memory from the brain up. We already did.
+>
+> **[land it]**
+>
+> Everyone else built a memory that *remembers.* We built the first one that
+> *realizes.* Every AI agent that touches production needs it — that's the whole
+> market, and it's on fire.
+>
+> I'm Sam. We're Postdict. The first memory that finds the *cause*, not the
+> lookalike. Come find me — I'll prove it on a laptop in thirty seconds.
 
 ---
 
-### [0:12–0:22] — THE FLAWED AXIOM (the line they repeat to their partners)
+## HOW TO DELIVER IT (this is 80% of the win on a stage)
 
-**On screen:** type one line:
-`relevance ≠ resemblance`
+1. **Memorize three sentences. Improvise the rest.** If you only nail three,
+   nail these:
+   - **The wound:** *"The cause turns out to be one line you changed three days ago — and forgot."*
+   - **The detonation:** *"A root cause never looks like the bug it creates."*
+   - **The category:** *"Everyone else built a memory that remembers. We built the first one that realizes."*
 
-**You say:**
-> "—every AI memory framework on Earth, every VC-backed startup, every platform
-> layer, is built on one flawed assumption: that **relevance equals resemblance.**
-> They search memory for what *looks similar* to the problem. But **a root cause
-> never looks like the bug it creates.** The entire industry is searching in the
-> one place the answer can never be."
+2. **The detonation line is the whole pitch.** Walk *toward* the audience as you
+   say it. Then STOP. Say nothing for two full seconds. That silence is you
+   letting 100 people independently realize you're right. Do not rush it.
 
-*(Beat. Let it sit.)*
+3. **Open about THEM, not you.** The first 15 seconds is their pain, not your
+   product. When heads nod because they've lived it, the room is yours — you
+   haven't even said what you do yet.
 
----
+4. **Short sentences. Hard stops.** On a stage, a long sentence loses the back
+   row. Every sentence above is built to be said in one breath. Trust the
+   periods.
 
-### [0:22–0:35] — MAKE IT CONCRETE (type it live)
+5. **Don't demo on stage — *promise* the demo.** "Come find me, I'll prove it on
+   a laptop in 30 seconds" is stronger than fumbling a terminal in front of 100
+   people. It pulls the serious ones to you afterward, one-on-one, where deals
+   actually start.
 
-**On screen:**
-```
-$ postdict ingest "Set API_TIMEOUT=2 in the deploy env" --ago-days 3    # the quiet cause
-$ postdict ingest "500 error in the billing service" --ago-days 20      # an old lookalike
-$ postdict ingest "Service crashed: 500 on the auth endpoint"           # today's crash
-```
-
-**You say:**
-> "Watch it happen. A one-line config change three days ago. An old, unrelated
-> 500 error weeks back. And today — the auth service crashes. Which past memory
-> caused it? To a vector database, today's crash looks most like that old billing
-> 500. The thing that *looks* similar is never the thing that *caused* it."
+6. **End on your name + the one-liner.** "We're Postdict. The first memory that
+   finds the cause, not the lookalike." That's what they Google in the parking lot.
 
 ---
 
-### [0:35–0:50] — THE PROOF (the money shot · go silent on the reveal)
+## THE 30-SECOND VERSION (if you only get a hallway / elevator)
 
-**On screen:** `$ postdict backfill --contrast` →
-```
-── 1. SIMILARITY SEARCH · keyword (BM25) ──
-   1. 500 error in the billing service          ← top match   (WRONG)
-   → ranked by RESEMBLANCE. its top hit is a lookalike, not the cause.
+> "Every AI memory tool searches for what your bug *looks like.* But a root cause
+> never looks like the bug it creates — it's a config change from three days ago
+> that looks nothing like the crash. So they all miss it. We built the first
+> memory that reaches *backward in time* to find the actual cause. Ported it
+> straight from a *Nature* paper on how the brain does it. Every agent that
+> touches production needs it. I'll show you on a laptop right now."
 
-── 2. POSTDICT (reach backward for the CAUSE) ──
-   #1 Set API_TIMEOUT=2 in the deploy env
-      ↩ reached back 3.0 days before the failure
-      🔗 causal join: api_timeout                            (RIGHT)
-```
+## THE ONE LINE (if you get five seconds)
 
-**You say (let `↩ reached back 3.0 days` hold in dead silence for a full second):**
-> "Same database. Same question. Similarity search returns the lookalike —
-> confident, and wrong. Postdict reaches **backward three days** and finds the
-> actual cause. Not because it's similar — because it's **causally upstream.**
-> That day you lost? Gone. It's instant now."
-
----
-
-### [0:50–0:58] — THE MOAT (kill "can't they just add this?")
-
-**You say:**
-> "And they can't copy it. This is a faithful port of a 2024 *Nature* result —
-> the brain reaches *backward* in time to find causes, backward-only, because a
-> root cause is always in the past. The incumbents can't bolt this on; their
-> whole architecture **is** the flawed axiom. You have to rebuild memory from the
-> cognitive science up. We already did. It runs locally, today."
-
----
-
-### [0:58–1:00] — THE ASK
-
-**On screen:** `the first memory that finds the cause, not the lookalike.`
-
-**You say:**
-> "Every agent that touches production needs this. That's the whole market, and
-> it's on fire. We're raising [X] to make every AI agent debug like a senior
-> engineer. The seed's in the repo — run it yourself."
-
----
-
-## DELIVERY — THE 6 RULES THAT MAKE IT LAND
-
-1. **Open with the wound, not the product.** 0:00–0:12 is about *them*, not you.
-   When an investor nods because they've lived it, you've already won the room.
-2. **The monologue is ~20 seconds total.** Investors fund what they *see* work.
-   Get to the terminal fast; the contrast carries the weight.
-3. **Two sentences, memorized cold:** the axiom — *"They believe relevance equals
-   resemblance."* The detonation — *"A root cause never looks like the bug it
-   creates."* Everything else can be loose.
-4. **Dead silence on the reveal (0:35–0:50).** When `↩ reached back 3.0 days`
-   appears, say nothing for one full second. The screen sells it.
-5. **Answer the moat before they ask it.** "Can't Mem0 add this?" — no, their
-   architecture is the axiom. That sentence is what turns "neat" into "fundable."
-6. **End on the market (TAM), not the feature.** "Every agent that touches
-   production" is the size of the prize. The demo earned you the right to say it.
-
-## THE THREE LINES THAT DO THE WORK
-- **The wound:** "Production breaks, and the cause is a change you made days ago and forgot."
-- **The detonation:** "A root cause never looks like the bug it creates."
-- **The category:** "We're not a better memory. We're the first memory that reasons backward."
-
----
-
-## NOTE ON THE BINARY
-
-The script types `postdict` (the new name). The shipping binary is still `vestige`
-today — for recording, either (a) `alias postdict=./target/release/vestige`, or
-(b) record now with `vestige` and re-record after the rename. The on-screen output
-is identical; only the command word differs.
+> "We're the first AI memory that finds the *cause* of a bug, not the lookalike —
+> because a cause never looks like the bug it creates."
