@@ -392,8 +392,8 @@ impl McpServer {
             // CONTEXT PACKETS (v1.8+)
             // ================================================================
             ToolDescription {
-                name: "session_context".to_string(),
-                description: Some("One-call session initialization. Combines search, intentions, status, predictions, and codebase context into a single token-budgeted response. Replaces 5 separate calls at session start.".to_string()),
+                name: "session_start".to_string(),
+                description: Some("One-call session initialization. Combines search, intentions, status, predictions, and codebase context into a single token-budgeted response. Call this once at the start of a session instead of 5 separate calls. (Renamed from 'session_context' in v2.2.)".to_string()),
                 input_schema: tools::session_context::schema(),
                 ..Default::default()
             },
@@ -1017,9 +1017,20 @@ impl McpServer {
             "restore" => tools::restore::execute(&self.storage, request.arguments).await,
 
             // ================================================================
-            // CONTEXT PACKETS (v1.8+)
+            // CONTEXT PACKETS (v1.8+) — `session_start` (renamed v2.2)
             // ================================================================
+            "session_start" => {
+                tools::session_context::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            // DEPRECATED (v2.2): renamed to `session_start`. Hidden alias.
             "session_context" => {
+                warn!("Tool 'session_context' is deprecated in v2.2. Use 'session_start'.");
                 tools::session_context::execute(
                     &self.storage,
                     &self.cognitive,
@@ -1886,8 +1897,12 @@ mod tests {
         assert!(tool_names.contains(&"predict"));
         assert!(tool_names.contains(&"restore"));
 
-        // Context packets (v1.8)
-        assert!(tool_names.contains(&"session_context"));
+        // Context packets (v1.8) — renamed session_context → session_start (v2.2)
+        assert!(tool_names.contains(&"session_start"));
+        assert!(
+            !tool_names.contains(&"session_context"),
+            "session_context renamed to 'session_start' in v2.2"
+        );
 
         // Autonomic tools (v1.9)
         assert!(tool_names.contains(&"memory_health"));
