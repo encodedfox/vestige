@@ -301,39 +301,14 @@ impl McpServer {
                 ..Default::default()
             },
             // ================================================================
-            // MAINTENANCE TOOLS (v1.7: system_status replaces health_check + stats)
+            // MAINTAIN — unified maintenance/lifecycle tool (v2.2)
+            // Folds consolidate + dream + gc + importance_score + backup +
+            // export + restore into one action-dispatched surface.
             // ================================================================
             ToolDescription {
-                name: "consolidate".to_string(),
-                description: Some("Run FSRS-6 memory consolidation cycle. Applies decay, generates embeddings, and performs maintenance. Use when memories seem stale.".to_string()),
-                input_schema: tools::maintenance::consolidate_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "backup".to_string(),
-                description: Some("Create a SQLite database backup. Returns the backup file path.".to_string()),
-                input_schema: tools::maintenance::backup_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "export".to_string(),
-                description: Some("Export memories as JSON or JSONL. Supports tag and date filters.".to_string()),
-                input_schema: tools::maintenance::export_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "gc".to_string(),
-                description: Some("Garbage collect stale memories below retention threshold. Defaults to dry_run=true for safety.".to_string()),
-                input_schema: tools::maintenance::gc_schema(),
-                ..Default::default()
-            },
-            // ================================================================
-            // AUTO-SAVE & DEDUP TOOLS (v1.3+)
-            // ================================================================
-            ToolDescription {
-                name: "importance_score".to_string(),
-                description: Some("Score content importance using 4-channel neuroscience model (novelty/arousal/reward/attention). Returns composite score, channel breakdown, encoding boost, and explanations.".to_string()),
-                input_schema: tools::importance::schema(),
+                name: "maintain".to_string(),
+                description: Some("Memory maintenance & lifecycle. Actions: 'consolidate' (run FSRS-6 decay/embedding cycle), 'dream' (replay memories → insights/connections + strengthen patterns), 'gc' (garbage-collect stale memories; dry_run=true by default for safety), 'importance_score' (4-channel neuroscience score for 'content'), 'backup' (SQLite DB backup), 'export' (memories as JSON/JSONL with tag/date filters), 'restore' (restore from a JSON backup at 'path').".to_string()),
+                input_schema: tools::maintain::schema(),
                 ..Default::default()
             },
             // ================================================================
@@ -350,13 +325,8 @@ impl McpServer {
             },
             // ================================================================
             // COGNITIVE TOOLS (v1.5+)
+            // (dream folded into `maintain` action='dream' in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "dream".to_string(),
-                description: Some("Trigger memory dreaming — replays recent memories to discover hidden connections, synthesize insights, and strengthen important patterns. Returns insights, connections, and dream stats.".to_string()),
-                input_schema: tools::dream::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // GRAPH — unified graph/association/prediction tool (v2.2)
             // Folds explore_connections + predict + memory_graph + composed_graph.
@@ -369,13 +339,8 @@ impl McpServer {
             },
             // ================================================================
             // RESTORE TOOL (v1.5+)
+            // (folded into `maintain` action='restore' in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "restore".to_string(),
-                description: Some("Restore memories from a JSON backup file. Supports MCP wrapper format, RecallResult format, and direct memory array format.".to_string()),
-                input_schema: tools::restore::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // CONTEXT PACKETS (v1.8+)
             // ================================================================
@@ -942,22 +907,65 @@ impl McpServer {
             }
 
             // ================================================================
-            // MAINTENANCE TOOLS (v1.2+, non-deprecated)
+            // MAINTAIN — unified maintenance/lifecycle tool (v2.2)
+            // action = consolidate | dream | gc | importance_score | backup
+            //        | export | restore
+            // ================================================================
+            "maintain" => {
+                // Mirror the pre-dispatch *Started* events that the standalone
+                // consolidate/dream arms emit, keyed off the action.
+                match request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("action"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some("consolidate") => self.emit(VestigeEvent::ConsolidationStarted {
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    Some("dream") => self.emit(VestigeEvent::DreamStarted {
+                        memory_count: self
+                            .storage
+                            .get_stats()
+                            .map(|s| s.total_nodes as usize)
+                            .unwrap_or(0),
+                        timestamp: chrono::Utc::now(),
+                    }),
+                    _ => {}
+                }
+                tools::maintain::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
+
+            // ================================================================
+            // MAINTENANCE TOOLS (v1.2+) — DEPRECATED (v2.2): folded into
+            // `maintain`. Hidden aliases; pre-emit Started events preserved.
             // ================================================================
             "consolidate" => {
+                warn!("Tool 'consolidate' is deprecated in v2.2. Use 'maintain' (action='consolidate').");
                 self.emit(VestigeEvent::ConsolidationStarted {
                     timestamp: chrono::Utc::now(),
                 });
                 tools::maintenance::execute_consolidate(&self.storage, request.arguments).await
             }
-            "backup" => tools::maintenance::execute_backup(&self.storage, request.arguments).await,
-            "export" => tools::maintenance::execute_export(&self.storage, request.arguments).await,
-            "gc" => tools::maintenance::execute_gc(&self.storage, request.arguments).await,
+            "backup" => {
+                warn!("Tool 'backup' is deprecated in v2.2. Use 'maintain' (action='backup').");
+                tools::maintenance::execute_backup(&self.storage, request.arguments).await
+            }
+            "export" => {
+                warn!("Tool 'export' is deprecated in v2.2. Use 'maintain' (action='export').");
+                tools::maintenance::execute_export(&self.storage, request.arguments).await
+            }
+            "gc" => {
+                warn!("Tool 'gc' is deprecated in v2.2. Use 'maintain' (action='gc').");
+                tools::maintenance::execute_gc(&self.storage, request.arguments).await
+            }
 
             // ================================================================
             // AUTO-SAVE & DEDUP TOOLS (v1.3+)
             // ================================================================
+            // DEPRECATED (v2.2): folded into `maintain` (action='importance_score').
             "importance_score" => {
+                warn!("Tool 'importance_score' is deprecated in v2.2. Use 'maintain' (action='importance_score').");
                 tools::importance::execute(&self.storage, &self.cognitive, request.arguments).await
             }
             // ================================================================
@@ -989,9 +997,11 @@ impl McpServer {
             }
 
             // ================================================================
-            // COGNITIVE TOOLS (v1.5+)
+            // COGNITIVE TOOLS (v1.5+) — DEPRECATED (v2.2): dream folded into
+            // `maintain` (action='dream'). Hidden alias; DreamStarted preserved.
             // ================================================================
             "dream" => {
+                warn!("Tool 'dream' is deprecated in v2.2. Use 'maintain' (action='dream').");
                 self.emit(VestigeEvent::DreamStarted {
                     memory_count: self
                         .storage
@@ -1018,7 +1028,11 @@ impl McpServer {
                 warn!("Tool 'predict' is deprecated in v2.2. Use 'graph' (action='predict').");
                 tools::predict::execute(&self.storage, &self.cognitive, request.arguments).await
             }
-            "restore" => tools::restore::execute(&self.storage, request.arguments).await,
+            // DEPRECATED (v2.2): folded into `maintain` (action='restore').
+            "restore" => {
+                warn!("Tool 'restore' is deprecated in v2.2. Use 'maintain' (action='restore').");
+                tools::restore::execute(&self.storage, request.arguments).await
+            }
 
             // ================================================================
             // CONTEXT PACKETS (v1.8+) — `session_start` (renamed v2.2)
@@ -1299,6 +1313,19 @@ impl McpServer {
             return;
         }
         let now = Utc::now();
+
+        // v2.2: the unified `maintain` tool folds consolidate/dream/importance_score
+        // (the three maintenance actions that emit). Normalize its name to the
+        // effective action so the existing emit arms below fire unchanged. Old
+        // standalone names still arrive verbatim and match directly.
+        let tool_name = if tool_name == "maintain" {
+            args.as_ref()
+                .and_then(|a| a.get("action"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("maintain")
+        } else {
+            tool_name
+        };
 
         match tool_name {
             // -- smart_ingest: memory created/updated --
@@ -1830,8 +1857,8 @@ mod tests {
         // dispatchable as hidden back-compat aliases but drop off the advertised list.
         assert_eq!(
             tools.len(),
-            21,
-            "Expected exactly 21 tools after dedup + memory_status + graph consolidation"
+            15,
+            "Expected exactly 15 tools after dedup + memory_status + graph + maintain consolidation"
         );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -1889,13 +1916,24 @@ mod tests {
             !tool_names.contains(&"stats"),
             "stats should be removed in v1.7"
         );
-        assert!(tool_names.contains(&"consolidate"));
-        assert!(tool_names.contains(&"backup"));
-        assert!(tool_names.contains(&"export"));
-        assert!(tool_names.contains(&"gc"));
-
-        // Auto-save tool (v1.3)
-        assert!(tool_names.contains(&"importance_score"));
+        // Maintenance / lifecycle — unified `maintain` tool (v2.2).
+        // consolidate + dream + gc + importance_score + backup + export + restore
+        // folded in; old names dispatch as hidden aliases but are off the list.
+        assert!(tool_names.contains(&"maintain"));
+        for old in [
+            "consolidate",
+            "dream",
+            "gc",
+            "importance_score",
+            "backup",
+            "export",
+            "restore",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'maintain' in v2.2"
+            );
+        }
 
         // Dedup / merge / supersede — unified `dedup` tool (v2.2).
         // find_duplicates + the 7 Phase-3 merge tools folded in; still
@@ -1917,10 +1955,8 @@ mod tests {
             );
         }
 
-        // Cognitive tools (v1.5)
-        // (explore_connections + predict folded into `graph` in v2.2)
-        assert!(tool_names.contains(&"dream"));
-        assert!(tool_names.contains(&"restore"));
+        // Cognitive tools (v1.5): explore_connections + predict → `graph`;
+        // dream + restore → `maintain` (all v2.2). Nothing left advertised here.
 
         // Context packets (v1.8) — renamed session_context → session_start (v2.2)
         assert!(tool_names.contains(&"session_start"));
@@ -2062,6 +2098,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// v2.2: the 7 tools folded into `maintain` must still dispatch, the new
+    /// actions must resolve, gc must default to dry_run, and restore must keep
+    /// path validation (a nonexistent path errors rather than silently no-op).
+    #[tokio::test]
+    async fn test_maintain_actions_and_safety() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        // Aliases + safe new actions must dispatch (not unknown-tool).
+        let dispatch_ok: Vec<(&str, serde_json::Value)> = vec![
+            ("consolidate", serde_json::json!({})),
+            ("backup", serde_json::json!({})),
+            ("dream", serde_json::json!({})),
+            ("maintain", serde_json::json!({"action": "consolidate"})),
+            ("maintain", serde_json::json!({"action": "gc"})),
+            ("maintain", serde_json::json!({"action": "backup"})),
+        ];
+        for (name, args) in dispatch_ok {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            if let Some(err) = response.error {
+                assert_ne!(err.code, -32602, "'{name}' {args} should dispatch: {}", err.message);
+            }
+        }
+
+        // gc via maintain defaults to dry_run=true (no deletion).
+        let gc_req = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "maintain", "arguments": {"action": "gc"} })),
+        );
+        let gc_resp = server.handle_request(gc_req).await.unwrap();
+        let text = gc_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("\"dryRun\": true") || text.contains("\"dryRun\":true"),
+            "maintain action=gc must default to dry_run=true; got: {text}"
+        );
+
+        // restore keeps path validation: a missing file must error, not no-op.
+        let restore_req = make_request(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "maintain",
+                "arguments": {"action": "restore", "path": "/nonexistent/vestige-backup-xyz.json"}
+            })),
+        );
+        let restore_resp = server.handle_request(restore_req).await.unwrap();
+        // Either a JSON-RPC error or an error envelope is acceptable; a silent
+        // success is NOT (that would mean confinement/validation was bypassed).
+        let validated = restore_resp.error.is_some()
+            || restore_resp
+                .result
+                .map(|r| {
+                    r["content"][0]["text"]
+                        .as_str()
+                        .map(|t| t.to_lowercase().contains("not found") || t.to_lowercase().contains("error"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+        assert!(validated, "maintain action=restore must validate a missing path");
     }
 
     #[tokio::test]
