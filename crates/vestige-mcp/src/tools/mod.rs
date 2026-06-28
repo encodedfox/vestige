@@ -2,9 +2,14 @@
 //!
 //! Tool implementations for the Vestige MCP server.
 //!
-//! The unified tools (codebase_unified, intention_unified, memory_unified, search_unified)
-//! are the primary API. The granular tools below are kept for backwards compatibility
-//! but are not exposed in the MCP tool list.
+//! v2.2 Tool Consolidation (Layer 1): the advertised surface is 12 tools —
+//! recall, memory, codebase, intention, smart_ingest, source_sync,
+//! memory_status, dedup, graph, maintain, session_start, suppress. The unified
+//! facade modules (recall, dedup, memory_status, graph_unified, maintain, plus
+//! the earlier *_unified) dispatch on an action/mode/view discriminator and
+//! delegate to the granular handler modules below, which stay in the crate as
+//! the implementation layer and as hidden back-compat aliases (see the redirect
+//! arms in server.rs). See docs/launch/tool-consolidation-v2.2.0.md.
 
 // Active unified tools
 pub mod codebase_unified;

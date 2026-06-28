@@ -240,9 +240,10 @@ impl McpServer {
 
     /// Handle tools/list request
     async fn handle_tools_list(&self) -> Result<serde_json::Value, JsonRpcError> {
-        // v2.1.21: 25 tools (verified by the `tools.len() == 25` assertion in the
-        // handle_tools_list test below — the `suppress` tool landed in v2.0.5).
-        // Deprecated tools still work via redirects in handle_tools_call.
+        // v2.2: 12 advertised tools after Layer-1 Tool Consolidation
+        // (verified by `tools.len() == 12` in test_tools_list_returns_all_tools).
+        // 22 deprecated/folded names still work as hidden redirects in
+        // handle_tools_call. See docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = vec![
             // ================================================================
             // RECALL — unified retrieval tool (v2.2). HOT PATH.
@@ -387,10 +388,11 @@ impl McpServer {
         // chunk-read them.
         //
         // Per-tool caps below are sized at ~2× observed peak with growth
-        // headroom; max permitted by Anthropic is 500_000. Only the four
-        // empirically-measured high-payload tools carry the annotation today;
-        // the remaining 21 tools deliberately do NOT (cargo-cult prevention —
-        // annotating a small-payload tool dilutes the signal).
+        // headroom; max permitted by Anthropic is 500_000. Only the
+        // high-payload tools carry the annotation (recall, memory_status,
+        // memory, codebase, dedup, graph); the remaining advertised tools
+        // deliberately do NOT (cargo-cult prevention — annotating a
+        // small-payload tool dilutes the signal).
         //
         // Other tools that COULD plausibly grow into the annotated set with
         // future workload (`deep_reference`, `cross_reference`, `memory_graph`,
