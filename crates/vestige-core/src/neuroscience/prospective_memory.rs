@@ -1279,6 +1279,7 @@ impl ProspectiveMemory {
             }
 
             // Check if triggered
+            let mut just_triggered = false;
             if intention
                 .trigger
                 .is_triggered(context, &context.recent_events)
@@ -1286,6 +1287,7 @@ impl ProspectiveMemory {
             {
                 intention.mark_triggered();
                 triggered.push(intention.clone());
+                just_triggered = true;
             }
 
             // Check for deadline escalation
@@ -1296,8 +1298,9 @@ impl ProspectiveMemory {
                 }
             }
 
-            // Auto-expire overdue intentions
-            if self.config.auto_expire && intention.is_overdue() {
+            // Auto-expire overdue intentions — but never clobber one we JUST
+            // triggered this iteration (it should fire before it expires).
+            if self.config.auto_expire && intention.is_overdue() && !just_triggered {
                 intention.status = IntentionStatus::Expired;
             }
         }
