@@ -11,6 +11,11 @@ pub mod codebase_unified;
 pub mod intention_unified;
 pub mod memory_unified;
 pub mod search_unified;
+
+// v2.2: Unified retrieval surface — folds search + deep_reference +
+// cross_reference + contradictions into one mode-dispatched tool.
+// mode=lookup (default) is a zero-overhead pass-through to search_unified.
+pub mod recall;
 pub mod smart_ingest;
 // #57: external-source connectors (GitHub Issues / Redmine retrieval layer)
 pub mod source_sync;

@@ -245,14 +245,19 @@ impl McpServer {
         // Deprecated tools still work via redirects in handle_tools_call.
         let mut tools = vec![
             // ================================================================
-            // UNIFIED TOOLS (v1.1+)
+            // RECALL — unified retrieval tool (v2.2). HOT PATH.
+            // Folds search + deep_reference + cross_reference + contradictions.
+            // mode='lookup' (default) is a zero-overhead pass-through to search.
             // ================================================================
             ToolDescription {
-                name: "search".to_string(),
-                description: Some("Unified search tool. Uses hybrid search (keyword + semantic + convex combination fusion) internally. Auto-strengthens memories on access (Testing Effect).".to_string()),
-                input_schema: tools::search_unified::schema(),
+                name: "recall".to_string(),
+                description: Some("Retrieve from memory. Modes: 'lookup' (default — fast hybrid search: keyword + semantic + convex fusion, auto-strengthens on access; use for plain recall), 'reason' (deep cognitive reasoning across memories with FSRS-6 trust scoring, spreading activation, supersession, and contradiction analysis; use when accuracy matters, needs 'query'), 'contradictions' (surface trust-weighted disagreement pairs for a 'topic'). Default mode is fast — only 'reason' pays the deep-analysis cost.".to_string()),
+                input_schema: tools::recall::schema(),
                 ..Default::default()
             },
+            // ================================================================
+            // UNIFIED TOOLS (v1.1+)
+            // ================================================================
             ToolDescription {
                 name: "memory".to_string(),
                 description: Some("Unified memory management tool. Actions: 'get' (retrieve full node), 'purge' (irreversibly remove content/embeddings with confirm=true), 'delete' (legacy alias for purge), 'state' (get accessibility state), 'promote' (thumbs up — increases retrieval strength), 'demote' (thumbs down — decreases retrieval strength, does NOT delete), 'edit' (update content in-place, preserves FSRS state).".to_string()),
@@ -356,26 +361,10 @@ impl McpServer {
             //  memory_graph + composed_graph → `graph`, all in v2.2)
             // ================================================================
             // ================================================================
-            // DEEP REFERENCE (v2.0.4+) — replaces cross_reference
+            // DEEP REFERENCE (v2.0.4+) — folded into `recall` (mode='reason' /
+            // 'contradictions') in v2.2. deep_reference/cross_reference/
+            // contradictions remain hidden dispatch aliases.
             // ================================================================
-            ToolDescription {
-                name: "deep_reference".to_string(),
-                description: Some("Deep cognitive reasoning across memories. Combines FSRS-6 trust scoring, spreading activation, temporal supersession, dream insights, and contradiction analysis to build a complete understanding of a topic. Returns trust-scored evidence, fact evolution timeline, and a recommended answer. Use this when accuracy matters.".to_string()),
-                input_schema: tools::cross_reference::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "cross_reference".to_string(),
-                description: Some("Alias for deep_reference. Connect the dots across memories with cognitive reasoning.".to_string()),
-                input_schema: tools::cross_reference::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "contradictions".to_string(),
-                description: Some("Inspect memory disagreements directly. Scans a topic or recent memories for trust-weighted contradiction pairs using the same local logic as deep_reference.".to_string()),
-                input_schema: tools::contradictions::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // ACTIVE FORGETTING (v2.0.5) — top-down suppression
             // Anderson et al. 2025 Nat Rev Neurosci + Davis Rac1
@@ -409,7 +398,8 @@ impl McpServer {
         // empirical measurement shows truncation under realistic use.
         for tool in tools.iter_mut() {
             let max_chars: Option<u64> = match tool.name.as_str() {
-                "search" => Some(300_000),
+                // v2.2: search folded into recall (mode='lookup'); annotation moved.
+                "recall" => Some(300_000),
                 "memory_status" => Some(200_000),
                 "memory" => Some(100_000),
                 "codebase" => Some(100_000),
@@ -470,7 +460,20 @@ impl McpServer {
             // ================================================================
             // UNIFIED TOOLS (v1.1+) - Preferred API
             // ================================================================
+            // RECALL — unified retrieval tool (v2.2). HOT PATH.
+            // mode = lookup (default, zero-overhead) | reason | contradictions
+            "recall" => {
+                tools::recall::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            // DEPRECATED (v2.2): folded into `recall` (mode='lookup'). Hidden alias.
             "search" => {
+                warn!("Tool 'search' is deprecated in v2.2. Use 'recall' (mode='lookup', the default).");
                 tools::search_unified::execute(
                     &self.storage,
                     &self.cognitive,
@@ -617,11 +620,12 @@ impl McpServer {
             "mark_reviewed" => tools::review::execute(&self.storage, request.arguments).await,
 
             // ================================================================
-            // DEPRECATED: Search tools - redirect to unified 'search'
+            // DEPRECATED: legacy search aliases — redirect to `recall` lookup.
+            // ('recall' itself is now the unified retrieval tool, handled above.)
             // ================================================================
-            "recall" | "semantic_search" | "hybrid_search" => {
+            "semantic_search" | "hybrid_search" => {
                 warn!(
-                    "Tool '{}' is deprecated. Use 'search' instead.",
+                    "Tool '{}' is deprecated. Use 'recall' (mode='lookup') instead.",
                     request.name
                 );
                 tools::search_unified::execute(
@@ -1075,11 +1079,14 @@ impl McpServer {
                 warn!("Tool 'composed_graph' is deprecated in v2.2. Use 'graph' (action='recent'|'get'|'memory'|'neighbors'|'never_composed'|'bounty_mode'|'label').");
                 tools::composed_graph::execute(&self.storage, request.arguments).await
             }
+            // DEPRECATED (v2.2): folded into `recall`. Hidden aliases.
             "deep_reference" | "cross_reference" => {
+                warn!("Tool '{}' is deprecated in v2.2. Use 'recall' (mode='reason').", request.name);
                 tools::cross_reference::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
             }
             "contradictions" => {
+                warn!("Tool 'contradictions' is deprecated in v2.2. Use 'recall' (mode='contradictions').");
                 tools::contradictions::execute(&self.storage, request.arguments).await
             }
 
@@ -1323,6 +1330,18 @@ impl McpServer {
                 .and_then(|a| a.get("action"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("maintain")
+        } else if tool_name == "recall" {
+            // The unified `recall` tool fires SearchPerformed only for the lookup
+            // path (the former `search`). reason/contradictions do not emit, so
+            // map them to a non-emitting name.
+            match args
+                .as_ref()
+                .and_then(|a| a.get("mode"))
+                .and_then(|v| v.as_str())
+            {
+                Some("reason") | Some("contradictions") => "recall_noemit",
+                _ => "search", // lookup (default) → SearchPerformed
+            }
         } else {
             tool_name
         };
@@ -1857,14 +1876,16 @@ mod tests {
         // dispatchable as hidden back-compat aliases but drop off the advertised list.
         assert_eq!(
             tools.len(),
-            15,
-            "Expected exactly 15 tools after dedup + memory_status + graph + maintain consolidation"
+            12,
+            "Expected exactly 12 tools after v2.2 Layer-1 consolidation \
+             (dedup + memory_status + graph + maintain + recall; session_context renamed)"
         );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
         // Unified tools
-        assert!(tool_names.contains(&"search"));
+        // (search folded into `recall` mode='lookup' in v2.2)
+        assert!(tool_names.contains(&"recall"));
         assert!(tool_names.contains(&"memory"));
         assert!(tool_names.contains(&"codebase"));
         assert!(tool_names.contains(&"intention"));
@@ -1981,10 +2002,20 @@ mod tests {
             );
         }
 
-        // Deep reference + cross_reference alias (v2.0.4)
-        assert!(tool_names.contains(&"deep_reference"));
-        assert!(tool_names.contains(&"cross_reference"));
-        assert!(tool_names.contains(&"contradictions"));
+        // Retrieval — unified `recall` tool (v2.2). search + deep_reference +
+        // cross_reference + contradictions folded in; old names dispatch as
+        // hidden aliases but are off the advertised list.
+        for old in [
+            "search",
+            "deep_reference",
+            "cross_reference",
+            "contradictions",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'recall' in v2.2"
+            );
+        }
 
         // Active forgetting (v2.0.5) — Anderson 2025 + Davis Rac1
         assert!(tool_names.contains(&"suppress"));
@@ -2166,6 +2197,71 @@ mod tests {
                 })
                 .unwrap_or(false);
         assert!(validated, "maintain action=restore must validate a missing path");
+    }
+
+    /// v2.2 HOT PATH: `recall` defaults to mode='lookup' (search), the folded
+    /// names still dispatch, and the reason/contradictions modes resolve.
+    #[tokio::test]
+    async fn test_recall_modes_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch.
+            ("search", serde_json::json!({"query": "x"})),
+            ("deep_reference", serde_json::json!({"query": "x"})),
+            ("cross_reference", serde_json::json!({"query": "x"})),
+            ("contradictions", serde_json::json!({})),
+            ("semantic_search", serde_json::json!({"query": "x"})),
+            // New unified modes.
+            ("recall", serde_json::json!({"query": "x"})), // default mode = lookup
+            ("recall", serde_json::json!({"mode": "lookup", "query": "x"})),
+            ("recall", serde_json::json!({"mode": "reason", "query": "x"})),
+            ("recall", serde_json::json!({"mode": "contradictions"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            assert!(
+                response.error.is_none(),
+                "'{name}' {args} should resolve, got error: {:?}",
+                response.error
+            );
+        }
+    }
+
+    /// v2.2: `recall` mode='lookup' (the default) must produce the same result
+    /// shape as the former standalone `search` — i.e. the no-mode default is a
+    /// faithful pass-through, not a reasoning call.
+    #[tokio::test]
+    async fn test_recall_lookup_matches_search_shape() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let args = serde_json::json!({ "query": "anything" });
+        let via_recall = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "recall", "arguments": args })),
+        );
+        let via_search = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "search", "arguments": args })),
+        );
+        let r1 = server.handle_request(via_recall).await.unwrap();
+        let r2 = server.handle_request(via_search).await.unwrap();
+        assert!(r1.error.is_none() && r2.error.is_none());
+        // The unified-tool wrapper text (the search payload) must match.
+        assert_eq!(
+            r1.result.unwrap()["content"][0]["text"],
+            r2.result.unwrap()["content"][0]["text"],
+            "recall(mode=lookup) must equal search byte-for-byte"
+        );
     }
 
     #[tokio::test]
@@ -2382,7 +2478,8 @@ mod tests {
     /// (cargo-cult prevention).
     fn expected_max_result_size(name: &str) -> Option<u64> {
         match name {
-            "search" => Some(300_000),
+            // v2.2: search folded into recall (mode='lookup'); annotation moved.
+            "recall" => Some(300_000),
             // v2.2: memory_timeline folded into memory_status (view='timeline');
             // the high-payload annotation moved with it.
             "memory_status" => Some(200_000),
@@ -2407,7 +2504,7 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        for name in ["search", "memory_status", "memory", "codebase", "dedup", "graph"] {
+        for name in ["recall", "memory_status", "memory", "codebase", "dedup", "graph"] {
             let tool = tools
                 .iter()
                 .find(|t| t["name"].as_str() == Some(name))
@@ -2495,19 +2592,20 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        let search_tool = tools
+        // v2.2: `recall` is the annotated retrieval tool (search folded in).
+        let recall_tool = tools
             .iter()
-            .find(|t| t["name"].as_str() == Some("search"))
-            .expect("'search' tool present");
+            .find(|t| t["name"].as_str() == Some("recall"))
+            .expect("'recall' tool present");
 
         // Wire-form: `_meta` must exist; `meta` (un-renamed) must NOT exist.
         assert!(
-            search_tool.get("_meta").is_some(),
-            "search tool missing `_meta` key (serde rename to _meta did not apply)"
+            recall_tool.get("_meta").is_some(),
+            "recall tool missing `_meta` key (serde rename to _meta did not apply)"
         );
         assert!(
-            search_tool.get("meta").is_none(),
-            "search tool has un-renamed `meta` key (regression — serde rename broke)"
+            recall_tool.get("meta").is_none(),
+            "recall tool has un-renamed `meta` key (regression — serde rename broke)"
         );
     }
 }
