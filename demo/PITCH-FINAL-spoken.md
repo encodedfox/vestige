@@ -1,11 +1,12 @@
-# Postdict — FINAL spoken pitch (Sam's delivery cut)
+# Vestige — FINAL spoken pitch (Sam's delivery cut)
 
 Sam's own tightened version. Solo founder, first person, on stage to 50-100
-people. No terminal, no slides — voice only. Two corrections from the draft:
-"our memory" → "my memory" (solo-founder rule), and the name is **Postdict**
-(not Vestige). The "2024 Nature paper" reference is verified true (Zaki/Cai et
-al., Nature, 2024) — keep it; don't name the finding on stage, "a 2024 Nature
-paper on how the brain finds causes" is the safe phrasing.
+people. No terminal, no slides — voice only. NAME = **Vestige** (Sam's call,
+Jun 27 2026 — it sounds natural, it's the live/loved product, and "vestige = a
+trace of what remains from the past" is backward-looking = on-thesis). One fix
+from Sam's draft: "our memory" → "my memory" (solo-founder rule). The "2024
+Nature paper" reference is verified true (Zaki/Cai et al., Nature, 2024) — keep
+it; don't name the finding on stage.
 
 ---
 
@@ -49,7 +50,7 @@ paper on how the brain finds causes" is the safe phrasing.
 > *realizes.* Every AI agent that touches production needs it. That's the whole
 > market.
 >
-> I'm Sam. I created Postdict from my tiny Chicago apartment — the first memory
+> I'm Sam. I created Vestige from my tiny Chicago apartment — the first memory
 > that finds the cause, not the lookalike.
 >
 > Come find me. I'll prove it on a laptop in thirty seconds.
