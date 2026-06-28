@@ -346,56 +346,16 @@ impl McpServer {
                 input_schema: tools::importance::schema(),
                 ..Default::default()
             },
-            ToolDescription {
-                name: "find_duplicates".to_string(),
-                description: Some("Find duplicate and near-duplicate memory clusters using cosine similarity on embeddings. Returns clusters with suggested actions (merge/review). Use to clean up redundant memories.".to_string()),
-                input_schema: tools::dedup::schema(),
-                ..Default::default()
-            },
             // ================================================================
-            // MERGE / SUPERSEDE CONTROLS (v2.1.25 — Phase 3)
-            // Diff-previewed, confidence-gated, reversible, never silent.
+            // DEDUP / MERGE / SUPERSEDE — unified `dedup` tool (v2.2)
+            // Folds find_duplicates + the 7 Phase-3 merge tools into one
+            // action-dispatched surface. Diff-previewed, confidence-gated,
+            // reversible, never silent; bitemporal-never-delete preserved.
             // ================================================================
             ToolDescription {
-                name: "merge_candidates".to_string(),
-                description: Some("Surface likely duplicate/overlapping memory clusters with confidence scores and the signals behind each (Fellegi-Sunter match/possible/non-match). Read-only — nothing is changed.".to_string()),
-                input_schema: tools::merge::merge_candidates_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "plan_merge".to_string(),
-                description: Some("Produce a previewable MERGE plan (a diff: combined content/tags/provenance) for 2+ memories WITHOUT applying it. Returns a plan_id for apply_plan. Protected members block the merge.".to_string()),
-                input_schema: tools::merge::plan_merge_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "plan_supersede".to_string(),
-                description: Some("Preview superseding memory A with B — bitemporal invalidation (stamps valid_until, keeps A queryable for audit) WITHOUT applying. Returns a plan_id for apply_plan.".to_string()),
-                input_schema: tools::merge::plan_supersede_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "apply_plan".to_string(),
-                description: Some("Execute a previously-generated merge/supersede plan by id. Recorded as a reversible operation. Old memories are invalidated (never deleted). 'possible'/'non_match' plans require confirm=true.".to_string()),
-                input_schema: tools::merge::apply_plan_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "merge_undo".to_string(),
-                description: Some("Reverse a prior merge/supersede operation (the 'git reflog for your agent's memory'). With no operation_id, lists the reversible operation log so you can pick one.".to_string()),
-                input_schema: tools::merge::merge_undo_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "protect".to_string(),
-                description: Some("Pin a memory so it can never be auto-merged, superseded, or garbage-collected. Pass protected=false to unpin.".to_string()),
-                input_schema: tools::merge::protect_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "merge_policy".to_string(),
-                description: Some("Get or set the per-project merge policy: the two Fellegi-Sunter thresholds (match_threshold, possible_threshold) and auto_apply. No args returns the current policy.".to_string()),
-                input_schema: tools::merge::merge_policy_schema(),
+                name: "dedup".to_string(),
+                description: Some("Deduplication & merge/supersede. Actions: 'scan' (default — surface duplicate clusters via cosine + merge candidates via Fellegi-Sunter, read-only), 'plan_merge' (preview a reversible merge plan for 2+ member_ids → plan_id), 'plan_supersede' (preview superseding old_id with new_id → plan_id), 'apply' (execute a plan_id; 'possible'/'non_match' need confirm=true), 'undo' (reverse an operation_id, or omit to list the reflog), 'protect' (pin a memory against auto-merge/supersede/forget), 'policy' (get/set Fellegi-Sunter thresholds). Old memories are invalidated, never deleted.".to_string()),
+                input_schema: tools::dedup::unified_schema(),
                 ..Default::default()
             },
             // ================================================================
@@ -516,6 +476,9 @@ impl McpServer {
                 "memory_timeline" => Some(200_000),
                 "memory" => Some(100_000),
                 "codebase" => Some(100_000),
+                // v2.2: dedup action='scan' returns duplicate clusters +
+                // merge candidates + policy in one payload.
+                "dedup" => Some(150_000),
                 _ => None,
             };
             if let Some(n) = max_chars {
@@ -1003,13 +966,31 @@ impl McpServer {
             "importance_score" => {
                 tools::importance::execute(&self.storage, &self.cognitive, request.arguments).await
             }
-            "find_duplicates" => tools::dedup::execute(&self.storage, request.arguments).await,
+            // ================================================================
+            // DEDUP / MERGE / SUPERSEDE — unified `dedup` tool (v2.2)
+            // ================================================================
+            "dedup" => tools::dedup::execute_unified(&self.storage, request.arguments).await,
 
-            // ================================================================
-            // MERGE / SUPERSEDE CONTROLS (v2.1.25 — Phase 3)
-            // ================================================================
+            // DEPRECATED (v2.2): folded into `dedup`. Kept as hidden back-compat
+            // aliases (≥1 minor release) — they call the same underlying handlers
+            // verbatim, so envelopes/plan_id/confirm-gating/bitemporal are intact.
+            "find_duplicates" => {
+                warn!("Tool 'find_duplicates' is deprecated in v2.2. Use 'dedup' with action='scan'.");
+                tools::dedup::execute(&self.storage, request.arguments).await
+            }
             "merge_candidates" | "plan_merge" | "plan_supersede" | "apply_plan" | "merge_undo"
             | "protect" | "merge_policy" => {
+                warn!(
+                    "Tool '{}' is deprecated in v2.2. Use 'dedup' (action={}).",
+                    request.name,
+                    match request.name.as_str() {
+                        "merge_candidates" => "scan",
+                        "apply_plan" => "apply",
+                        "merge_undo" => "undo",
+                        "merge_policy" => "policy",
+                        other => other,
+                    }
+                );
                 tools::merge::execute(&self.storage, request.name.as_str(), request.arguments).await
             }
 
@@ -1820,10 +1801,10 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // 34 tools: 25 from v2.1.21 + 7 Phase 3 merge/supersede tools
-        // (merge_candidates, plan_merge, plan_supersede, apply_plan, merge_undo,
-        // protect, merge_policy, composed_graph) + 1 connector tool (source_sync, #57).
-        assert_eq!(tools.len(), 34, "Expected exactly 34 tools");
+        // v2.2 Tool Consolidation (Layer 1): 34 → 27 after `dedup` folds
+        // find_duplicates + the 7 Phase-3 merge tools (8 → 1). Old names remain
+        // dispatchable as hidden back-compat aliases but drop off the advertised list.
+        assert_eq!(tools.len(), 27, "Expected exactly 27 tools after dedup consolidation");
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
@@ -1876,18 +1857,28 @@ mod tests {
         assert!(tool_names.contains(&"export"));
         assert!(tool_names.contains(&"gc"));
 
-        // Auto-save & dedup tools (v1.3)
+        // Auto-save tool (v1.3)
         assert!(tool_names.contains(&"importance_score"));
-        assert!(tool_names.contains(&"find_duplicates"));
 
-        // Merge / Supersede controls (v2.1.25 — Phase 3)
-        assert!(tool_names.contains(&"merge_candidates"));
-        assert!(tool_names.contains(&"plan_merge"));
-        assert!(tool_names.contains(&"plan_supersede"));
-        assert!(tool_names.contains(&"apply_plan"));
-        assert!(tool_names.contains(&"merge_undo"));
-        assert!(tool_names.contains(&"protect"));
-        assert!(tool_names.contains(&"merge_policy"));
+        // Dedup / merge / supersede — unified `dedup` tool (v2.2).
+        // find_duplicates + the 7 Phase-3 merge tools folded in; still
+        // dispatchable as hidden back-compat aliases, but off the advertised list.
+        assert!(tool_names.contains(&"dedup"));
+        for old in [
+            "find_duplicates",
+            "merge_candidates",
+            "plan_merge",
+            "plan_supersede",
+            "apply_plan",
+            "merge_undo",
+            "protect",
+            "merge_policy",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'dedup' in v2.2"
+            );
+        }
 
         // Cognitive tools (v1.5)
         assert!(tool_names.contains(&"dream"));
@@ -1910,6 +1901,44 @@ mod tests {
 
         // Active forgetting (v2.0.5) — Anderson 2025 + Davis Rac1
         assert!(tool_names.contains(&"suppress"));
+    }
+
+    /// v2.2: the 8 tools folded into `dedup` must still dispatch (hidden
+    /// back-compat aliases), i.e. they must NOT return the "Unknown tool"
+    /// InvalidParams (-32602) error. Read-only/list-style actions are used so
+    /// the call resolves without mutating or requiring extra setup.
+    #[tokio::test]
+    async fn test_deprecated_dedup_aliases_redirect() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        // (tool name, args) — all read-only / list-style so they resolve cleanly.
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            ("find_duplicates", serde_json::json!({})),
+            ("merge_candidates", serde_json::json!({})),
+            ("merge_undo", serde_json::json!({})), // no operation_id => lists the reflog
+            ("merge_policy", serde_json::json!({})), // no args => returns current policy
+            ("dedup", serde_json::json!({"action": "policy"})),
+            ("dedup", serde_json::json!({})), // default action = scan
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            // The call may succeed (result) or fail for a domain reason, but it
+            // must NOT be the unknown-tool InvalidParams error.
+            if let Some(err) = response.error {
+                assert_ne!(
+                    err.code, -32602,
+                    "'{name}' should still dispatch (hidden alias), got unknown-tool error: {}",
+                    err.message
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2130,6 +2159,8 @@ mod tests {
             "memory_timeline" => Some(200_000),
             "memory" => Some(100_000),
             "codebase" => Some(100_000),
+            // v2.2: dedup action='scan' returns clusters + candidates + policy.
+            "dedup" => Some(150_000),
             _ => None,
         }
     }
@@ -2145,7 +2176,7 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        for name in ["search", "memory_timeline", "memory", "codebase"] {
+        for name in ["search", "memory_timeline", "memory", "codebase", "dedup"] {
             let tool = tools
                 .iter()
                 .find(|t| t["name"].as_str() == Some(name))
