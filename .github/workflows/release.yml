@@ -39,11 +39,11 @@ jobs:
           # consumers must `brew install onnxruntime` before running — see
           # INSTALL-INTEL-MAC.md bundled in the tarball.
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-14
             archive: tar.gz
             cargo_flags: "--no-default-features --features ort-dynamic,vector-search"
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
             archive: tar.gz
             cargo_flags: ""
 

@@ -17,7 +17,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # Pin macOS to macos-14 (Sonoma): the rolling `macos-latest` image
+        # intermittently ships a broken compiler-rt path ("ld: library
+        # 'clang_rt.osx' not found"), which fails the Rust link step on an
+        # otherwise-green commit. macos-14 has a stable Xcode/clang toolchain.
+        os: [macos-14, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -61,13 +65,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
             cargo_flags: ""
           # Intel Mac builds against a system ONNX Runtime via ort-dynamic
           # (ort-sys has no x86_64-apple-darwin prebuilts). Compile-only here;
           # runtime linking is a user concern documented in INSTALL-INTEL-MAC.md.
-          - os: macos-latest
+          - os: macos-14
             target: x86_64-apple-darwin
             cargo_flags: "--no-default-features --features ort-dynamic,vector-search"
           - os: ubuntu-latest
