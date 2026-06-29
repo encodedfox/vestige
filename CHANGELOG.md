@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-06-29 — "Retroactive Salience + Tool Consolidation"
+
+Three independent value streams land together as a coherent release.
+
+### Added — Retroactive Salience Backfill ("Memory with hindsight")
+
+A faithful port of Cai 2024 (*Nature*). When a **failure** (bug/crash/regression)
+is recorded, Vestige reaches **backward in time** and promotes the quiet earlier
+memory that *caused* it — the root cause a vector search structurally cannot
+surface, because it is not *similar* to the failure, only *causally upstream*
+(it shares an entity: the same file, env var, or service). Backward-only by
+construction. Auto-fires inside the consolidation pass; also exposed as the
+`backfill` MCP tool and the `vestige backfill` CLI command (`--manual`,
+`--contrast`, `--no-promote` dry-run).
+
+### Changed — MCP Tool Consolidation (34 → 13 advertised tools)
+
+The MCP surface is consolidated from 34 tools to **13**: `recall` (folds
+search + deep_reference + contradictions), `maintain` (consolidate/dream/gc/
+importance_score/backup/export/restore), `dedup` (8 merge tools → 1), `graph`
+(explore/predict/memory_graph/composed_graph), `memory_status` (system_status/
+memory_health/timeline/changelog), plus `memory`, `codebase`, `intention`,
+`smart_ingest`, `source_sync`, `session_start`, `suppress`, and the flagship
+`backfill`. Old tool names remain dispatchable as hidden back-compat aliases.
+
+### Improved — `deep_reference` retrieval engine
+
+- **F32 embeddings** (was I8 quantization) — lifts the 0.4–0.6 paraphrase cosine
+  band so close-but-reworded queries actually retrieve.
+- **Reciprocal Rank Fusion** replaces linear score combination in hybrid search.
+- **Claim-vs-memory contradiction** — `recall`/`cross_reference` now test *your
+  claim* against stored memory, surfacing `claim_contradicts_memory` instead of
+  the old "confident silence."
+- **Never-composed semantic-band gate** — admits no-shared-word memory pairs in
+  the 0.45–0.85 cosine band for `vestige compose`.
+- New `vestige recall <query>` and `vestige compose` CLI commands expose the
+  engine outside the MCP path.
+
+### Fixed — security & correctness (multi-model audit swarm)
+
+SSRF/token-exfil hardening, panic/DoS/overflow fixes, deadlock and
+lock-contention fixes, dedup and decay correctness. `usearch` keeps
+`features = ["fp16lib"]` to avoid the Windows MSVC C1021 build break (#71/#94).
+
 ## [2.1.27] - 2026-06-19 — "External-Source Connectors"
 
 Roadmap [#57](https://github.com/samvallad33/vestige/issues/57), **Phases 1–4
