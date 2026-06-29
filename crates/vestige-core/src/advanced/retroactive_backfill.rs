@@ -56,6 +56,12 @@ pub const FAILURE_MARKERS: &[&str] = &[
     // performance/degradation failures (an agent should backfill from these too)
     "spiked", "latency", "degraded", "slow", "hang", "hung", "throttled",
     "oom", "502", "503", "504", "rejected", "denied", "flaky",
+    // real-incident vocabulary (CauseBench found these missing — postmortems often
+    // describe failures without the classic crash words above)
+    "pinned", "saturated", "saturation", "stalled", "exhausted", "exhaustion",
+    "overload", "overloaded", "backlog", "fell behind", "lag", "lagging",
+    "unavailable", "down", "dropped", "reset", "refused", "stampede",
+    "thrashing", "starved", "starvation", "expired", "expiry", "overflow",
 ];
 
 /// How strongly to promote the backfilled cause: multiply its stability by this
@@ -91,10 +97,83 @@ pub struct FailureEvent {
     pub id: String,
     pub content: String,
     pub entities: Vec<String>,
+    /// The failure's tags — failure markers can live in a tag, so salience
+    /// detection must see them too.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Prediction error / surprise of this event (0..1).
     pub prediction_error: f32,
     /// True if a caller explicitly marked this salient (manual override path).
     pub manual: bool,
+}
+
+/// Pull shared-entity join keys from content + tags (single source of truth used
+/// by the MCP tool, CLI, and offline pass so they never diverge).
+pub fn extract_entities(content: &str, tags: &[String]) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut set: HashSet<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+    for raw in content.split(|c: char| {
+        !(c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-')
+    }) {
+        let tok = raw.trim_matches(|c: char| c == '.' || c == '/' || c == '-');
+        if tok.len() < 3 {
+            continue;
+        }
+        let is_env = tok.len() >= 3
+            && tok.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+            && tok.chars().any(|c| c.is_ascii_uppercase());
+        let is_path = (tok.contains('/') || tok.contains('.'))
+            && tok.chars().any(|c| c.is_ascii_alphabetic());
+        if is_env || is_path {
+            set.insert(tok.to_lowercase());
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Whole-word marker match: `marker` must appear bounded by non-alphanumeric
+/// chars, not embedded in a larger identifier. This is the difference between
+/// matching "timeout" in "a request timeout" (a real failure) and NOT matching it
+/// inside the config var `API_TIMEOUT` (a perfectly ordinary env var). Plain
+/// substring over-fires: "timeout" hits "API_TIMEOUT", "leak" hits "leaky", "500"
+/// hits "$500" — which wrongly flags a quiet CAUSE as a failure and excludes it
+/// from the backward reach.
+fn contains_marker_word(hay: &str, marker: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let mut from = 0usize;
+    while let Some(pos) = hay[from..].find(marker) {
+        let start = from + pos;
+        let end = start + marker.len();
+        let before_ok = start == 0
+            || !{
+                let c = bytes[start - 1] as char;
+                c.is_alphanumeric() || c == '_'
+            };
+        let after_ok = end >= bytes.len()
+            || !{
+                let c = bytes[end] as char;
+                c.is_alphanumeric() || c == '_'
+            };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Does this content/tags pair read like a failure? Whole-word marker match over
+/// content + tags (see [`contains_marker_word`] for why whole-word, not substring).
+/// Shared by every caller so failure detection never drifts.
+pub fn looks_like_failure(content: &str, tags: &[String]) -> bool {
+    let hay = content.to_lowercase();
+    if FAILURE_MARKERS.iter().any(|m| contains_marker_word(&hay, m)) {
+        return true;
+    }
+    tags.iter().any(|t| {
+        let tl = t.to_lowercase();
+        FAILURE_MARKERS.iter().any(|m| contains_marker_word(&tl, m))
+    })
 }
 
 impl FailureEvent {
@@ -108,8 +187,7 @@ impl FailureEvent {
         if self.prediction_error < salience_threshold {
             return false;
         }
-        let hay = self.content.to_lowercase();
-        FAILURE_MARKERS.iter().any(|m| hay.contains(m))
+        looks_like_failure(&self.content, &self.tags)
     }
 }
 
@@ -288,6 +366,7 @@ mod tests {
             id: "fail-wed".into(),
             content: "Service crashed: 500 Internal Server Error on the auth endpoint".into(),
             entities: vec!["auth-service".into(), "API_TIMEOUT".into()],
+            tags: vec![],
             prediction_error: 0.9,
             manual: false,
         }
@@ -358,6 +437,7 @@ mod tests {
             id: "calm".into(),
             content: "Refactored the logging format for readability".into(),
             entities: vec!["logger".into()],
+            tags: vec![],
             prediction_error: 0.2, // low surprise
             manual: false,
         };
@@ -372,6 +452,7 @@ mod tests {
             id: "manual".into(),
             content: "Latency crept up on the checkout path".into(),
             entities: vec!["checkout".into()],
+            tags: vec![],
             prediction_error: 0.1,
             manual: true,
         };

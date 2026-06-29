@@ -262,6 +262,10 @@ enum Commands {
         /// failure (the lookalike, NOT the cause), then what Postdict surfaces.
         #[arg(long)]
         contrast: bool,
+        /// Machine-readable: print the raw backfill result as JSON (for tooling /
+        /// benchmarks). Suppresses the human-formatted output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Start standalone HTTP MCP server (no stdio, for remote access)
@@ -347,7 +351,8 @@ fn main() -> anyhow::Result<()> {
             lookback_days,
             no_promote,
             contrast,
-        } => run_backfill(failure_id, manual, lookback_days, !no_promote, contrast),
+            json,
+        } => run_backfill(failure_id, manual, lookback_days, !no_promote, contrast, json),
         Commands::Serve {
             port,
             dashboard,
@@ -2602,6 +2607,7 @@ fn run_backfill(
     lookback_days: i64,
     promote: bool,
     contrast: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     let storage = std::sync::Arc::new(open_storage()?);
     #[cfg(feature = "embeddings")]
@@ -2708,6 +2714,14 @@ fn run_backfill(
     let result = rt
         .block_on(vestige_mcp::tools::backfill::execute(&storage, Some(args)))
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Machine-readable path: dump the raw tool result (includes per-cause
+    // memory_id, shared_entities, similarity_rank) and stop. Used by tooling and
+    // the CauseBench harness so it can score against real engine output.
+    if json {
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
 
     println!("{}", "=== Retroactive Salience Backfill ===".magenta().bold());
     println!();

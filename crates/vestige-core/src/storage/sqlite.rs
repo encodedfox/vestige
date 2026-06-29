@@ -3646,6 +3646,129 @@ impl SqliteMemoryStore {
             }
         }
 
+        // 8.5. Retroactive Salience Backfill — memory with hindsight (auto-fire).
+        //
+        // The dream pass (step 8) replays memories forward to synthesize insights.
+        // This is its backward twin: when a recent memory is a salient FAILURE,
+        // reach BACKWARD across history and PROMOTE the quiet earlier memory that
+        // caused it — the root cause a semantic search structurally cannot surface
+        // because it is causally upstream, not *similar*. Faithful port of the
+        // offline ensemble co-reactivation in Zaki/Cai et al. 2024 Nature; the
+        // consolidation pass IS the offline window. Bounded on every axis so a
+        // noisy day cannot trigger a promotion storm, and idempotent across cycles
+        // via a durable causal edge (so the same cause is promoted once per
+        // failure, not every cycle — promote_memory's stability boost is capped
+        // but would still inflate without this guard).
+        let mut backfilled_causes = 0i64;
+        {
+            use crate::advanced::retroactive_backfill::{
+                self as rb, BackfillCandidate, FailureEvent, RetroactiveBackfill,
+            };
+            const MAX_FAILURES_PER_CYCLE: usize = 5;
+            const CANDIDATE_SCAN: i32 = 500;
+
+            let recent = self.get_all_nodes(CANDIDATE_SCAN, 0).unwrap_or_default();
+            let failures: Vec<&KnowledgeNode> = recent
+                .iter()
+                .filter(|n| rb::looks_like_failure(&n.content, &n.tags))
+                .take(MAX_FAILURES_PER_CYCLE)
+                .collect();
+
+            if !failures.is_empty() {
+                let backfill = RetroactiveBackfill::new();
+                let mut already_promoted: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+
+                for failure_node in failures {
+                    let failure = FailureEvent {
+                        id: failure_node.id.clone(),
+                        content: failure_node.content.clone(),
+                        entities: rb::extract_entities(&failure_node.content, &failure_node.tags),
+                        tags: failure_node.tags.clone(),
+                        prediction_error: 0.9,
+                        manual: false,
+                    };
+                    // candidates = every OTHER memory strictly older than the
+                    // failure, EXCLUDING other failures (a root cause is the quiet
+                    // upstream change, not an earlier crash).
+                    let candidates: Vec<BackfillCandidate> = recent
+                        .iter()
+                        .filter(|c| c.id != failure_node.id)
+                        .filter(|c| !rb::looks_like_failure(&c.content, &c.tags))
+                        .filter_map(|c| {
+                            let age = (failure_node.created_at - c.created_at).num_seconds()
+                                as f64
+                                / 86_400.0;
+                            if age <= 0.0 {
+                                return None;
+                            }
+                            Some(BackfillCandidate {
+                                id: c.id.clone(),
+                                content: c.content.clone(),
+                                entities: rb::extract_entities(&c.content, &c.tags),
+                                age_days_before_failure: age,
+                                stability: c.stability,
+                                similarity_to_failure: None,
+                            })
+                        })
+                        .collect();
+
+                    let result = backfill.run(&failure, &candidates);
+                    if !result.triggered {
+                        continue;
+                    }
+                    for cause in &result.causes {
+                        if !already_promoted
+                            .insert((cause.memory_id.clone(), failure_node.id.clone()))
+                        {
+                            continue;
+                        }
+                        // Cross-cycle idempotency: a durable causal edge is both the
+                        // dedup key and a first-class artifact. Write it FIRST, only
+                        // promote if it persisted (a failed edge write => retry next
+                        // cycle cleanly, never double-inflate).
+                        let link_type = crate::memory::EdgeType::Causal.to_string();
+                        let already_linked = self
+                            .get_connections_for_memory(&cause.memory_id)
+                            .map(|conns| {
+                                conns.iter().any(|c| {
+                                    c.source_id == cause.memory_id
+                                        && c.target_id == failure_node.id
+                                        && c.link_type == link_type
+                                })
+                            })
+                            .unwrap_or(false);
+                        if already_linked {
+                            continue;
+                        }
+                        let conn = ConnectionRecord {
+                            source_id: cause.memory_id.clone(),
+                            target_id: failure_node.id.clone(),
+                            strength: 1.0,
+                            link_type,
+                            created_at: Utc::now(),
+                            last_activated: Utc::now(),
+                            activation_count: 0,
+                        };
+                        if self.save_connection(&conn).is_err() {
+                            continue;
+                        }
+                        if self.promote_memory(&cause.memory_id).is_ok() {
+                            backfilled_causes += 1;
+                        }
+                    }
+                }
+                if backfilled_causes > 0 {
+                    tracing::info!(
+                        backfilled_causes,
+                        "Retroactive Salience Backfill: promoted {} root-cause memor{} a semantic search would miss",
+                        backfilled_causes,
+                        if backfilled_causes == 1 { "y" } else { "ies" }
+                    );
+                }
+            }
+        }
+
         // 9. Memory Compression (old memories → summaries)
         let mut _memories_compressed = 0i64;
         {
@@ -3819,6 +3942,7 @@ impl SqliteMemoryStore {
             neighbors_reinforced: 0,
             activations_computed,
             w20_optimized,
+            backfilled_causes,
         })
     }
 
