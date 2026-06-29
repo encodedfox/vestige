@@ -139,7 +139,7 @@ candle-core = { version = "0.10.2", optional = true }
 # Disable default features so release binaries do not include SimSIMD's
 # Haswell+/AVX2/FMA dispatch targets. Those kernels can trigger illegal
 # instructions on older x86_64 CPUs that Vestige otherwise supports.
-usearch = { version = "=2.23.0", default-features = false, optional = true }
+usearch = { version = "=2.23.0", default-features = false, features = ["fp16lib"], optional = true }
 
 # LRU cache for query embeddings
 lru = "0.16"
