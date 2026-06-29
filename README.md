@@ -2,9 +2,9 @@
 
 <h1>Vestige</h1>
 
-### Your bug was born days before it crashed — you just can't remember where.
+### Your bug was born days before it crashed. You just can't remember where.
 
-<em>Vestige is a local-first memory for AI agents that reaches <b>backward through time</b> to find the quiet change that caused today's failure — the cause that looks nothing like the bug. One 23MB Rust binary. No cloud. Your data never leaves your machine.</em>
+<em>Vestige is a local-first memory for AI agents that reaches <b>backward through time</b> to find the quiet change that caused today's failure: the cause that looks nothing like the bug. One 23MB Rust binary. No cloud. Your data never leaves your machine.</em>
 
 [![GitHub stars](https://img.shields.io/github/stars/samvallad33/vestige?style=for-the-badge&logo=github&color=8b5cf6)](https://github.com/samvallad33/vestige/stargazers)
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige?style=for-the-badge&color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
@@ -19,57 +19,57 @@
 
 ## 👋 Why I built this
 
-Hi — I'm [Sam](https://github.com/samvallad33). I built Vestige from a tiny apartment in Chicago because I kept losing days to the same thing, and I bet you have too.
+Hi, I'm [Sam](https://github.com/samvallad33). I built Vestige from a tiny apartment in Chicago because I kept losing days to the same thing, and I bet you have too.
 
-Production breaks. You start hunting. And the cause is almost never *near* the error — it's some quiet change you made days ago that looks **nothing** like the crash it eventually caused. A flipped env var. A swapped service. A config tweak you'd already forgotten.
+Production breaks. You start hunting. And the cause is almost never *near* the error. It's some quiet change you made days ago that looks **nothing** like the crash it eventually caused. A flipped env var. A swapped service. A config tweak you'd already forgotten.
 
-Here's the part that took me a while to see: **every AI memory tool is built on vector search, and vector search hunts for what *looks like* your problem.** But a root cause never looks like the bug it creates. So they all search the goal line — while the real failure was a quiet midfield turnover fifteen minutes earlier.
+Here's the part that took me a while to see: **every AI memory tool is built on vector search, and vector search hunts for what *looks like* your problem.** But a root cause never looks like the bug it creates. So they all search the goal line, while the real failure was a quiet midfield turnover fifteen minutes earlier.
 
 I wanted a memory that traces the match *backward.*
 
-So that's what Vestige is. Everyone else built a memory that **remembers**. I tried to build the first one that **realizes** — it gates what's worth keeping, lets the noise fade like your own memory does, and when a failure hits, it reaches back through time to the change that actually caused it.
+So that's what Vestige is. Everyone else built a memory that **remembers**. I tried to build the first one that **realizes**: it gates what's worth keeping, lets the noise fade like your own memory does, and when a failure hits, it reaches back through time to the change that actually caused it.
 
 It's one Rust binary. It runs entirely on your machine. It never phones home. And there's a 60-second start right below.
 
-> 🎙️ **The 60-second version** of this whole story — the one I give in person — lives in [`demo/PITCH-v2-causebench.md`](demo/PITCH-v2-causebench.md). If you've got a minute, read that first. It's the clearest way to *get* why this matters.
+> 🎙️ **The 60-second version** of this whole story, the one I give in person, lives in [`demo/PITCH-v2-causebench.md`](demo/PITCH-v2-causebench.md). If you've got a minute, read that first. It's the clearest way to *get* why this matters.
 
 ---
 
 ## ⚡ Get it running in 60 seconds
 
 ```bash
-npm install -g vestige-mcp-server@latest      # one binary — no Docker, no API key, no signup
+npm install -g vestige-mcp-server@latest      # one binary, no Docker, no API key, no signup
 claude mcp add vestige vestige-mcp -s user    # connect it to Claude Code
 ```
 
-That's the whole install. Now talk to your agent like it has a memory — because now it does:
+That's the whole install. Now talk to your agent like it has a memory, because now it does:
 
 ```
 You:  "Remember: we always disable SimSIMD on release builds, it breaks old x86 CPUs."
         ...days later, fresh session, zero context...
 You:  "Should I enable SimSIMD for the release?"
-AI:   ⚠️ Hold on — this contradicts a decision you stored: you chose to DISABLE it
+AI:   ⚠️ Hold on, this contradicts a decision you stored: you chose to DISABLE it
         because it breaks old x86 CPUs.
 ```
 
-That last line isn't me being cute — it's a real status the engine returns, called `claim_contradicts_memory`. Most memory tools would have happily handed you the wrong answer. Vestige tells you when you're about to walk back into a mistake you already learned from.
+That last line isn't me being cute. It's a real status the engine returns, called `claim_contradicts_memory`. Most memory tools would have happily handed you the wrong answer. Vestige tells you when you're about to walk back into a mistake you already learned from.
 
-*(Works with Codex, Cursor, VS Code, Claude Desktop, Windsurf, JetBrains, Zed — anything that speaks MCP. [Full setup is here ↓](#-works-in-every-editor-you-use).)*
+*(Works with Codex, Cursor, VS Code, Claude Desktop, Windsurf, JetBrains, Zed: anything that speaks MCP. [Full setup is here ↓](#-works-in-every-editor-you-use).)*
 
 ---
 
 ## 🧠 It's not RAG with a nicer haircut
 
-RAG is a bucket: throw everything in, hope nearest-neighbor finds it later. Vestige behaves more like an actual memory — it decides what's worth keeping, forgets what isn't, and reasons across what's left.
+RAG is a bucket: throw everything in, hope nearest-neighbor finds it later. Vestige behaves more like an actual memory: it decides what's worth keeping, forgets what isn't, and reasons across what's left.
 
 |  | 🪣 RAG / Vector Store | 🧠 Vestige |
 |---|---|---|
-| **What it stores** | Everything you hand it | Only what's **surprising or new** — the rest gets merged or skipped |
-| **What it forgets** | Nothing — it just bloats | Unused memories **fade** on a real forgetting curve, so your context stays lean |
-| **Finding a root cause** | Can't — the cause isn't *similar* to the bug | **Reaches backward in time** to the change that caused it (the whole point ↓) |
-| **Catching contradictions** | Silent — serves the stale answer with a straight face | Tells you: *"this contradicts what you decided"* |
-| **Duplicates** | You clean them up by hand | Self-heals — *"likes dark mode"* + *"prefers dark themes"* quietly become one |
-| **Forgetting on demand** | DELETE and it's gone | **`suppress`** — gently inhibits a memory (and its neighbors), reversible for 24h |
+| **What it stores** | Everything you hand it | Only what's **surprising or new** (the rest gets merged or skipped) |
+| **What it forgets** | Nothing; it just bloats | Unused memories **fade** on a real forgetting curve, so your context stays lean |
+| **Finding a root cause** | Can't, because the cause isn't *similar* to the bug | **Reaches backward in time** to the change that caused it (the whole point ↓) |
+| **Catching contradictions** | Silent; serves the stale answer with a straight face | Tells you: *"this contradicts what you decided"* |
+| **Duplicates** | You clean them up by hand | Self-heals: *"likes dark mode"* + *"prefers dark themes"* quietly become one |
+| **Forgetting on demand** | DELETE and it's gone | **`suppress`** gently inhibits a memory (and its neighbors), reversible for 24h |
 | **Where it lives** | Usually someone else's cloud | **Your machine. One binary. No telemetry.** |
 
 ---
@@ -78,17 +78,17 @@ RAG is a bucket: throw everything in, hope nearest-neighbor finds it later. Vest
 
 This is the part I'm proudest of, and it's worth one honest paragraph.
 
-A bug shows up today. The cause was a quiet decision from three weeks ago — a changed env var, a swapped service. That cause **shares no words with the error it created.** A vector search will never connect them, because it only knows how to find things that *look alike* — and this is a case where the cause and the symptom look nothing alike. This isn't a tuning problem; in 2026 Google DeepMind published a proof ([arXiv:2508.21038](https://arxiv.org/abs/2508.21038), ICLR 2026) that single-vector retrieval is *mathematically* incapable of bridging gaps like this.
+A bug shows up today. The cause was a quiet decision from three weeks ago, like a changed env var or a swapped service. That cause **shares no words with the error it created.** A vector search will never connect them, because it only knows how to find things that *look alike*, and this is a case where the cause and the symptom look nothing alike. This isn't a tuning problem; in 2026 Google DeepMind published a proof ([arXiv:2508.21038](https://arxiv.org/abs/2508.21038), ICLR 2026) that single-vector retrieval is *mathematically* incapable of bridging gaps like this.
 
-So Vestige doesn't do it with similarity. Its **Retroactive Salience Backfill** — ported from **Zaki/Cai et al., 2024, *Nature* 637:145–155** ([DOI](https://doi.org/10.1038/s41586-024-08168-4)), on how the brain links a shock to the quiet memory that caused it — reaches *backward through time* and promotes the dormant memory that's **causally upstream**: it shares an *entity* (the same file, env var, or service), not the same words.
+So Vestige doesn't do it with similarity. Its **Retroactive Salience Backfill** (ported from **Zaki/Cai et al., 2024, *Nature* 637:145–155** ([DOI](https://doi.org/10.1038/s41586-024-08168-4)), on how the brain links a shock to the quiet memory that caused it) reaches *backward through time* and promotes the dormant memory that's **causally upstream**: it shares an *entity* (the same file, env var, or service), not the same words.
 
-I also built a benchmark to keep myself honest about it. Every pure vector retriever scored **0% recall@1** on the causal-gap task; Vestige scored **60%**. (To be precise: the impossibility is DeepMind's *theorem*; the 0%-vs-60% is *my measurement* — two different claims, and I keep them separate.)
+I also built a benchmark to keep myself honest about it. Every pure vector retriever scored **0% recall@1** on the causal-gap task; Vestige scored **60%**. (To be precise: the impossibility is DeepMind's *theorem*; the 0%-vs-60% is *my measurement*. Two different claims, and I keep them separate.)
 
 ```bash
 vestige backfill --contrast      # show the root cause a vector search would have missed
 ```
 
-The nice part: it compounds. Every failure your agent records makes the *next* session diagnose faster — run two is smarter than run one — and it happens automatically during consolidation, so you don't have to babysit it.
+The nice part: it compounds. Every failure your agent records makes the *next* session diagnose faster (run two is smarter than run one), and it happens automatically during consolidation, so you don't have to babysit it.
 
 All of this shipped in **v2.2.0**, along with a 34→13 tool consolidation and a rebuilt retrieval engine. [Full release notes →](https://github.com/samvallad33/vestige/releases/tag/v2.2.0)
 
@@ -101,32 +101,32 @@ I get skeptical when projects wave the word "neuroscience" around, so here's my 
 | Mechanism | What it does for you | Grounded in |
 |---|---|---|
 | **Prediction-Error Gating** | Redundant info gets merged, contradictory gets superseded, only the novel gets stored | The hippocampal novelty signal |
-| **FSRS-6 Spaced Repetition** | 21 parameters of the mathematics of forgetting — used memories stay, unused fade | Modern spaced-repetition research |
+| **FSRS-6 Spaced Repetition** | 21 parameters of the mathematics of forgetting, so used memories stay and unused ones fade | Modern spaced-repetition research |
 | **Retroactive Salience Backfill** | Backward causal reach to the root cause of a failure | Zaki/Cai et al. 2024, *Nature* 637:145–155 |
 | **Synaptic Tagging** | A memory that looked trivial this morning can be tagged critical tonight | [Frey & Morris 1997](https://doi.org/10.1038/385533a0) |
-| **Spreading Activation** | Search "auth bug," surface last week's JWT update — memory is a graph, not a list | [Collins & Loftus 1975](https://doi.org/10.1037/0033-295X.82.6.407) |
-| **Dual-Strength Model** | Storage strength vs. retrieval strength — deeply stored ≠ instantly recalled, just like you | [Bjork & Bjork 1992](https://doi.org/10.1016/S0079-7421(08)60016-9) |
+| **Spreading Activation** | Search "auth bug," surface last week's JWT update, because memory is a graph, not a list | [Collins & Loftus 1975](https://doi.org/10.1037/0033-295X.82.6.407) |
+| **Dual-Strength Model** | Storage strength vs. retrieval strength, so deeply stored ≠ instantly recalled, just like you | [Bjork & Bjork 1992](https://doi.org/10.1016/S0079-7421(08)60016-9) |
 | **Memory Dreaming** | Sleep-like consolidation: replays, connects, synthesizes insights to a graph | Active-dreaming consolidation |
-| **Active Forgetting (`suppress`)** | Top-down inhibition that *compounds* and cascades to neighbors — reversible for 24h | [Anderson 2025](https://www.nature.com/articles/s41583-025-00929-y) · [Davis 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/) |
+| **Active Forgetting (`suppress`)** | Top-down inhibition that *compounds* and cascades to neighbors, reversible for 24h | [Anderson 2025](https://www.nature.com/articles/s41583-025-00929-y) · [Davis 2020](https://pmc.ncbi.nlm.nih.gov/articles/PMC7477079/) |
 
-[**Read the full science doc →**](docs/SCIENCE.md) — every feature, every paper.
+[**Read the full science doc →**](docs/SCIENCE.md). Every feature, every paper.
 
 ---
 
 ## 🛠 13 tools, one brain
 
-v2.2.0 consolidated a sprawling 34-tool surface into **13 sharp ones** your agent actually reaches for. Old names still work as hidden aliases — nothing breaks.
+v2.2.0 consolidated a sprawling 34-tool surface into **13 sharp ones** your agent actually reaches for. Old names still work as hidden aliases, so nothing breaks.
 
 | Tool | What it does |
 |---|---|
-| 🔍 `recall` | The retrieval engine — folds search + deep reasoning + contradiction detection into one call. F32 embeddings, Reciprocal Rank Fusion, claim-vs-memory checks. |
-| 🧠 `backfill` | **Memory with hindsight** — backward causal reach to a failure's root cause (Cai 2024). |
+| 🔍 `recall` | The retrieval engine. Folds search + deep reasoning + contradiction detection into one call. F32 embeddings, Reciprocal Rank Fusion, claim-vs-memory checks. |
+| 🧠 `backfill` | **Memory with hindsight.** Backward causal reach to a failure's root cause (Cai 2024). |
 | 💾 `smart_ingest` | Stores with CREATE / UPDATE / SUPERSEDE via Prediction-Error Gating. Batch session-end saves. |
 | 🗂 `memory` | Get, edit, promote 👍, demote 👎, check state, purge content + embeddings. |
 | 🧩 `graph` | Reasoning chains, associations, bridges, predictions, force-directed export. |
-| 🌙 `maintain` | Consolidate, dream, GC, importance-score, backup, export, restore — one maintenance verb. |
+| 🌙 `maintain` | Consolidate, dream, GC, importance-score, backup, export, restore. One maintenance verb. |
 | 🧹 `dedup` | Self-healing duplicate detection + merge (8 old tools → 1). |
-| 🚫 `suppress` | Top-down active forgetting — compounds, cascades, reversible 24h. The memory is *inhibited, not erased.* |
+| 🚫 `suppress` | Top-down active forgetting that compounds, cascades, and is reversible for 24h. The memory is *inhibited, not erased.* |
 | 📟 `memory_status` | Health + stats + trends + recommendations in one packet. |
 | 🧬 `codebase` · `intention` · `source_sync` · `session_start` | Per-project code memory · "remind me when X" · external-source connectors · one-call session init. |
 
@@ -213,32 +213,32 @@ Registering the server exposes the tools; a short instruction tells the agent *w
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  SvelteKit Dashboard — Three.js 3D graph · WebGL bloom    │
+│  SvelteKit Dashboard / Three.js 3D graph / WebGL bloom    │
 ├──────────────────────────────────────────────────────────┤
-│  Axum HTTP + WebSocket (:3927) — REST + live event stream │
+│  Axum HTTP + WebSocket (:3927) / REST + live event stream │
 ├──────────────────────────────────────────────────────────┤
-│  MCP Server (stdio JSON-RPC) — 13 tools · 30 modules      │
+│  MCP Server (stdio JSON-RPC) / 13 tools · 30 modules      │
 ├──────────────────────────────────────────────────────────┤
 │  Cognitive Engine                                          │
 │   FSRS-6 · Spreading Activation · Prediction-Error Gating │
 │   Retroactive Salience Backfill · Synaptic Tagging        │
 │   Memory Dreamer · Hippocampal Index · Active Forgetting  │
 ├──────────────────────────────────────────────────────────┤
-│  Storage — SQLite + FTS5 · USearch HNSW · Nomic Embed v1.5│
+│  Storage: SQLite + FTS5 · USearch HNSW · Nomic Embed v1.5 │
 │   Optional: Qwen3 reranker · SQLCipher · Metal/CUDA       │
 └──────────────────────────────────────────────────────────┘
 ```
 
 | | |
 |---|---|
-| **Language** | Rust 2024 (MSRV 1.91) — **86,000+ lines** |
+| **Language** | Rust 2024 (MSRV 1.91), **86,000+ lines** |
 | **Binary** | ~23MB, single file |
 | **Embeddings** | Nomic Embed Text v1.5 (768d→256d Matryoshka, 8192 ctx); Qwen3 optional |
 | **Vector search** | USearch HNSW (≈20× faster than FAISS) |
 | **Storage** | SQLite + FTS5, optional SQLCipher encryption |
 | **Tests** | **1,550 passing** · clippy `-D warnings` clean |
 | **First run** | Downloads ~130MB embedding model once, then **fully offline forever** |
-| **Platforms** | macOS (ARM + Intel) · Linux x86_64 · Windows x86_64 — all prebuilt |
+| **Platforms** | macOS (ARM + Intel) · Linux x86_64 · Windows x86_64. All prebuilt |
 
 ---
 
@@ -256,7 +256,7 @@ Registering the server exposes the tools; a short instruction tells the agent *w
 
 <div align="center">
 
-### If your agent should remember what you taught it yesterday — star it. ⭐
+### If your agent should remember what you taught it yesterday, star it. ⭐
 
 <sub><b>86,000+ lines of Rust · 13 tools · 30 cognitive modules · 130 years of memory research · one 23MB binary that never phones home.</b></sub>
 
