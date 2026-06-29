@@ -37,7 +37,7 @@ use crate::embeddings::EmbeddingService;
 use crate::embeddings::{EMBEDDING_DIMENSIONS, Embedding, matryoshka_truncate};
 
 #[cfg(feature = "vector-search")]
-use crate::search::{VectorIndex, linear_combination};
+use crate::search::{VectorIndex, reciprocal_rank_fusion};
 
 #[cfg(all(feature = "embeddings", feature = "vector-search"))]
 use crate::search::hyde;
@@ -2896,13 +2896,15 @@ impl SqliteMemoryStore {
                 vec![]
             };
 
+        // Reciprocal Rank Fusion (k=60) when both lists are present: it is scale-free
+        // and rewards a memory that appears in BOTH the keyword and semantic lists —
+        // exactly the structurally-similar-different-words paraphrase that linear
+        // max-norm fusion buried. Falls back to linear when only one list exists.
+        // (keyword_weight/semantic_weight retained in the signature for compatibility;
+        // RRF is rank-based so the weights no longer scale the fused score.)
+        let _ = (keyword_weight, semantic_weight);
         let combined = if !semantic_results.is_empty() {
-            linear_combination(
-                &keyword_results,
-                &semantic_results,
-                keyword_weight,
-                semantic_weight,
-            )
+            reciprocal_rank_fusion(&keyword_results, &semantic_results, 60.0)
         } else {
             keyword_results.clone()
         };
@@ -4713,6 +4715,22 @@ impl SqliteMemoryStore {
         let composed_pairs = self.composed_pair_set()?;
         let composition_degrees = self.composition_degree_map()?;
         let outcome_map = self.composition_outcome_map()?;
+
+        // SEMANTIC-BAND GATE (the composition generativity unlock): load embeddings so a pair
+        // that shares NO literal tag/word but lives in the "distant-but-relatable" cosine band
+        // can still surface as a never-composed insight — exactly the non-obvious combination
+        // a keyword/exact-overlap gate (and cosine-NN search) can never return. The band excludes
+        // near-duplicates (>= 0.85, those are the same idea) and unrelated noise (< 0.45).
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        let embedding_map: std::collections::HashMap<String, Vec<f32>> = self
+            .get_all_embeddings()
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        const COMPOSE_BAND_LO: f32 = 0.45;
+        #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+        const COMPOSE_BAND_HI: f32 = 0.85;
+
         let mut candidates = Vec::new();
 
         for i in 0..nodes.len() {
@@ -4733,7 +4751,27 @@ impl SqliteMemoryStore {
 
                 let shared_tags = Self::shared_tags(&a.tags, &b.tags);
                 let shared_terms = Self::shared_content_terms(&a.content, &b.content, 8);
-                if shared_tags.is_empty() && shared_terms.is_empty() {
+
+                // Semantic-band cosine: lets a pair with NO shared surface tokens but a
+                // related MEANING through the gate (the generative cross-domain combination).
+                #[cfg(all(feature = "embeddings", feature = "vector-search"))]
+                let band_cos: Option<f32> = match (embedding_map.get(&a.id), embedding_map.get(&b.id))
+                {
+                    (Some(ea), Some(eb)) => {
+                        let c = crate::embeddings::cosine_similarity(ea, eb);
+                        if (COMPOSE_BAND_LO..COMPOSE_BAND_HI).contains(&c) {
+                            Some(c)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                #[cfg(not(all(feature = "embeddings", feature = "vector-search")))]
+                let band_cos: Option<f32> = None;
+
+                // Admit the pair if it shares surface signal OR it sits in the semantic band.
+                if shared_tags.is_empty() && shared_terms.is_empty() && band_cos.is_none() {
                     continue;
                 }
 
@@ -4752,10 +4790,14 @@ impl SqliteMemoryStore {
                 );
                 let anchor_score =
                     (shared_tags.len() as f64 * 0.45) + (shared_terms.len().min(5) as f64 * 0.25);
+                // Semantic-band pairs (no surface overlap) get an anchor from cosine so they
+                // clear the cutoff: a mid-band 0.45-0.85 meaning-match is a strong compose signal.
+                let band_anchor = band_cos.map(|c| 1.0 + (c as f64 - 0.45) * 2.0).unwrap_or(0.0);
                 let prior_outcomes = Self::pair_prior_outcomes(&outcome_map, &a.id, &b.id);
                 let outcome_signal = Self::outcome_signal(&prior_outcomes);
                 let outcome_score_adjustment = Self::outcome_score_adjustment(&prior_outcomes);
                 let score = anchor_score
+                    + band_anchor
                     + (bridge_score * 2.0)
                     + (novelty_score * 1.5)
                     + trust_score

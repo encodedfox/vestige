@@ -661,6 +661,36 @@ pub async fn execute(
     }
 
     // ====================================================================
+    // STAGE 5b: CLAIM-vs-MEMORY contradiction (the structural fix).
+    // The original engine only compared stored memory PAIRS — it never tested
+    // the user's QUERY against memory, so "your claim X contradicts stored
+    // memory Y" was invisible (confident silence, the dangerous failure). Here
+    // we test args.query against each analyzed memory so a claim that conflicts
+    // with a high-trust memory surfaces and lowers confidence.
+    let mut claim_conflicts: Vec<Value> = Vec::new();
+    for m in scored.iter() {
+        if m.trust < 0.3 {
+            continue;
+        }
+        let overlap = topic_overlap(&args.query, &m.content);
+        if overlap < 0.4 {
+            continue;
+        }
+        if appears_contradictory(&args.query, &m.content) {
+            claim_conflicts.push(serde_json::json!({
+                "claim": args.query.chars().take(160).collect::<String>(),
+                "conflicting_memory": {
+                    "id": m.id,
+                    "preview": m.content.chars().take(150).collect::<String>(),
+                    "trust": (m.trust * 100.0).round() / 100.0,
+                    "date": m.updated_at.to_rfc3339(),
+                },
+                "topic_overlap": overlap,
+            }));
+        }
+    }
+
+    // ====================================================================
     // STAGE 6: Dream Insight Integration
     // ====================================================================
     let mut related_insights: Vec<Value> = Vec::new();
@@ -848,10 +878,16 @@ pub async fn execute(
     // function of trust + corpus size alone.
     let base_confidence = recommended.map(composite).unwrap_or(0.0);
     let agreement_boost = (evidence.len() as f64 * 0.03).min(0.2);
-    let contradiction_penalty = contradictions.len() as f64 * 0.1;
+    // A claim that conflicts with a stored memory is the strongest possible signal
+    // to lower confidence (heavier penalty than an inter-memory disagreement).
+    let contradiction_penalty =
+        (contradictions.len() as f64 * 0.1) + (claim_conflicts.len() as f64 * 0.2);
     let confidence = (base_confidence + agreement_boost - contradiction_penalty).clamp(0.0, 1.0);
 
-    let status = if contradictions.is_empty() && confidence > 0.7 {
+    let status = if !claim_conflicts.is_empty() {
+        // The claim itself conflicts with stored memory — never report "resolved".
+        "claim_contradicts_memory"
+    } else if contradictions.is_empty() && confidence > 0.7 {
         "resolved"
     } else if !contradictions.is_empty() {
         "contradictions_found"
@@ -861,7 +897,13 @@ pub async fn execute(
         "partial_evidence"
     };
 
-    let guidance = if let Some(rec) = recommended {
+    let guidance = if !claim_conflicts.is_empty() {
+        format!(
+            "CAUTION: your claim conflicts with {} stored memor{}. Do NOT treat this as resolved — review the conflicting memory(ies) below before acting.",
+            claim_conflicts.len(),
+            if claim_conflicts.len() == 1 { "y" } else { "ies" }
+        )
+    } else if let Some(rec) = recommended {
         if contradictions.is_empty() {
             format!(
                 "High confidence ({:.0}%). Recommended memory (trust {:.0}%, {}) is the most reliable source.",
@@ -902,6 +944,10 @@ pub async fn execute(
         "memoriesAnalyzed": scored.len(),
         "activationExpanded": activation_expanded,
     });
+
+    if !claim_conflicts.is_empty() {
+        response["claim_conflicts"] = serde_json::json!(claim_conflicts);
+    }
 
     if let Some(rec) = recommended {
         response["recommended"] = serde_json::json!({
@@ -1364,6 +1410,90 @@ mod tests {
             "Don't use FAISS for vector search in production",
             "Use FAISS for vector search in production always"
         ));
+    }
+
+    // ========================================================================
+    // STAGE 5b AUDIT: a NON-contradicting claim must NOT set
+    // status=claim_contradicts_memory; a contradicting claim MUST.
+    // ========================================================================
+    #[tokio::test]
+    async fn audit_stage5b_noncontradicting_claim_is_not_flagged() {
+        let (storage, _dir) = test_storage().await;
+
+        // High-overlap, AGREEING memory: same subject, same stance.
+        ingest_one(
+            &storage,
+            "Vestige uses USearch HNSW for vector search with cosine similarity \
+             and Matryoshka truncation to 256 dimensions for storage savings.",
+            &["vestige", "vector-search"],
+        )
+        .await;
+
+        // Claim that AGREES (no negation, no correction marker, same subject).
+        let args = serde_json::json!({
+            "query": "Vestige uses USearch HNSW for vector search with cosine \
+                      similarity and Matryoshka truncation to 256 dimensions"
+        });
+        let result = execute(&storage, &test_cognitive(), Some(args))
+            .await
+            .expect("execute should succeed");
+
+        // Non-vacuous: the memory MUST have been retrieved (else the assertion
+        // below would pass trivially via the no_memories early-return).
+        assert!(
+            result["memoriesAnalyzed"].as_i64().unwrap_or(0) >= 1,
+            "Expected the agreeing memory to be retrieved (memoriesAnalyzed>=1). Got {:?}",
+            result["memoriesAnalyzed"]
+        );
+        assert_ne!(
+            result["status"].as_str(),
+            Some("claim_contradicts_memory"),
+            "A NON-contradicting (agreeing) claim must not be flagged. Got status={:?}, claim_conflicts={:?}",
+            result["status"],
+            result.get("claim_conflicts")
+        );
+        assert!(
+            result.get("claim_conflicts").is_none(),
+            "No claim_conflicts array should be present for an agreeing claim. Got {:?}",
+            result.get("claim_conflicts")
+        );
+    }
+
+    // STAGE 5b decision predicate, tested directly. The end-to-end `execute`
+    // path cannot surface a genuinely-contradicting claim in a test env with no
+    // embeddings model loaded, because keyword retrieval is implicit-AND and a
+    // contradicting claim by construction carries a stance word the memory
+    // lacks. This asserts the exact gate STAGE 5b applies once a memory is
+    // retrieved: topic_overlap >= 0.4 AND appears_contradictory(query, memory).
+    #[test]
+    fn audit_stage5b_gate_predicate_distinguishes_agree_vs_contradict() {
+        let memory = "USearch HNSW vector search Vestige production cosine similarity \
+                      recall correct should always be enabled because it is fast";
+
+        // Agreeing claim: high overlap, NO stance flip → must NOT trip the gate.
+        let agree = "USearch HNSW vector search Vestige production cosine similarity \
+                     recall correct should always be enabled because it is fast";
+        assert!(
+            topic_overlap(agree, memory) >= 0.4,
+            "agree/memory should share topic"
+        );
+        assert!(
+            !appears_contradictory(agree, memory),
+            "An agreeing claim must NOT be flagged as contradictory (false-positive guard)"
+        );
+
+        // Contradicting claim: same subject + a negation marker ("never"/"avoid")
+        // present in exactly one side → must trip the gate.
+        let contradict = "USearch HNSW vector search Vestige production cosine similarity \
+                          recall avoid never enabled";
+        assert!(
+            topic_overlap(contradict, memory) >= 0.4,
+            "contradict/memory should share topic"
+        );
+        assert!(
+            appears_contradictory(contradict, memory),
+            "A same-subject negated claim MUST be flagged as contradictory"
+        );
     }
 
     #[test]

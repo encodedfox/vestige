@@ -268,6 +268,35 @@ enum Commands {
         json: bool,
     },
 
+    /// Recall + reason across memories (deep_reference): hybrid search, FSRS-6 trust,
+    /// spreading activation, supersession + contradiction analysis. Returns the
+    /// synthesized answer, evidence, and confidence.
+    Recall {
+        /// The query / claim to reason about
+        query: String,
+        /// How many memories to analyze (candidate depth)
+        #[arg(long, default_value = "20")]
+        depth: i64,
+        /// Output raw JSON instead of the human-readable summary
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Compose: surface NEVER-COMPOSED memory pairs — two memories you wrote that nobody
+    /// (including you) ever connected — and the testable question they imply. The insight
+    /// generator: semantic-band + structural-bridge ranking over your cross-domain memory.
+    Compose {
+        /// How many candidate insight pairs to surface
+        #[arg(long, default_value = "5")]
+        limit: i32,
+        /// Optional tag filter (comma-separated) to focus a domain
+        #[arg(long)]
+        tags: Option<String>,
+        /// Output raw JSON instead of the human-readable summary
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Start standalone HTTP MCP server (no stdio, for remote access)
     Serve {
         /// HTTP transport port
@@ -353,6 +382,8 @@ fn main() -> anyhow::Result<()> {
             contrast,
             json,
         } => run_backfill(failure_id, manual, lookback_days, !no_promote, contrast, json),
+        Commands::Recall { query, depth, json } => run_recall(query, depth, json),
+        Commands::Compose { limit, tags, json } => run_compose(limit, tags, json),
         Commands::Serve {
             port,
             dashboard,
@@ -2775,6 +2806,172 @@ fn run_backfill(
             println!();
         }
     }
+    Ok(())
+}
+
+/// Recall + reason across memories using the real deep_reference engine.
+fn run_recall(query: String, depth: i64, json: bool) -> anyhow::Result<()> {
+    use vestige_mcp::cognitive::CognitiveEngine;
+
+    let storage = open_storage()?;
+
+    #[cfg(feature = "embeddings")]
+    {
+        if let Err(e) = storage.init_embeddings() {
+            eprintln!(
+                "  {} Embeddings unavailable: {} (recall will use keyword-only)",
+                "!".yellow(),
+                e
+            );
+        }
+    }
+
+    let storage = Arc::new(storage);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async move {
+        let cognitive = Arc::new(tokio::sync::Mutex::new(CognitiveEngine::new()));
+        {
+            let mut cog = cognitive.lock().await;
+            cog.hydrate(&storage);
+        }
+        let args = serde_json::json!({ "query": query, "depth": depth });
+        vestige_mcp::tools::cross_reference::execute(&storage, &cognitive, Some(args)).await
+    });
+
+    let value = result.map_err(|e| anyhow::anyhow!("recall error: {}", e))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    // Human-readable summary of the real engine output.
+    let conf = value
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let intent = value
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Synthesis");
+    let analyzed = value
+        .get("memoriesAnalyzed")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    println!(
+        "{}  intent={}  confidence={:.0}%  memories_analyzed={}",
+        "Recall".cyan().bold(),
+        intent,
+        conf * 100.0,
+        analyzed
+    );
+
+    if let Some(rec) = value.get("recommended") {
+        let ans = rec
+            .get("answer_preview")
+            .or_else(|| rec.get("preview"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !ans.is_empty() {
+            println!("\n{}", "Recommended:".white().bold());
+            for line in ans.lines().take(6) {
+                println!("  {}", line);
+            }
+        }
+    }
+
+    if let Some(ev) = value.get("evidence").and_then(|v| v.as_array()) {
+        println!("\n{} ({})", "Evidence".white().bold(), ev.len());
+        for (i, e) in ev.iter().take(5).enumerate() {
+            let pv = e
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .replace('\n', " ");
+            let pv: String = pv.chars().take(78).collect();
+            println!("  {}. {}", i + 1, pv);
+        }
+    }
+
+    Ok(())
+}
+
+/// Compose: surface never-composed memory pairs + the testable question they imply.
+fn run_compose(limit: i32, tags: Option<String>, json: bool) -> anyhow::Result<()> {
+    let storage = open_storage()?;
+
+    #[cfg(feature = "embeddings")]
+    {
+        let _ = storage.init_embeddings();
+    }
+
+    let tag_vec: Option<Vec<String>> = tags.map(|t| {
+        t.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
+    let candidates = storage
+        .get_never_composed_candidates(limit, tag_vec.as_deref())
+        .map_err(|e| anyhow::anyhow!("compose error: {}", e))?;
+
+    if json {
+        let arr: Vec<_> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "score": c.score,
+                    "novelty": c.novelty_score,
+                    "bridge": c.bridge_score,
+                    "trust": c.trust_score,
+                    "a": c.first_preview,
+                    "b": c.second_preview,
+                    "shared_tags": c.shared_tags,
+                    "question": c.composition_question,
+                    "reason": c.reason,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+
+    if candidates.is_empty() {
+        println!(
+            "{}  no never-composed candidates surfaced (try a wider --limit or remove --tags)",
+            "Compose".magenta().bold()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}  {} never-composed insight{} — pairs you wrote that were never connected:\n",
+        "Compose".magenta().bold(),
+        candidates.len(),
+        if candidates.len() == 1 { "" } else { "s" }
+    );
+
+    for (i, c) in candidates.iter().enumerate() {
+        let a: String = c.first_preview.replace('\n', " ").chars().take(70).collect();
+        let b: String = c.second_preview.replace('\n', " ").chars().take(70).collect();
+        let idx = format!("{}.", i + 1).cyan().bold();
+        let metrics = format!(
+            "{:.2}  (novelty {:.2}, bridge {:.2})",
+            c.score, c.novelty_score, c.bridge_score
+        );
+        println!("{} {} {}", idx, "score".white(), metrics);
+        println!("   A: {}", a);
+        println!("   B: {}", b);
+        let q: String = c.composition_question.replace('\n', " ").chars().take(120).collect();
+        if !q.is_empty() {
+            println!("   {} {}", "?".yellow().bold(), q.yellow());
+        }
+        println!();
+    }
+
     Ok(())
 }
 
