@@ -2,89 +2,101 @@
 
 <h1>Vestige</h1>
 
-### Your AI has the memory of a goldfish. Vestige gives it a hippocampus.
+### Your bug was born days before it crashed — you just can't remember where.
 
-<em>Local-first cognitive memory for AI agents. 130 years of neuroscience, compiled into one 23MB Rust binary. Zero cloud. Your data never leaves your machine.</em>
+<em>Vestige is a local-first memory for AI agents that reaches <b>backward through time</b> to find the quiet change that caused today's failure — the cause that looks nothing like the bug. One 23MB Rust binary. No cloud. Your data never leaves your machine.</em>
 
 [![GitHub stars](https://img.shields.io/github/stars/samvallad33/vestige?style=for-the-badge&logo=github&color=8b5cf6)](https://github.com/samvallad33/vestige/stargazers)
 [![Release](https://img.shields.io/github/v/release/samvallad33/vestige?style=for-the-badge&color=06b6d4)](https://github.com/samvallad33/vestige/releases/latest)
 [![Tests](https://img.shields.io/badge/tests-1550_passing-22c55e?style=for-the-badge)](https://github.com/samvallad33/vestige/actions)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-3b82f6?style=for-the-badge)](LICENSE)
 
-[**⚡ Quick Start**](#-60-second-start) · [**🧠 Why It's Different**](#-why-this-isnt-rag-with-a-fancy-name) · [**🔬 The Science**](#-this-is-real-neuroscience-not-a-metaphor) · [**🛠 13 Tools**](#-13-tools-one-brain) · [**📊 Dashboard**](#-watch-your-ai-think-in-3d)
+[**⚡ Quick Start**](#-get-it-running-in-60-seconds) · [**🧠 The Idea**](#-why-i-built-this) · [**🔬 The Science**](#-this-is-real-neuroscience-not-a-metaphor) · [**🛠 13 Tools**](#-13-tools-one-brain) · [**📊 Dashboard**](#-watch-your-ai-think-in-3d)
 
 </div>
 
 ---
 
-> ### The moment that made this real
->
-> You spent 40 minutes last Tuesday explaining to your agent why the staging connection pooler corrupts data during migrations. You moved on.
->
-> Today — new session, new context window — it cheerfully suggests *disabling the pooler during a migration.* The lesson is gone. The agent that "remembers everything" remembers **nothing** that matters.
->
-> **Vestige is the fix.** Not a bigger context window. Not a vector dump. A memory that **decides what to keep, reaches backward to find the root cause of a failure, and tells you when you're about to contradict something you already learned.**
+## 👋 Why I built this
+
+Hi — I'm [Sam](https://github.com/samvallad33). I built Vestige from a tiny apartment in Chicago because I kept losing days to the same thing, and I bet you have too.
+
+Production breaks. You start hunting. And the cause is almost never *near* the error — it's some quiet change you made days ago that looks **nothing** like the crash it eventually caused. A flipped env var. A swapped service. A config tweak you'd already forgotten.
+
+Here's the part that took me a while to see: **every AI memory tool is built on vector search, and vector search hunts for what *looks like* your problem.** But a root cause never looks like the bug it creates. So they all search the goal line — while the real failure was a quiet midfield turnover fifteen minutes earlier.
+
+I wanted a memory that traces the match *backward.*
+
+So that's what Vestige is. Everyone else built a memory that **remembers**. I tried to build the first one that **realizes** — it gates what's worth keeping, lets the noise fade like your own memory does, and when a failure hits, it reaches back through time to the change that actually caused it.
+
+It's one Rust binary. It runs entirely on your machine. It never phones home. And there's a 60-second start right below.
+
+> 🎙️ **The 60-second version** of this whole story — the one I give in person — lives in [`demo/PITCH-v2-causebench.md`](demo/PITCH-v2-causebench.md). If you've got a minute, read that first. It's the clearest way to *get* why this matters.
 
 ---
 
-## ⚡ 60-second start
+## ⚡ Get it running in 60 seconds
 
 ```bash
-npm install -g vestige-mcp-server@latest      # 1. install (one binary, no Docker, no API key)
-claude mcp add vestige vestige-mcp -s user    # 2. connect to Claude Code
+npm install -g vestige-mcp-server@latest      # one binary — no Docker, no API key, no signup
+claude mcp add vestige vestige-mcp -s user    # connect it to Claude Code
 ```
 
-That's it. Now talk to your agent like it has a memory — because now it does:
+That's the whole install. Now talk to your agent like it has a memory — because now it does:
 
 ```
 You:  "Remember: we always disable SimSIMD on release builds, it breaks old x86 CPUs."
         ...days later, fresh session, zero context...
 You:  "Should I enable SimSIMD for the release?"
-AI:   ⚠️ Your claim contradicts a stored decision — you decided to DISABLE it (it breaks old x86 CPUs).
+AI:   ⚠️ Hold on — this contradicts a decision you stored: you chose to DISABLE it
+        because it breaks old x86 CPUs.
 ```
 
-> That last line is **`claim_contradicts_memory`** — a real status the engine returns. Most memory systems give you confident silence. Vestige tells you when you're about to repeat a mistake. *(Works with Codex, Cursor, VS Code, Claude Desktop, Windsurf, JetBrains, Zed — anything that speaks MCP. [Full setup ↓](#-works-in-every-editor-you-use))*
+That last line isn't me being cute — it's a real status the engine returns, called `claim_contradicts_memory`. Most memory tools would have happily handed you the wrong answer. Vestige tells you when you're about to walk back into a mistake you already learned from.
+
+*(Works with Codex, Cursor, VS Code, Claude Desktop, Windsurf, JetBrains, Zed — anything that speaks MCP. [Full setup is here ↓](#-works-in-every-editor-you-use).)*
 
 ---
 
-## 🧠 Why this isn't "RAG with a fancy name"
+## 🧠 It's not RAG with a nicer haircut
 
-RAG is a bucket. You throw everything in and hope nearest-neighbor finds it later. Vestige is an **active organ** — it gates what enters, lets the unimportant fade, and reasons across what's left.
+RAG is a bucket: throw everything in, hope nearest-neighbor finds it later. Vestige behaves more like an actual memory — it decides what's worth keeping, forgets what isn't, and reasons across what's left.
 
 |  | 🪣 RAG / Vector Store | 🧠 Vestige |
 |---|---|---|
-| **What it stores** | Everything you give it | Only what's **surprising or new** (Prediction-Error Gating — the hippocampal bouncer) |
-| **What it forgets** | Nothing — bloats forever | Unused memories **decay** on the real FSRS-6 forgetting curve; context stays lean |
-| **Finding the root cause** | Can't — the cause isn't *similar* to the bug | **Reaches backward in time** to the causally-upstream memory (the headline v2.2 feature ↓) |
-| **Contradictions** | Silent — happily serves the stale answer | Returns **`claim_contradicts_memory`** and shows you the conflict |
-| **Duplicates** | You dedup by hand | Self-heals: *"likes dark mode"* + *"prefers dark themes"* → merged |
-| **Forgetting on demand** | DELETE only | **`suppress`** — compounding top-down inhibition, neighbor cascade, reversible for 24h |
-| **Consolidation** | None | **Dreams** — replays memories, finds hidden connections, synthesizes insights |
-| **Where it lives** | Usually someone else's cloud | **100% on your machine.** One binary. No telemetry. |
+| **What it stores** | Everything you hand it | Only what's **surprising or new** — the rest gets merged or skipped |
+| **What it forgets** | Nothing — it just bloats | Unused memories **fade** on a real forgetting curve, so your context stays lean |
+| **Finding a root cause** | Can't — the cause isn't *similar* to the bug | **Reaches backward in time** to the change that caused it (the whole point ↓) |
+| **Catching contradictions** | Silent — serves the stale answer with a straight face | Tells you: *"this contradicts what you decided"* |
+| **Duplicates** | You clean them up by hand | Self-heals — *"likes dark mode"* + *"prefers dark themes"* quietly become one |
+| **Forgetting on demand** | DELETE and it's gone | **`suppress`** — gently inhibits a memory (and its neighbors), reversible for 24h |
+| **Where it lives** | Usually someone else's cloud | **Your machine. One binary. No telemetry.** |
 
 ---
 
-## 🔥 The feature no other AI memory has: Memory with hindsight
+## 🔥 The thing nothing else does: memory with hindsight
 
-Here's the thing vector search **structurally cannot do.**
+This is the part I'm proudest of, and it's worth one honest paragraph.
 
-A bug appears today. The root cause was a quiet decision you made *three weeks ago* — a changed env var, a config tweak, a service you swapped. That root cause is **not similar to the bug.** It shares no keywords. A vector search will never surface it, because it's not *similar* — it's *causally upstream.*
+A bug shows up today. The cause was a quiet decision from three weeks ago — a changed env var, a swapped service. That cause **shares no words with the error it created.** A vector search will never connect them, because it only knows how to find things that *look alike* — and this is a case where the cause and the symptom look nothing alike. This isn't a tuning problem; in 2026 Google DeepMind published a proof ([arXiv:2508.21038](https://arxiv.org/abs/2508.21038), ICLR 2026) that single-vector retrieval is *mathematically* incapable of bridging gaps like this.
 
-Vestige's **Retroactive Salience Backfill** — a faithful port of **Zaki/Cai et al., 2024, *Nature* 637:145–155** (offline ensemble co-reactivation links memories across days) — does what your brain does after a failure: it **reaches backward through time**, finds the dormant memory that *caused* this, and promotes it — because they share an **entity** (the same file, env var, or service), not because they share words.
+So Vestige doesn't do it with similarity. Its **Retroactive Salience Backfill** — ported from **Zaki/Cai et al., 2024, *Nature* 637:145–155** ([DOI](https://doi.org/10.1038/s41586-024-08168-4)), on how the brain links a shock to the quiet memory that caused it — reaches *backward through time* and promotes the dormant memory that's **causally upstream**: it shares an *entity* (the same file, env var, or service), not the same words.
+
+I also built a benchmark to keep myself honest about it. Every pure vector retriever scored **0% recall@1** on the causal-gap task; Vestige scored **60%**. (To be precise: the impossibility is DeepMind's *theorem*; the 0%-vs-60% is *my measurement* — two different claims, and I keep them separate.)
 
 ```bash
 vestige backfill --contrast      # show the root cause a vector search would have missed
 ```
 
-> **Run 2 is smarter than run 1.** Every failure your agent records makes the *next* session diagnose faster. That compounding is the moat — and it runs automatically inside consolidation, no babysitting.
+The nice part: it compounds. Every failure your agent records makes the *next* session diagnose faster — run two is smarter than run one — and it happens automatically during consolidation, so you don't have to babysit it.
 
-This shipped in **v2.2.0** alongside a 34→13 tool consolidation and a rebuilt retrieval engine. [Full release notes →](https://github.com/samvallad33/vestige/releases/tag/v2.2.0)
+All of this shipped in **v2.2.0**, along with a 34→13 tool consolidation and a rebuilt retrieval engine. [Full release notes →](https://github.com/samvallad33/vestige/releases/tag/v2.2.0)
 
 ---
 
 ## 🔬 This is real neuroscience, not a metaphor
 
-Every mechanism below is a cited paper, implemented in Rust, running locally. This is the difference between *"we use embeddings"* and *a memory system.*
+I get skeptical when projects wave the word "neuroscience" around, so here's my receipt: every mechanism below is a real, cited paper, implemented in Rust, running locally on your machine. None of it phones a model in the cloud to sound smart.
 
 | Mechanism | What it does for you | Grounded in |
 |---|---|---|
