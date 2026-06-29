@@ -7,7 +7,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use vestige_core::{CompositionOutcomeRecord, Storage};
 
-const OUTCOME_TYPES: &[&str] = &[
+pub(crate) const OUTCOME_TYPES: &[&str] = &[
     "helpful",
     "dead_end",
     "submitted",

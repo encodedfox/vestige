@@ -129,23 +129,6 @@ impl McpServer {
         }
     }
 
-    /// Read the active Memory PR review mode from `<data_dir>/review_mode.json`,
-    /// defaulting to `RiskGated`. Shared shape with the dashboard handler so the
-    /// MCP write path and the UI agree on the mode.
-    fn review_mode(&self) -> vestige_core::ReviewMode {
-        let path = self.storage.data_dir().join("review_mode.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("mode")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
-            .map(|s| vestige_core::ReviewMode::from_label(&s))
-            .unwrap_or_default()
-    }
-
     /// Handle an incoming JSON-RPC request
     pub async fn handle_request(&mut self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         debug!("Handling request: {}", request.method);
@@ -257,19 +240,25 @@ impl McpServer {
 
     /// Handle tools/list request
     async fn handle_tools_list(&self) -> Result<serde_json::Value, JsonRpcError> {
-        // v2.1.27: 34 tools (verified by the `tools.len() == 34` assertion in the
-        // handle_tools_list test below).
-        // Deprecated tools still work via redirects in handle_tools_call.
+        // v2.2: 12 advertised tools after Layer-1 Tool Consolidation
+        // (verified by `tools.len() == 12` in test_tools_list_returns_all_tools).
+        // 22 deprecated/folded names still work as hidden redirects in
+        // handle_tools_call. See docs/launch/tool-consolidation-v2.2.0.md.
         let mut tools = vec![
+            // ================================================================
+            // RECALL — unified retrieval tool (v2.2). HOT PATH.
+            // Folds search + deep_reference + cross_reference + contradictions.
+            // mode='lookup' (default) is a zero-overhead pass-through to search.
+            // ================================================================
+            ToolDescription {
+                name: "recall".to_string(),
+                description: Some("Retrieve from memory. Modes: 'lookup' (default — fast hybrid search: keyword + semantic + convex fusion, auto-strengthens on access; use for plain recall), 'reason' (deep cognitive reasoning across memories with FSRS-6 trust scoring, spreading activation, supersession, and contradiction analysis; use when accuracy matters, needs 'query'), 'contradictions' (surface trust-weighted disagreement pairs for a 'topic'). Default mode is fast — only 'reason' pays the deep-analysis cost.".to_string()),
+                input_schema: tools::recall::schema(),
+                ..Default::default()
+            },
             // ================================================================
             // UNIFIED TOOLS (v1.1+)
             // ================================================================
-            ToolDescription {
-                name: "search".to_string(),
-                description: Some("Retrieval tool for answering from stored Vestige memories. Use for topical search or literal lookup; set concrete=true for ids, paths, env vars, and code symbols, and choose retrieval_mode precise/balanced/exhaustive based on recall needs. Returns ranked memories with ids, scores, tags, and content; it does not create/edit/delete memories, but accessed results may be strengthened by the Testing Effect.".to_string()),
-                input_schema: tools::search_unified::schema(),
-                ..Default::default()
-            },
             ToolDescription {
                 name: "memory".to_string(),
                 description: Some("Unified memory management tool. Actions: 'get' (retrieve full node), 'purge' (irreversibly remove content/embeddings with confirm=true), 'delete' (legacy alias for purge), 'state' (get accessibility state), 'promote' (thumbs up — increases retrieval strength), 'demote' (thumbs down — decreases retrieval strength, does NOT delete), 'edit' (update content in-place, preserves FSRS state).".to_string()),
@@ -278,13 +267,13 @@ impl McpServer {
             },
             ToolDescription {
                 name: "codebase".to_string(),
-                description: Some("Project-specific engineering memory tool. Use remember_pattern to save reusable implementation patterns, remember_decision to save architecture decisions with rationale/alternatives/files, and get_context before coding in a named codebase. remember_* actions write durable memories; get_context is read-only. Returns created memory ids or relevant patterns and decisions.".to_string()),
+                description: Some("Unified codebase tool. Actions: 'remember_pattern' (store code pattern), 'remember_decision' (store architectural decision), 'get_context' (retrieve patterns and decisions).".to_string()),
                 input_schema: tools::codebase_unified::schema(),
                 ..Default::default()
             },
             ToolDescription {
                 name: "intention".to_string(),
-                description: Some("Prospective-memory task and reminder tool. Use set to create time/context/event reminders, check at session start or resume with current context, update to complete/snooze/cancel, and list to audit open loops. set/update write intention state; check/list are read-only. Returns triggered or filtered intentions with ids, status, priority, and deadlines.".to_string()),
+                description: Some("Unified intention management tool. Actions: 'set' (create), 'check' (find triggered), 'update' (complete/snooze/cancel), 'list' (show intentions).".to_string()),
                 input_schema: tools::intention_unified::schema(),
                 ..Default::default()
             },
@@ -307,195 +296,76 @@ impl McpServer {
                 ..Default::default()
             },
             // ================================================================
-            // TEMPORAL TOOLS (v1.2+)
+            // STATUS / TEMPORAL — unified `memory_status` tool (v2.2)
+            // Folds system_status + memory_health + memory_timeline +
+            // memory_changelog into one view-dispatched surface.
             // ================================================================
             ToolDescription {
-                name: "memory_timeline".to_string(),
-                description: Some("Browse memories chronologically. Returns memories in a time range, grouped by day. Defaults to last 7 days.".to_string()),
-                input_schema: tools::timeline::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "memory_changelog".to_string(),
-                description: Some("View audit trail of memory changes. Per-memory: state transitions. System-wide: consolidations + recent state changes.".to_string()),
-                input_schema: tools::changelog::schema(),
+                name: "memory_status".to_string(),
+                description: Some("Memory status & history. Views: 'health' (default — full system health + stats + FSRS preview + cognitive-module health + warnings + recommendations), 'retention' (lightweight retention dashboard: avg, distribution, trend), 'timeline' (browse memories chronologically, grouped by day), 'changelog' (audit trail of memory state changes — per-memory transitions or system-wide).".to_string()),
+                input_schema: tools::memory_status::schema(),
                 ..Default::default()
             },
             // ================================================================
-            // MAINTENANCE TOOLS (v1.7: system_status replaces health_check + stats)
+            // MAINTAIN — unified maintenance/lifecycle tool (v2.2)
+            // Folds consolidate + dream + gc + importance_score + backup +
+            // export + restore into one action-dispatched surface.
             // ================================================================
             ToolDescription {
-                name: "system_status".to_string(),
-                description: Some("Read-only diagnostics for the local Vestige memory database and cognitive modules. Use before release/support/debugging, after migrations, or when semantic search, retention, or embeddings look wrong; pass schema_introspection=true for SQLite schema, table, and embedding coverage details. Returns health status, counts, FSRS preview, warnings, and recommendations without changing data.".to_string()),
-                input_schema: tools::maintenance::system_status_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "consolidate".to_string(),
-                description: Some("Run FSRS-6 memory consolidation cycle. Applies decay, generates embeddings, and performs maintenance. Use when memories seem stale.".to_string()),
-                input_schema: tools::maintenance::consolidate_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "backup".to_string(),
-                description: Some("Create a local SQLite database backup before migrations, restores, exports, or risky maintenance. Takes no arguments; writes a timestamped .db file inside Vestige's backups directory using a consistent SQLite backup and does not change memories. Returns the backup path, file size, and success metadata. This is not a cloud backup.".to_string()),
-                input_schema: tools::maintenance::backup_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "export".to_string(),
-                description: Some("Export memory data to a local file for review, analysis, or transfer. Use json/jsonl for human-readable subsets with tags/since filters, or portable for exact Vestige-to-Vestige archive transfer. Writes only to Vestige's exports directory and does not modify memories. Returns output path, format, count, size, and filter metadata.".to_string()),
-                input_schema: tools::maintenance::export_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "gc".to_string(),
-                description: Some("Garbage collect stale memories below retention threshold. Defaults to dry_run=true for safety.".to_string()),
-                input_schema: tools::maintenance::gc_schema(),
+                name: "maintain".to_string(),
+                description: Some("Memory maintenance & lifecycle. Actions: 'consolidate' (run FSRS-6 decay/embedding cycle), 'dream' (replay memories → insights/connections + strengthen patterns), 'gc' (garbage-collect stale memories; dry_run=true by default for safety), 'importance_score' (4-channel neuroscience score for 'content'), 'backup' (SQLite DB backup), 'export' (memories as JSON/JSONL with tag/date filters), 'restore' (restore from a JSON backup at 'path').".to_string()),
+                input_schema: tools::maintain::schema(),
                 ..Default::default()
             },
             // ================================================================
-            // AUTO-SAVE & DEDUP TOOLS (v1.3+)
+            // DEDUP / MERGE / SUPERSEDE — unified `dedup` tool (v2.2)
+            // Folds find_duplicates + the 7 Phase-3 merge tools into one
+            // action-dispatched surface. Diff-previewed, confidence-gated,
+            // reversible, never silent; bitemporal-never-delete preserved.
             // ================================================================
             ToolDescription {
-                name: "importance_score".to_string(),
-                description: Some("Score content importance using 4-channel neuroscience model (novelty/arousal/reward/attention). Returns composite score, channel breakdown, encoding boost, and explanations.".to_string()),
-                input_schema: tools::importance::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "find_duplicates".to_string(),
-                description: Some("Find duplicate and near-duplicate memory clusters using cosine similarity on embeddings. Returns clusters with suggested actions (merge/review). Use to clean up redundant memories.".to_string()),
-                input_schema: tools::dedup::schema(),
-                ..Default::default()
-            },
-            // ================================================================
-            // MERGE / SUPERSEDE CONTROLS (v2.1.25 — Phase 3)
-            // Diff-previewed, confidence-gated, reversible, never silent.
-            // ================================================================
-            ToolDescription {
-                name: "merge_candidates".to_string(),
-                description: Some("Surface likely duplicate/overlapping memory clusters with confidence scores and the signals behind each (Fellegi-Sunter match/possible/non-match). Read-only — nothing is changed.".to_string()),
-                input_schema: tools::merge::merge_candidates_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "plan_merge".to_string(),
-                description: Some("Produce a previewable MERGE plan (a diff: combined content/tags/provenance) for 2+ memories WITHOUT applying it. Returns a plan_id for apply_plan. Protected members block the merge.".to_string()),
-                input_schema: tools::merge::plan_merge_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "plan_supersede".to_string(),
-                description: Some("Preview superseding memory A with B — bitemporal invalidation (stamps valid_until, keeps A queryable for audit) WITHOUT applying. Returns a plan_id for apply_plan.".to_string()),
-                input_schema: tools::merge::plan_supersede_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "apply_plan".to_string(),
-                description: Some("Execute a previously-generated merge/supersede plan by id. Recorded as a reversible operation. Old memories are invalidated (never deleted). 'possible'/'non_match' plans require confirm=true.".to_string()),
-                input_schema: tools::merge::apply_plan_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "merge_undo".to_string(),
-                description: Some("Reverse a prior merge/supersede operation (the 'git reflog for your agent's memory'). With no operation_id, lists the reversible operation log so you can pick one.".to_string()),
-                input_schema: tools::merge::merge_undo_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "protect".to_string(),
-                description: Some("Pin a memory so it can never be auto-merged, superseded, or garbage-collected. Pass protected=false to unpin.".to_string()),
-                input_schema: tools::merge::protect_schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "merge_policy".to_string(),
-                description: Some("Get or set the per-project merge policy: the two Fellegi-Sunter thresholds (match_threshold, possible_threshold) and auto_apply. No args returns the current policy.".to_string()),
-                input_schema: tools::merge::merge_policy_schema(),
+                name: "dedup".to_string(),
+                description: Some("Deduplication & merge/supersede. Actions: 'scan' (default — surface duplicate clusters via cosine + merge candidates via Fellegi-Sunter, read-only), 'plan_merge' (preview a reversible merge plan for 2+ member_ids → plan_id), 'plan_supersede' (preview superseding old_id with new_id → plan_id), 'apply' (execute a plan_id; 'possible'/'non_match' need confirm=true), 'undo' (reverse an operation_id, or omit to list the reflog), 'protect' (pin a memory against auto-merge/supersede/forget), 'policy' (get/set Fellegi-Sunter thresholds). Old memories are invalidated, never deleted.".to_string()),
+                input_schema: tools::dedup::unified_schema(),
                 ..Default::default()
             },
             // ================================================================
             // COGNITIVE TOOLS (v1.5+)
+            // (dream folded into `maintain` action='dream' in v2.2)
+            // ================================================================
+            // ================================================================
+            // GRAPH — unified graph/association/prediction tool (v2.2)
+            // Folds explore_connections + predict + memory_graph + composed_graph.
             // ================================================================
             ToolDescription {
-                name: "dream".to_string(),
-                description: Some("Memory-consolidation maintenance tool that replays recent and waking-tagged memories to discover latent connections, synthesize insights, and strengthen useful patterns. Use after enough new memories or when you want cross-topic links; use search/deep_reference for immediate retrieval instead. Persists dream history, insights, and connection records. Returns status, insights, connections, and run statistics.".to_string()),
-                input_schema: tools::dream::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "explore_connections".to_string(),
-                description: Some("Graph exploration tool for memory connections. Actions: 'chain' (build reasoning path between memories), 'associations' (find related memories via spreading activation + hippocampal index), 'bridges' (find connecting memories between two nodes).".to_string()),
-                input_schema: tools::explore::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "predict".to_string(),
-                description: Some("Proactive memory prediction — predicts what memories you'll need next based on context, recent activity, and learned patterns. Returns predictions, suggestions, and speculative retrievals.".to_string()),
-                input_schema: tools::predict::schema(),
+                name: "graph".to_string(),
+                description: Some("Memory graph & associations. Actions: 'chain' (reasoning path from→to), 'associations' (related memories via spreading activation, needs 'from'), 'bridges' (connectors between from/to), 'predict' (what memories you'll need next, from 'context'), 'memory_graph' (force-directed subgraph for viz, from center_id or query), 'recent'/'get'/'memory'/'neighbors'/'never_composed'/'bounty_mode' (composition topology), 'label' (record a composition outcome — the only write).".to_string()),
+                input_schema: tools::graph_unified::schema(),
                 ..Default::default()
             },
             // ================================================================
             // RESTORE TOOL (v1.5+)
+            // (folded into `maintain` action='restore' in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "restore".to_string(),
-                description: Some("Import memories from a trusted local JSON backup or portable export. Use for disaster recovery or Vestige-to-Vestige transfer after creating a backup; path is restricted to Vestige backups/exports unless allowAnyPath=true. Writes imported memories or portable rows, and merge=true keeps newer local rows on conflict. Returns imported counts, skipped rows, conflicts, and rejects raw SQLite backups.".to_string()),
-                input_schema: tools::restore::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // CONTEXT PACKETS (v1.8+)
             // ================================================================
             ToolDescription {
-                name: "session_context".to_string(),
-                description: Some("One-call session initialization. Combines search, intentions, status, predictions, and codebase context into a single token-budgeted response. Replaces 5 separate calls at session start.".to_string()),
+                name: "session_start".to_string(),
+                description: Some("One-call session initialization. Combines search, intentions, status, predictions, and codebase context into a single token-budgeted response. Call this once at the start of a session instead of 5 separate calls. (Renamed from 'session_context' in v2.2.)".to_string()),
                 input_schema: tools::session_context::schema(),
                 ..Default::default()
             },
             // ================================================================
             // AUTONOMIC TOOLS (v1.9+)
+            // (memory_health → `memory_status` view='retention';
+            //  memory_graph + composed_graph → `graph`, all in v2.2)
             // ================================================================
-            ToolDescription {
-                name: "memory_health".to_string(),
-                description: Some("Retention dashboard. Returns avg retention, retention distribution (buckets: 0-20%, 20-40%, etc.), trend (improving/declining/stable), and recommendation. Lightweight alternative to full system_status focused on memory quality.".to_string()),
-                input_schema: tools::health::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "memory_graph".to_string(),
-                description: Some("Subgraph export for visualization. Input: center_id or query, depth (1-3), max_nodes. Returns nodes with force-directed layout positions and edges with weights. Powers memory graph visualization.".to_string()),
-                input_schema: tools::graph::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "composed_graph".to_string(),
-                description: Some("Composition ledger for how memories have been combined into answers, investigations, and work lanes. Use recent/get/memory/neighbors to inspect prior compositions, never_composed/bounty_mode to find unexplored memory pairs, and label to record outcome quality. Most actions are read-only; label writes outcome metadata only. Returns composition events, members, neighbors, candidate lanes, or outcome records.".to_string()),
-                input_schema: tools::composed_graph::schema(),
-                ..Default::default()
-            },
             // ================================================================
-            // DEEP REFERENCE (v2.0.4+) — replaces cross_reference
+            // DEEP REFERENCE (v2.0.4+) — folded into `recall` (mode='reason' /
+            // 'contradictions') in v2.2. deep_reference/cross_reference/
+            // contradictions remain hidden dispatch aliases.
             // ================================================================
-            ToolDescription {
-                name: "deep_reference".to_string(),
-                description: Some("Deep cognitive reasoning across memories. Combines FSRS-6 trust scoring, spreading activation, temporal supersession, dream insights, and contradiction analysis to build a complete understanding of a topic. Returns trust-scored evidence, fact evolution timeline, and a recommended answer. Use this when accuracy matters.".to_string()),
-                input_schema: tools::cross_reference::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "cross_reference".to_string(),
-                description: Some("Backward-compatible alias for deep_reference. Use for high-accuracy reasoning across memories when simple search is not enough: fact checks, contradictions, timelines, stale decisions, and source-of-truth synthesis. Read-only retrieval and reasoning over memory state. Returns trust-scored evidence, temporal evolution, contradiction notes, and a recommended answer.".to_string()),
-                input_schema: tools::cross_reference::schema(),
-                ..Default::default()
-            },
-            ToolDescription {
-                name: "contradictions".to_string(),
-                description: Some("Inspect memory disagreements directly. Scans a topic or recent memories for trust-weighted contradiction pairs using the same local logic as deep_reference.".to_string()),
-                input_schema: tools::contradictions::schema(),
-                ..Default::default()
-            },
             // ================================================================
             // ACTIVE FORGETTING (v2.0.5) — top-down suppression
             // Anderson et al. 2025 Nat Rev Neurosci + Davis Rac1
@@ -508,7 +378,10 @@ impl McpServer {
             },
             // ================================================================
             // RETROACTIVE SALIENCE BACKFILL — Cai 2024 Nature
-            // "Memory with hindsight": failure -> backward causal reach
+            // "Memory with hindsight": failure -> backward causal reach.
+            // A flagship v2.2 capability, kept as its own advertised tool — it
+            // is a distinct cognitive primitive (backward causal promotion),
+            // not a maintenance op that folds into `maintain`.
             // ================================================================
             ToolDescription {
                 name: "backfill".to_string(),
@@ -528,10 +401,11 @@ impl McpServer {
         // chunk-read them.
         //
         // Per-tool caps below are sized at ~2× observed peak with growth
-        // headroom; max permitted by Anthropic is 500_000. Only the four
-        // empirically-measured high-payload tools carry the annotation today;
-        // the remaining 30 tools deliberately do NOT (cargo-cult prevention —
-        // annotating a small-payload tool dilutes the signal).
+        // headroom; max permitted by Anthropic is 500_000. Only the
+        // high-payload tools carry the annotation (recall, memory_status,
+        // memory, codebase, dedup, graph); the remaining advertised tools
+        // deliberately do NOT (cargo-cult prevention — annotating a
+        // small-payload tool dilutes the signal).
         //
         // Other tools that COULD plausibly grow into the annotated set with
         // future workload (`deep_reference`, `cross_reference`, `memory_graph`,
@@ -539,10 +413,17 @@ impl McpServer {
         // empirical measurement shows truncation under realistic use.
         for tool in tools.iter_mut() {
             let max_chars: Option<u64> = match tool.name.as_str() {
-                "search" => Some(300_000),
-                "memory_timeline" => Some(200_000),
+                // v2.2: search folded into recall (mode='lookup'); annotation moved.
+                "recall" => Some(300_000),
+                "memory_status" => Some(200_000),
                 "memory" => Some(100_000),
                 "codebase" => Some(100_000),
+                // v2.2: dedup action='scan' returns duplicate clusters +
+                // merge candidates + policy in one payload.
+                "dedup" => Some(150_000),
+                // v2.2: graph action='memory_graph' (force-directed layout) and
+                // 'bounty_mode' pagination can both produce large payloads.
+                "graph" => Some(250_000),
                 _ => None,
             };
             if let Some(n) = max_chars {
@@ -590,583 +471,655 @@ impl McpServer {
             None
         };
 
-        // ================================================================
-        // AGENT BLACK BOX (v2.2)
-        // Open/continue a run for this call and record the opening `mcp.call`
-        // event (args are hashed, never stored raw). Downstream memory events
-        // are recorded from the result after dispatch.
-        // ================================================================
-        let run_id = crate::trace_recorder::run_id_for(&request.arguments);
-        crate::trace_recorder::record_call(
-            &self.storage,
-            self.event_tx.as_ref(),
-            &run_id,
-            &request.name,
-            &request.arguments,
-        );
-
-        let pre_gated = crate::trace_recorder::gate_pending_memory_mutation(
-            &self.storage,
-            self.event_tx.as_ref(),
-            &run_id,
-            &request.name,
-            &request.arguments,
-            self.review_mode(),
-        );
-
-        let result = if let Some(content) =
-            pre_gated.map_err(|e| JsonRpcError::internal_error(&e))?
-        {
-            Ok(content)
-        } else {
-            match request.name.as_str() {
-                // ================================================================
-                // UNIFIED TOOLS (v1.1+) - Preferred API
-                // ================================================================
-                "search" => {
-                    tools::search_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        &self.output_config,
-                        request.arguments,
-                    )
+        let result = match request.name.as_str() {
+            // ================================================================
+            // UNIFIED TOOLS (v1.1+) - Preferred API
+            // ================================================================
+            // RECALL — unified retrieval tool (v2.2). HOT PATH.
+            // mode = lookup (default, zero-overhead) | reason | contradictions
+            "recall" => {
+                tools::recall::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            // DEPRECATED (v2.2): folded into `recall` (mode='lookup'). Hidden alias.
+            "search" => {
+                warn!("Tool 'search' is deprecated in v2.2. Use 'recall' (mode='lookup', the default).");
+                tools::search_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            "memory" => {
+                tools::memory_unified::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
-                }
-                "memory" => {
-                    tools::memory_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        request.arguments,
-                    )
+            }
+            "codebase" => {
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            "intention" => {
+                tools::intention_unified::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
-                }
-                "codebase" => {
-                    tools::codebase_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        &self.output_config,
-                        request.arguments,
-                    )
+            }
+
+            // ================================================================
+            // Core memory (v1.7: smart_ingest absorbs ingest + checkpoint)
+            // ================================================================
+            "smart_ingest" => {
+                tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
-                }
-                "intention" => {
-                    tools::intention_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        request.arguments,
-                    )
+            }
+
+            // ================================================================
+            // External-source connectors (#57)
+            // ================================================================
+            "source_sync" => tools::source_sync::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // Retroactive Salience Backfill (Cai 2024 Nature) — flagship v2.2
+            // ================================================================
+            "backfill" => tools::backfill::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // DEPRECATED (v1.7): ingest → smart_ingest
+            // ================================================================
+            "ingest" => {
+                warn!("Tool 'ingest' is deprecated in v1.7. Use 'smart_ingest' instead.");
+                tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
-                }
+            }
 
-                // ================================================================
-                // Core memory (v1.7: smart_ingest absorbs ingest + checkpoint)
-                // ================================================================
-                "smart_ingest" => {
-                    tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
-                        .await
-                }
+            // ================================================================
+            // DEPRECATED (v1.7): session_checkpoint → smart_ingest (batch mode)
+            // ================================================================
+            "session_checkpoint" => {
+                warn!(
+                    "Tool 'session_checkpoint' is deprecated in v1.7. Use 'smart_ingest' with 'items' parameter instead."
+                );
+                tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
+                    .await
+            }
 
-                // ================================================================
-                // External-source connectors (#57)
-                // ================================================================
-                "source_sync" => {
-                    tools::source_sync::execute(&self.storage, request.arguments).await
-                }
+            // ================================================================
+            // DEPRECATED (v1.7): promote_memory → memory(action='promote')
+            // ================================================================
+            "promote_memory" => {
+                warn!(
+                    "Tool 'promote_memory' is deprecated in v1.7. Use 'memory' with action='promote' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert("action".to_string(), serde_json::json!("promote"));
+                        }
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "promote"})),
+                };
+                tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args).await
+            }
+            "demote_memory" => {
+                warn!(
+                    "Tool 'demote_memory' is deprecated in v1.7. Use 'memory' with action='demote' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert("action".to_string(), serde_json::json!("demote"));
+                        }
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "demote"})),
+                };
+                tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args).await
+            }
 
-                // ================================================================
-                // DEPRECATED (v1.7): ingest → smart_ingest
-                // ================================================================
-                "ingest" => {
-                    warn!("Tool 'ingest' is deprecated in v1.7. Use 'smart_ingest' instead.");
-                    tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
-                        .await
-                }
+            // ================================================================
+            // DEPRECATED (v1.7): health_check, stats → system_status
+            // ================================================================
+            "health_check" => {
+                warn!("Tool 'health_check' is deprecated in v1.7. Use 'system_status' instead.");
+                tools::maintenance::execute_system_status(
+                    &self.storage,
+                    &self.cognitive,
+                    request.arguments,
+                )
+                .await
+            }
+            "stats" => {
+                warn!("Tool 'stats' is deprecated in v1.7. Use 'system_status' instead.");
+                tools::maintenance::execute_system_status(
+                    &self.storage,
+                    &self.cognitive,
+                    request.arguments,
+                )
+                .await
+            }
 
-                // ================================================================
-                // DEPRECATED (v1.7): session_checkpoint → smart_ingest (batch mode)
-                // ================================================================
-                "session_checkpoint" => {
-                    warn!(
-                        "Tool 'session_checkpoint' is deprecated in v1.7. Use 'smart_ingest' with 'items' parameter instead."
-                    );
-                    tools::smart_ingest::execute(&self.storage, &self.cognitive, request.arguments)
-                        .await
-                }
+            // ================================================================
+            // MEMORY STATUS — unified status/temporal tool (v2.2)
+            // view = health (default) | retention | timeline | changelog
+            // ================================================================
+            "memory_status" => {
+                tools::memory_status::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
 
-                // ================================================================
-                // DEPRECATED (v1.7): promote_memory → memory(action='promote')
-                // ================================================================
-                "promote_memory" => {
-                    warn!(
-                        "Tool 'promote_memory' is deprecated in v1.7. Use 'memory' with action='promote' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert("action".to_string(), serde_json::json!("promote"));
+            // DEPRECATED (v2.2): folded into `memory_status`. Hidden aliases —
+            // each calls the same underlying handler verbatim.
+            "system_status" => {
+                warn!("Tool 'system_status' is deprecated in v2.2. Use 'memory_status' (view='health').");
+                tools::maintenance::execute_system_status(
+                    &self.storage,
+                    &self.cognitive,
+                    request.arguments,
+                )
+                .await
+            }
+
+            "mark_reviewed" => tools::review::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // DEPRECATED: legacy search aliases — redirect to `recall` lookup.
+            // ('recall' itself is now the unified retrieval tool, handled above.)
+            // ================================================================
+            "semantic_search" | "hybrid_search" => {
+                warn!(
+                    "Tool '{}' is deprecated. Use 'recall' (mode='lookup') instead.",
+                    request.name
+                );
+                tools::search_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+
+            // ================================================================
+            // DEPRECATED: Memory tools - redirect to unified 'memory'
+            // ================================================================
+            "get_knowledge" => {
+                warn!(
+                    "Tool 'get_knowledge' is deprecated. Use 'memory' with action='get' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let id = args.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        Some(serde_json::json!({
+                            "action": "get",
+                            "id": id
+                        }))
+                    }
+                    None => None,
+                };
+                tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args).await
+            }
+            "delete_knowledge" => {
+                warn!(
+                    "Tool 'delete_knowledge' is deprecated. Use 'memory' with action='purge', confirm=true instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let id = args.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        let confirm = args
+                            .get("confirm")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Bool(false));
+                        Some(serde_json::json!({
+                            "action": "delete",
+                            "id": id,
+                            "confirm": confirm
+                        }))
+                    }
+                    None => None,
+                };
+                tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args).await
+            }
+            "get_memory_state" => {
+                warn!(
+                    "Tool 'get_memory_state' is deprecated. Use 'memory' with action='state' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let id = args
+                            .get("memory_id")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        Some(serde_json::json!({
+                            "action": "state",
+                            "id": id
+                        }))
+                    }
+                    None => None,
+                };
+                tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args).await
+            }
+
+            // ================================================================
+            // DEPRECATED: Codebase tools - redirect to unified 'codebase'
+            // ================================================================
+            "remember_pattern" => {
+                warn!(
+                    "Tool 'remember_pattern' is deprecated. Use 'codebase' with action='remember_pattern' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert("action".to_string(), serde_json::json!("remember_pattern"));
+                        }
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "remember_pattern"})),
+                };
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    unified_args,
+                )
+                .await
+            }
+            "remember_decision" => {
+                warn!(
+                    "Tool 'remember_decision' is deprecated. Use 'codebase' with action='remember_decision' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert(
+                                "action".to_string(),
+                                serde_json::json!("remember_decision"),
+                            );
+                        }
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "remember_decision"})),
+                };
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    unified_args,
+                )
+                .await
+            }
+            "get_codebase_context" => {
+                warn!(
+                    "Tool 'get_codebase_context' is deprecated. Use 'codebase' with action='get_context' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert("action".to_string(), serde_json::json!("get_context"));
+                        }
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "get_context"})),
+                };
+                tools::codebase_unified::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    unified_args,
+                )
+                .await
+            }
+
+            // ================================================================
+            // DEPRECATED: Intention tools - redirect to unified 'intention'
+            // ================================================================
+            "set_intention" => {
+                warn!(
+                    "Tool 'set_intention' is deprecated. Use 'intention' with action='set' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert("action".to_string(), serde_json::json!("set"));
+                        }
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "set"})),
+                };
+                tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
+                    .await
+            }
+            "check_intentions" => {
+                warn!(
+                    "Tool 'check_intentions' is deprecated. Use 'intention' with action='check' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert("action".to_string(), serde_json::json!("check"));
+                        }
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "check"})),
+                };
+                tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
+                    .await
+            }
+            "complete_intention" => {
+                warn!(
+                    "Tool 'complete_intention' is deprecated. Use 'intention' with action='update', status='complete' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let id = args
+                            .get("intentionId")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        Some(serde_json::json!({
+                            "action": "update",
+                            "id": id,
+                            "status": "complete"
+                        }))
+                    }
+                    None => None,
+                };
+                tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
+                    .await
+            }
+            "snooze_intention" => {
+                warn!(
+                    "Tool 'snooze_intention' is deprecated. Use 'intention' with action='update', status='snooze' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let id = args
+                            .get("intentionId")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let minutes = args
+                            .get("minutes")
+                            .cloned()
+                            .unwrap_or(serde_json::json!(30));
+                        Some(serde_json::json!({
+                            "action": "update",
+                            "id": id,
+                            "status": "snooze",
+                            "snooze_minutes": minutes
+                        }))
+                    }
+                    None => None,
+                };
+                tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
+                    .await
+            }
+            "list_intentions" => {
+                warn!(
+                    "Tool 'list_intentions' is deprecated. Use 'intention' with action='list' instead."
+                );
+                let unified_args = match request.arguments {
+                    Some(ref args) => {
+                        let mut new_args = args.clone();
+                        if let Some(obj) = new_args.as_object_mut() {
+                            obj.insert("action".to_string(), serde_json::json!("list"));
+                            if let Some(status) = obj.remove("status") {
+                                obj.insert("filter_status".to_string(), status);
                             }
-                            Some(new_args)
                         }
-                        None => Some(serde_json::json!({"action": "promote"})),
-                    };
-                    tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-                "demote_memory" => {
-                    warn!(
-                        "Tool 'demote_memory' is deprecated in v1.7. Use 'memory' with action='demote' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert("action".to_string(), serde_json::json!("demote"));
-                            }
-                            Some(new_args)
-                        }
-                        None => Some(serde_json::json!({"action": "demote"})),
-                    };
-                    tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-
-                // ================================================================
-                // DEPRECATED (v1.7): health_check, stats → system_status
-                // ================================================================
-                "health_check" => {
-                    warn!(
-                        "Tool 'health_check' is deprecated in v1.7. Use 'system_status' instead."
-                    );
-                    tools::maintenance::execute_system_status(
-                        &self.storage,
-                        &self.cognitive,
-                        request.arguments,
-                    )
+                        Some(new_args)
+                    }
+                    None => Some(serde_json::json!({"action": "list"})),
+                };
+                tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
                     .await
-                }
-                "stats" => {
-                    warn!("Tool 'stats' is deprecated in v1.7. Use 'system_status' instead.");
-                    tools::maintenance::execute_system_status(
-                        &self.storage,
-                        &self.cognitive,
-                        request.arguments,
-                    )
+            }
+
+            // ================================================================
+            // Neuroscience tools (internal, not in tools/list)
+            // ================================================================
+            "list_by_state" => {
+                tools::memory_states::execute_list(&self.storage, request.arguments).await
+            }
+            "state_stats" => tools::memory_states::execute_stats(&self.storage).await,
+            "trigger_importance" => {
+                tools::tagging::execute_trigger(&self.storage, request.arguments).await
+            }
+            "find_tagged" => tools::tagging::execute_find(&self.storage, request.arguments).await,
+            "tagging_stats" => tools::tagging::execute_stats(&self.storage).await,
+            "match_context" => tools::context::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // Feedback (internal, still used by request_feedback)
+            // ================================================================
+            "request_feedback" => {
+                tools::feedback::execute_request_feedback(&self.storage, request.arguments).await
+            }
+
+            // ================================================================
+            // TEMPORAL TOOLS (v1.2+) — DEPRECATED (v2.2): folded into
+            // `memory_status` (view='timeline' / view='changelog'). Hidden aliases.
+            // ================================================================
+            "memory_timeline" => {
+                warn!("Tool 'memory_timeline' is deprecated in v2.2. Use 'memory_status' (view='timeline').");
+                tools::timeline::execute(&self.storage, &self.output_config, request.arguments)
                     .await
-                }
+            }
+            "memory_changelog" => {
+                warn!("Tool 'memory_changelog' is deprecated in v2.2. Use 'memory_status' (view='changelog').");
+                tools::changelog::execute(&self.storage, request.arguments).await
+            }
 
-                // ================================================================
-                // SYSTEM STATUS (v1.7: replaces health_check + stats)
-                // ================================================================
-                "system_status" => {
-                    tools::maintenance::execute_system_status(
-                        &self.storage,
-                        &self.cognitive,
-                        request.arguments,
-                    )
-                    .await
-                }
-
-                "mark_reviewed" => tools::review::execute(&self.storage, request.arguments).await,
-
-                // ================================================================
-                // DEPRECATED: Search tools - redirect to unified 'search'
-                // ================================================================
-                "recall" | "semantic_search" | "hybrid_search" => {
-                    warn!(
-                        "Tool '{}' is deprecated. Use 'search' instead.",
-                        request.name
-                    );
-                    tools::search_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        &self.output_config,
-                        request.arguments,
-                    )
-                    .await
-                }
-
-                // ================================================================
-                // DEPRECATED: Memory tools - redirect to unified 'memory'
-                // ================================================================
-                "get_knowledge" => {
-                    warn!(
-                        "Tool 'get_knowledge' is deprecated. Use 'memory' with action='get' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let id = args.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                            Some(serde_json::json!({
-                                "action": "get",
-                                "id": id
-                            }))
-                        }
-                        None => None,
-                    };
-                    tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-                "delete_knowledge" => {
-                    warn!(
-                        "Tool 'delete_knowledge' is deprecated. Use 'memory' with action='purge', confirm=true instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let id = args.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                            let confirm = args
-                                .get("confirm")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Bool(false));
-                            Some(serde_json::json!({
-                                "action": "delete",
-                                "id": id,
-                                "confirm": confirm
-                            }))
-                        }
-                        None => None,
-                    };
-                    tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-                "get_memory_state" => {
-                    warn!(
-                        "Tool 'get_memory_state' is deprecated. Use 'memory' with action='state' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let id = args
-                                .get("memory_id")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            Some(serde_json::json!({
-                                "action": "state",
-                                "id": id
-                            }))
-                        }
-                        None => None,
-                    };
-                    tools::memory_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-
-                // ================================================================
-                // DEPRECATED: Codebase tools - redirect to unified 'codebase'
-                // ================================================================
-                "remember_pattern" => {
-                    warn!(
-                        "Tool 'remember_pattern' is deprecated. Use 'codebase' with action='remember_pattern' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert(
-                                    "action".to_string(),
-                                    serde_json::json!("remember_pattern"),
-                                );
-                            }
-                            Some(new_args)
-                        }
-                        None => Some(serde_json::json!({"action": "remember_pattern"})),
-                    };
-                    tools::codebase_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        &self.output_config,
-                        unified_args,
-                    )
-                    .await
-                }
-                "remember_decision" => {
-                    warn!(
-                        "Tool 'remember_decision' is deprecated. Use 'codebase' with action='remember_decision' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert(
-                                    "action".to_string(),
-                                    serde_json::json!("remember_decision"),
-                                );
-                            }
-                            Some(new_args)
-                        }
-                        None => Some(serde_json::json!({"action": "remember_decision"})),
-                    };
-                    tools::codebase_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        &self.output_config,
-                        unified_args,
-                    )
-                    .await
-                }
-                "get_codebase_context" => {
-                    warn!(
-                        "Tool 'get_codebase_context' is deprecated. Use 'codebase' with action='get_context' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert("action".to_string(), serde_json::json!("get_context"));
-                            }
-                            Some(new_args)
-                        }
-                        None => Some(serde_json::json!({"action": "get_context"})),
-                    };
-                    tools::codebase_unified::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        &self.output_config,
-                        unified_args,
-                    )
-                    .await
-                }
-
-                // ================================================================
-                // DEPRECATED: Intention tools - redirect to unified 'intention'
-                // ================================================================
-                "set_intention" => {
-                    warn!(
-                        "Tool 'set_intention' is deprecated. Use 'intention' with action='set' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert("action".to_string(), serde_json::json!("set"));
-                            }
-                            Some(new_args)
-                        }
-                        None => Some(serde_json::json!({"action": "set"})),
-                    };
-                    tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-                "check_intentions" => {
-                    warn!(
-                        "Tool 'check_intentions' is deprecated. Use 'intention' with action='check' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert("action".to_string(), serde_json::json!("check"));
-                            }
-                            Some(new_args)
-                        }
-                        None => Some(serde_json::json!({"action": "check"})),
-                    };
-                    tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-                "complete_intention" => {
-                    warn!(
-                        "Tool 'complete_intention' is deprecated. Use 'intention' with action='update', status='complete' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let id = args
-                                .get("intentionId")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            Some(serde_json::json!({
-                                "action": "update",
-                                "id": id,
-                                "status": "complete"
-                            }))
-                        }
-                        None => None,
-                    };
-                    tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-                "snooze_intention" => {
-                    warn!(
-                        "Tool 'snooze_intention' is deprecated. Use 'intention' with action='update', status='snooze' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let id = args
-                                .get("intentionId")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            let minutes = args
-                                .get("minutes")
-                                .cloned()
-                                .unwrap_or(serde_json::json!(30));
-                            Some(serde_json::json!({
-                                "action": "update",
-                                "id": id,
-                                "status": "snooze",
-                                "snooze_minutes": minutes
-                            }))
-                        }
-                        None => None,
-                    };
-                    tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-                "list_intentions" => {
-                    warn!(
-                        "Tool 'list_intentions' is deprecated. Use 'intention' with action='list' instead."
-                    );
-                    let unified_args = match request.arguments {
-                        Some(ref args) => {
-                            let mut new_args = args.clone();
-                            if let Some(obj) = new_args.as_object_mut() {
-                                obj.insert("action".to_string(), serde_json::json!("list"));
-                                if let Some(status) = obj.remove("status") {
-                                    obj.insert("filter_status".to_string(), status);
-                                }
-                            }
-                            Some(new_args)
-                        }
-                        None => Some(serde_json::json!({"action": "list"})),
-                    };
-                    tools::intention_unified::execute(&self.storage, &self.cognitive, unified_args)
-                        .await
-                }
-
-                // ================================================================
-                // Neuroscience tools (internal, not in tools/list)
-                // ================================================================
-                "list_by_state" => {
-                    tools::memory_states::execute_list(&self.storage, request.arguments).await
-                }
-                "state_stats" => tools::memory_states::execute_stats(&self.storage).await,
-                "trigger_importance" => {
-                    tools::tagging::execute_trigger(&self.storage, request.arguments).await
-                }
-                "find_tagged" => {
-                    tools::tagging::execute_find(&self.storage, request.arguments).await
-                }
-                "tagging_stats" => tools::tagging::execute_stats(&self.storage).await,
-                "match_context" => tools::context::execute(&self.storage, request.arguments).await,
-
-                // ================================================================
-                // Feedback (internal, still used by request_feedback)
-                // ================================================================
-                "request_feedback" => {
-                    tools::feedback::execute_request_feedback(&self.storage, request.arguments)
-                        .await
-                }
-
-                // ================================================================
-                // TEMPORAL TOOLS (v1.2+)
-                // ================================================================
-                "memory_timeline" => {
-                    tools::timeline::execute(&self.storage, &self.output_config, request.arguments)
-                        .await
-                }
-                "memory_changelog" => {
-                    tools::changelog::execute(&self.storage, request.arguments).await
-                }
-
-                // ================================================================
-                // MAINTENANCE TOOLS (v1.2+, non-deprecated)
-                // ================================================================
-                "consolidate" => {
-                    self.emit(VestigeEvent::ConsolidationStarted {
+            // ================================================================
+            // MAINTAIN — unified maintenance/lifecycle tool (v2.2)
+            // action = consolidate | dream | gc | importance_score | backup
+            //        | export | restore
+            // ================================================================
+            "maintain" => {
+                // Mirror the pre-dispatch *Started* events that the standalone
+                // consolidate/dream arms emit, keyed off the action.
+                match request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("action"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some("consolidate") => self.emit(VestigeEvent::ConsolidationStarted {
                         timestamp: chrono::Utc::now(),
-                    });
-                    tools::maintenance::execute_consolidate(&self.storage, request.arguments).await
-                }
-                "backup" => {
-                    tools::maintenance::execute_backup(&self.storage, request.arguments).await
-                }
-                "export" => {
-                    tools::maintenance::execute_export(&self.storage, request.arguments).await
-                }
-                "gc" => tools::maintenance::execute_gc(&self.storage, request.arguments).await,
-
-                // ================================================================
-                // AUTO-SAVE & DEDUP TOOLS (v1.3+)
-                // ================================================================
-                "importance_score" => {
-                    tools::importance::execute(&self.storage, &self.cognitive, request.arguments)
-                        .await
-                }
-                "find_duplicates" => tools::dedup::execute(&self.storage, request.arguments).await,
-
-                // ================================================================
-                // MERGE / SUPERSEDE CONTROLS (v2.1.25 — Phase 3)
-                // ================================================================
-                "merge_candidates" | "plan_merge" | "plan_supersede" | "apply_plan"
-                | "merge_undo" | "protect" | "merge_policy" => {
-                    tools::merge::execute(&self.storage, request.name.as_str(), request.arguments)
-                        .await
-                }
-
-                // ================================================================
-                // COGNITIVE TOOLS (v1.5+)
-                // ================================================================
-                "dream" => {
-                    self.emit(VestigeEvent::DreamStarted {
+                    }),
+                    Some("dream") => self.emit(VestigeEvent::DreamStarted {
                         memory_count: self
                             .storage
                             .get_stats()
                             .map(|s| s.total_nodes as usize)
                             .unwrap_or(0),
                         timestamp: chrono::Utc::now(),
-                    });
-                    tools::dream::execute(&self.storage, &self.cognitive, request.arguments).await
+                    }),
+                    _ => {}
                 }
-                "explore_connections" => {
-                    tools::explore::execute(&self.storage, &self.cognitive, request.arguments).await
-                }
-                "predict" => {
-                    tools::predict::execute(&self.storage, &self.cognitive, request.arguments).await
-                }
-                "restore" => tools::restore::execute(&self.storage, request.arguments).await,
+                tools::maintain::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
 
-                // ================================================================
-                // CONTEXT PACKETS (v1.8+)
-                // ================================================================
-                "session_context" => {
-                    tools::session_context::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        &self.output_config,
-                        request.arguments,
-                    )
+            // ================================================================
+            // MAINTENANCE TOOLS (v1.2+) — DEPRECATED (v2.2): folded into
+            // `maintain`. Hidden aliases; pre-emit Started events preserved.
+            // ================================================================
+            "consolidate" => {
+                warn!("Tool 'consolidate' is deprecated in v2.2. Use 'maintain' (action='consolidate').");
+                self.emit(VestigeEvent::ConsolidationStarted {
+                    timestamp: chrono::Utc::now(),
+                });
+                tools::maintenance::execute_consolidate(&self.storage, request.arguments).await
+            }
+            "backup" => {
+                warn!("Tool 'backup' is deprecated in v2.2. Use 'maintain' (action='backup').");
+                tools::maintenance::execute_backup(&self.storage, request.arguments).await
+            }
+            "export" => {
+                warn!("Tool 'export' is deprecated in v2.2. Use 'maintain' (action='export').");
+                tools::maintenance::execute_export(&self.storage, request.arguments).await
+            }
+            "gc" => {
+                warn!("Tool 'gc' is deprecated in v2.2. Use 'maintain' (action='gc').");
+                tools::maintenance::execute_gc(&self.storage, request.arguments).await
+            }
+
+            // ================================================================
+            // AUTO-SAVE & DEDUP TOOLS (v1.3+)
+            // ================================================================
+            // DEPRECATED (v2.2): folded into `maintain` (action='importance_score').
+            "importance_score" => {
+                warn!("Tool 'importance_score' is deprecated in v2.2. Use 'maintain' (action='importance_score').");
+                tools::importance::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
+            // ================================================================
+            // DEDUP / MERGE / SUPERSEDE — unified `dedup` tool (v2.2)
+            // ================================================================
+            "dedup" => tools::dedup::execute_unified(&self.storage, request.arguments).await,
+
+            // DEPRECATED (v2.2): folded into `dedup`. Kept as hidden back-compat
+            // aliases (≥1 minor release) — they call the same underlying handlers
+            // verbatim, so envelopes/plan_id/confirm-gating/bitemporal are intact.
+            "find_duplicates" => {
+                warn!("Tool 'find_duplicates' is deprecated in v2.2. Use 'dedup' with action='scan'.");
+                tools::dedup::execute(&self.storage, request.arguments).await
+            }
+            "merge_candidates" | "plan_merge" | "plan_supersede" | "apply_plan" | "merge_undo"
+            | "protect" | "merge_policy" => {
+                warn!(
+                    "Tool '{}' is deprecated in v2.2. Use 'dedup' (action={}).",
+                    request.name,
+                    match request.name.as_str() {
+                        "merge_candidates" => "scan",
+                        "apply_plan" => "apply",
+                        "merge_undo" => "undo",
+                        "merge_policy" => "policy",
+                        other => other,
+                    }
+                );
+                tools::merge::execute(&self.storage, request.name.as_str(), request.arguments).await
+            }
+
+            // ================================================================
+            // COGNITIVE TOOLS (v1.5+) — DEPRECATED (v2.2): dream folded into
+            // `maintain` (action='dream'). Hidden alias; DreamStarted preserved.
+            // ================================================================
+            "dream" => {
+                warn!("Tool 'dream' is deprecated in v2.2. Use 'maintain' (action='dream').");
+                self.emit(VestigeEvent::DreamStarted {
+                    memory_count: self
+                        .storage
+                        .get_stats()
+                        .map(|s| s.total_nodes as usize)
+                        .unwrap_or(0),
+                    timestamp: chrono::Utc::now(),
+                });
+                tools::dream::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
+            // ================================================================
+            // GRAPH — unified graph/association/prediction tool (v2.2)
+            // ================================================================
+            "graph" => {
+                tools::graph_unified::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
-                }
+            }
+            // DEPRECATED (v2.2): folded into `graph`. Hidden aliases.
+            "explore_connections" => {
+                warn!("Tool 'explore_connections' is deprecated in v2.2. Use 'graph' (action='chain'|'associations'|'bridges').");
+                tools::explore::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
+            "predict" => {
+                warn!("Tool 'predict' is deprecated in v2.2. Use 'graph' (action='predict').");
+                tools::predict::execute(&self.storage, &self.cognitive, request.arguments).await
+            }
+            // DEPRECATED (v2.2): folded into `maintain` (action='restore').
+            "restore" => {
+                warn!("Tool 'restore' is deprecated in v2.2. Use 'maintain' (action='restore').");
+                tools::restore::execute(&self.storage, request.arguments).await
+            }
 
-                // ================================================================
-                // AUTONOMIC TOOLS (v1.9+)
-                // ================================================================
-                "memory_health" => tools::health::execute(&self.storage, request.arguments).await,
-                "memory_graph" => tools::graph::execute(&self.storage, request.arguments).await,
-                "composed_graph" => {
-                    tools::composed_graph::execute(&self.storage, request.arguments).await
-                }
-                "deep_reference" | "cross_reference" => {
-                    tools::cross_reference::execute(
-                        &self.storage,
-                        &self.cognitive,
-                        request.arguments,
-                    )
+            // ================================================================
+            // CONTEXT PACKETS (v1.8+) — `session_start` (renamed v2.2)
+            // ================================================================
+            "session_start" => {
+                tools::session_context::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+            // DEPRECATED (v2.2): renamed to `session_start`. Hidden alias.
+            "session_context" => {
+                warn!("Tool 'session_context' is deprecated in v2.2. Use 'session_start'.");
+                tools::session_context::execute(
+                    &self.storage,
+                    &self.cognitive,
+                    &self.output_config,
+                    request.arguments,
+                )
+                .await
+            }
+
+            // ================================================================
+            // AUTONOMIC TOOLS (v1.9+)
+            // ================================================================
+            // DEPRECATED (v2.2): folded into `memory_status` (view='retention').
+            "memory_health" => {
+                warn!("Tool 'memory_health' is deprecated in v2.2. Use 'memory_status' (view='retention').");
+                tools::health::execute(&self.storage, request.arguments).await
+            }
+            // DEPRECATED (v2.2): folded into `graph`. Hidden aliases.
+            "memory_graph" => {
+                warn!("Tool 'memory_graph' is deprecated in v2.2. Use 'graph' (action='memory_graph').");
+                tools::graph::execute(&self.storage, request.arguments).await
+            }
+            "composed_graph" => {
+                warn!("Tool 'composed_graph' is deprecated in v2.2. Use 'graph' (action='recent'|'get'|'memory'|'neighbors'|'never_composed'|'bounty_mode'|'label').");
+                tools::composed_graph::execute(&self.storage, request.arguments).await
+            }
+            // DEPRECATED (v2.2): folded into `recall`. Hidden aliases.
+            "deep_reference" | "cross_reference" => {
+                warn!("Tool '{}' is deprecated in v2.2. Use 'recall' (mode='reason').", request.name);
+                tools::cross_reference::execute(&self.storage, &self.cognitive, request.arguments)
                     .await
-                }
-                "contradictions" => {
-                    tools::contradictions::execute(&self.storage, request.arguments).await
-                }
+            }
+            "contradictions" => {
+                warn!("Tool 'contradictions' is deprecated in v2.2. Use 'recall' (mode='contradictions').");
+                tools::contradictions::execute(&self.storage, request.arguments).await
+            }
 
-                // ================================================================
-                // ACTIVE FORGETTING (v2.0.5) — top-down suppression
-                // ================================================================
-                "suppress" => tools::suppress::execute(&self.storage, request.arguments).await,
-                "backfill" => tools::backfill::execute(&self.storage, request.arguments).await,
+            // ================================================================
+            // ACTIVE FORGETTING (v2.0.5) — top-down suppression
+            // ================================================================
+            "suppress" => tools::suppress::execute(&self.storage, request.arguments).await,
 
-                name => {
-                    return Err(JsonRpcError::invalid_params(&format!(
-                        "Unknown tool: {}",
-                        name
-                    )));
-                }
+            name => {
+                return Err(JsonRpcError::invalid_params(&format!(
+                    "Unknown tool: {}",
+                    name
+                )));
             }
         };
 
@@ -1176,82 +1129,10 @@ impl McpServer {
         // ================================================================
         if let Ok(ref content) = result {
             self.emit_tool_event(&request.name, &saved_args, content);
-            // Black Box: record the downstream memory events (retrieve /
-            // suppress / write / veto / dream) the agent experienced.
-            crate::trace_recorder::record_result(
-                &self.storage,
-                self.event_tx.as_ref(),
-                &run_id,
-                &request.name,
-                content,
-            );
         }
 
-        // ================================================================
-        // RISK-GATED MEMORY PRs (v2.2) — quarantine review, the cognitive
-        // immune system. Normal writes auto-land. Risky writes (contradiction
-        // vs high-trust, supersede/forget/merge, sensitive topics, …) are
-        // *committed then quarantined*: the row is recorded (audit history
-        // preserved) but suppressed out of retrieval until a Memory PR is
-        // decided. This is quarantine review, NOT pre-write blocking — the
-        // write happens inside the tool before the gate sees it; we hold its
-        // influence, not its existence. Centralized here so tools stay
-        // untouched.
-        // ================================================================
-        let opened_prs = if let Ok(ref content) = result {
-            crate::trace_recorder::gate_writes(
-                &self.storage,
-                self.event_tx.as_ref(),
-                &run_id,
-                &request.name,
-                content,
-                self.review_mode(),
-            )
-        } else {
-            Vec::new()
-        };
-
         let response = match result {
-            Ok(mut content) => {
-                // ============================================================
-                // TRACE SPINE (Phase 0)
-                // Stamp the runId + a pointer to the full trace onto the tool
-                // output itself. This is the first hop of the correlation
-                // chain: the same runId now appears in the tool result, the
-                // SQLite trace rows, the WebSocket events, /api/traces/{runId},
-                // and vestige://trace/{runId}. One id, end to end.
-                // ============================================================
-                // Memory Receipt: for retrieval tools, build + persist a
-                // receipt from what the tool already computed and attach it.
-                // Done before the runId stamp so the receipt's own suppressed
-                // list is part of the same payload the agent reads.
-                let receipt = crate::trace_recorder::build_and_save_receipt(
-                    &self.storage,
-                    &run_id,
-                    &request.name,
-                    &content,
-                );
-                if let Some(obj) = content.as_object_mut() {
-                    obj.insert("runId".to_string(), serde_json::json!(run_id));
-                    obj.insert(
-                        "traceUri".to_string(),
-                        serde_json::json!(format!("vestige://trace/{run_id}")),
-                    );
-                    if let Some(r) = receipt {
-                        obj.insert("receipt".to_string(), r);
-                    }
-                    // Surface opened Memory PRs so the agent learns its risky
-                    // write is held for review, not silently committed.
-                    if !opened_prs.is_empty() {
-                        obj.insert("memoryPrsOpened".to_string(), serde_json::json!(opened_prs));
-                        obj.insert(
-                            "memoryPrNotice".to_string(),
-                            serde_json::json!(
-                                "Vestige opened a Memory PR (quarantine review): this write was recorded but is held out of retrieval until reviewed — its audit history is preserved while its influence is suspended. See the Memory PRs queue."
-                            ),
-                        );
-                    }
-                }
+            Ok(content) => {
                 let call_result = CallToolResult {
                     content: vec![crate::protocol::messages::ToolResultContent {
                         content_type: "text".to_string(),
@@ -1393,27 +1274,6 @@ impl McpServer {
                 description: Some("Intentions that have been triggered or are overdue".to_string()),
                 mime_type: Some("application/json".to_string()),
             },
-            // Agent Black Box (v2.2) — replayable agent-run traces. Individual
-            // runs are read via the templated `vestige://trace/{runId}` (or
-            // `trace://{runId}`) URI; these concrete entries list the runs and
-            // the latest trace so a client can discover them.
-            ResourceDescription {
-                uri: "trace://runs".to_string(),
-                name: "Agent Runs (Black Box)".to_string(),
-                description: Some(
-                    "Recent agent runs. Read vestige://trace/{runId} for a full replayable trace."
-                        .to_string(),
-                ),
-                mime_type: Some("application/json".to_string()),
-            },
-            ResourceDescription {
-                uri: "trace://latest".to_string(),
-                name: "Latest Agent Trace".to_string(),
-                description: Some(
-                    "The most recently active agent run's full black-box trace.".to_string(),
-                ),
-                mime_type: Some("application/json".to_string()),
-            },
         ];
 
         let result = ListResourcesResult { resources };
@@ -1436,17 +1296,7 @@ impl McpServer {
         // OpenCode and other MCP clients may send "vestige/memory://recent"
         // but we register resources as "memory://recent"
         let normalized_uri = uri.strip_prefix("vestige/").unwrap_or(uri);
-        // The trace resource is specced as `vestige://trace/{runId}`. Accept
-        // both that form and the bare `trace://{runId}` scheme, normalizing the
-        // former to the latter so the resource module sees one shape.
-        let trace_uri = normalized_uri
-            .strip_prefix("vestige://trace/")
-            .map(|rest| format!("trace://{rest}"));
-        let content = if let Some(ref tu) = trace_uri {
-            resources::trace::read(&self.storage, tu).await
-        } else if normalized_uri.starts_with("trace://") {
-            resources::trace::read(&self.storage, normalized_uri).await
-        } else if normalized_uri.starts_with("memory://") {
+        let content = if normalized_uri.starts_with("memory://") {
             resources::memory::read(&self.storage, normalized_uri).await
         } else if normalized_uri.starts_with("codebase://") {
             resources::codebase::read(&self.storage, normalized_uri).await
@@ -1490,6 +1340,31 @@ impl McpServer {
             return;
         }
         let now = Utc::now();
+
+        // v2.2: the unified `maintain` tool folds consolidate/dream/importance_score
+        // (the three maintenance actions that emit). Normalize its name to the
+        // effective action so the existing emit arms below fire unchanged. Old
+        // standalone names still arrive verbatim and match directly.
+        let tool_name = if tool_name == "maintain" {
+            args.as_ref()
+                .and_then(|a| a.get("action"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("maintain")
+        } else if tool_name == "recall" {
+            // The unified `recall` tool fires SearchPerformed only for the lookup
+            // path (the former `search`). reason/contradictions do not emit, so
+            // map them to a non-emitting name.
+            match args
+                .as_ref()
+                .and_then(|a| a.get("mode"))
+                .and_then(|v| v.as_str())
+            {
+                Some("reason") | Some("contradictions") => "recall_noemit",
+                _ => "search", // lookup (default) → SearchPerformed
+            }
+        } else {
+            tool_name
+        };
 
         match tool_name {
             // -- smart_ingest: memory created/updated --
@@ -2016,18 +1891,29 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // 35 tools: the unified memory surface, Phase 3 merge/supersede controls,
-        // ComposedGraph, the #57 source_sync connector, and `backfill`
-        // (Retroactive Salience Backfill — Cai 2024 Nature).
-        assert_eq!(tools.len(), 35, "Expected exactly 35 tools");
+        // v2.2 Tool Consolidation (Layer 1): 34 → 27 after `dedup` folds
+        // find_duplicates + the 7 Phase-3 merge tools (8 → 1). Old names remain
+        // dispatchable as hidden back-compat aliases but drop off the advertised list.
+        assert_eq!(
+            tools.len(),
+            13,
+            "Expected exactly 13 tools after v2.2 Layer-1 consolidation \
+             (12 consolidated: dedup + memory_status + graph + maintain + recall; \
+             session_context renamed) plus the flagship `backfill` (Retroactive \
+             Salience, Cai 2024 Nature), a distinct cognitive primitive"
+        );
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
         // Unified tools
-        assert!(tool_names.contains(&"search"));
+        // (search folded into `recall` mode='lookup' in v2.2)
+        assert!(tool_names.contains(&"recall"));
         assert!(tool_names.contains(&"memory"));
         assert!(tool_names.contains(&"codebase"));
         assert!(tool_names.contains(&"intention"));
+
+        // Flagship retroactive-salience backfill stays advertised (not folded).
+        assert!(tool_names.contains(&"backfill"));
 
         // Core memory (smart_ingest absorbs ingest + checkpoint in v1.7)
         assert!(tool_names.contains(&"smart_ingest"));
@@ -2053,12 +1939,21 @@ mod tests {
             "demote_memory should be removed in v1.7"
         );
 
-        // Temporal tools (v1.2)
-        assert!(tool_names.contains(&"memory_timeline"));
-        assert!(tool_names.contains(&"memory_changelog"));
-
-        // Maintenance tools (v1.7: system_status replaces health_check + stats)
-        assert!(tool_names.contains(&"system_status"));
+        // Status / temporal — unified `memory_status` tool (v2.2).
+        // system_status + memory_health + memory_timeline + memory_changelog
+        // folded in; old names dispatch as hidden aliases but are off the list.
+        assert!(tool_names.contains(&"memory_status"));
+        for old in [
+            "system_status",
+            "memory_health",
+            "memory_timeline",
+            "memory_changelog",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'memory_status' in v2.2"
+            );
+        }
         assert!(
             !tool_names.contains(&"health_check"),
             "health_check should be removed in v1.7"
@@ -2067,48 +1962,331 @@ mod tests {
             !tool_names.contains(&"stats"),
             "stats should be removed in v1.7"
         );
-        assert!(tool_names.contains(&"consolidate"));
-        assert!(tool_names.contains(&"backup"));
-        assert!(tool_names.contains(&"export"));
-        assert!(tool_names.contains(&"gc"));
+        // Maintenance / lifecycle — unified `maintain` tool (v2.2).
+        // consolidate + dream + gc + importance_score + backup + export + restore
+        // folded in; old names dispatch as hidden aliases but are off the list.
+        assert!(tool_names.contains(&"maintain"));
+        for old in [
+            "consolidate",
+            "dream",
+            "gc",
+            "importance_score",
+            "backup",
+            "export",
+            "restore",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'maintain' in v2.2"
+            );
+        }
 
-        // Auto-save & dedup tools (v1.3)
-        assert!(tool_names.contains(&"importance_score"));
-        assert!(tool_names.contains(&"find_duplicates"));
+        // Dedup / merge / supersede — unified `dedup` tool (v2.2).
+        // find_duplicates + the 7 Phase-3 merge tools folded in; still
+        // dispatchable as hidden back-compat aliases, but off the advertised list.
+        assert!(tool_names.contains(&"dedup"));
+        for old in [
+            "find_duplicates",
+            "merge_candidates",
+            "plan_merge",
+            "plan_supersede",
+            "apply_plan",
+            "merge_undo",
+            "protect",
+            "merge_policy",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'dedup' in v2.2"
+            );
+        }
 
-        // Merge / Supersede controls (v2.1.25 — Phase 3)
-        assert!(tool_names.contains(&"merge_candidates"));
-        assert!(tool_names.contains(&"plan_merge"));
-        assert!(tool_names.contains(&"plan_supersede"));
-        assert!(tool_names.contains(&"apply_plan"));
-        assert!(tool_names.contains(&"merge_undo"));
-        assert!(tool_names.contains(&"protect"));
-        assert!(tool_names.contains(&"merge_policy"));
+        // Cognitive tools (v1.5): explore_connections + predict → `graph`;
+        // dream + restore → `maintain` (all v2.2). Nothing left advertised here.
 
-        // Cognitive tools (v1.5)
-        assert!(tool_names.contains(&"dream"));
-        assert!(tool_names.contains(&"explore_connections"));
-        assert!(tool_names.contains(&"predict"));
-        assert!(tool_names.contains(&"restore"));
+        // Context packets (v1.8) — renamed session_context → session_start (v2.2)
+        assert!(tool_names.contains(&"session_start"));
+        assert!(
+            !tool_names.contains(&"session_context"),
+            "session_context renamed to 'session_start' in v2.2"
+        );
 
-        // Context packets (v1.8)
-        assert!(tool_names.contains(&"session_context"));
+        // Graph — unified `graph` tool (v2.2). explore_connections + predict +
+        // memory_graph + composed_graph folded in; old names dispatch as hidden
+        // aliases but are off the advertised list. (memory_health → memory_status.)
+        assert!(tool_names.contains(&"graph"));
+        for old in [
+            "explore_connections",
+            "predict",
+            "memory_graph",
+            "composed_graph",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'graph' in v2.2"
+            );
+        }
 
-        // Autonomic tools (v1.9)
-        assert!(tool_names.contains(&"memory_health"));
-        assert!(tool_names.contains(&"memory_graph"));
-        assert!(tool_names.contains(&"composed_graph"));
-
-        // Deep reference + cross_reference alias (v2.0.4)
-        assert!(tool_names.contains(&"deep_reference"));
-        assert!(tool_names.contains(&"cross_reference"));
-        assert!(tool_names.contains(&"contradictions"));
+        // Retrieval — unified `recall` tool (v2.2). search + deep_reference +
+        // cross_reference + contradictions folded in; old names dispatch as
+        // hidden aliases but are off the advertised list.
+        for old in [
+            "search",
+            "deep_reference",
+            "cross_reference",
+            "contradictions",
+        ] {
+            assert!(
+                !tool_names.contains(&old),
+                "{old} should be folded into 'recall' in v2.2"
+            );
+        }
 
         // Active forgetting (v2.0.5) — Anderson 2025 + Davis Rac1
         assert!(tool_names.contains(&"suppress"));
+    }
 
-        // Retroactive Salience Backfill — Cai 2024 Nature (memory with hindsight)
-        assert!(tool_names.contains(&"backfill"));
+    /// v2.2: the 8 tools folded into `dedup` must still dispatch (hidden
+    /// back-compat aliases), i.e. they must NOT return the "Unknown tool"
+    /// InvalidParams (-32602) error. Read-only/list-style actions are used so
+    /// the call resolves without mutating or requiring extra setup.
+    #[tokio::test]
+    async fn test_deprecated_dedup_aliases_redirect() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        // (tool name, args) — all read-only / list-style so they resolve cleanly.
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            ("find_duplicates", serde_json::json!({})),
+            ("merge_candidates", serde_json::json!({})),
+            ("merge_undo", serde_json::json!({})), // no operation_id => lists the reflog
+            ("merge_policy", serde_json::json!({})), // no args => returns current policy
+            ("dedup", serde_json::json!({"action": "policy"})),
+            ("dedup", serde_json::json!({})), // default action = scan
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            // The call may succeed (result) or fail for a domain reason, but it
+            // must NOT be the unknown-tool InvalidParams error.
+            if let Some(err) = response.error {
+                assert_ne!(
+                    err.code, -32602,
+                    "'{name}' should still dispatch (hidden alias), got unknown-tool error: {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    /// v2.2: the 4 tools folded into `memory_status` must still dispatch, and
+    /// each `view` of the new tool must resolve.
+    #[tokio::test]
+    async fn test_memory_status_views_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch.
+            ("system_status", serde_json::json!({})),
+            ("memory_health", serde_json::json!({})),
+            ("memory_timeline", serde_json::json!({})),
+            ("memory_changelog", serde_json::json!({})),
+            // New unified views.
+            ("memory_status", serde_json::json!({})), // default view = health
+            ("memory_status", serde_json::json!({"view": "retention"})),
+            ("memory_status", serde_json::json!({"view": "timeline"})),
+            ("memory_status", serde_json::json!({"view": "changelog"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            assert!(
+                response.error.is_none(),
+                "'{name}' {args} should resolve, got error: {:?}",
+                response.error
+            );
+        }
+    }
+
+    /// v2.2: the 4 tools folded into `graph` must still dispatch, and the
+    /// read-only `graph` actions must resolve. (memory_graph is sync — this also
+    /// guards the no-`.await` facade branch.)
+    #[tokio::test]
+    async fn test_graph_actions_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch (not unknown-tool).
+            ("predict", serde_json::json!({})),
+            ("memory_graph", serde_json::json!({})),
+            ("composed_graph", serde_json::json!({"action": "recent"})),
+            // New unified actions (read-only).
+            ("graph", serde_json::json!({"action": "predict"})),
+            ("graph", serde_json::json!({"action": "memory_graph"})),
+            ("graph", serde_json::json!({"action": "recent"})),
+            ("graph", serde_json::json!({"action": "never_composed"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            if let Some(err) = response.error {
+                assert_ne!(
+                    err.code, -32602,
+                    "'{name}' {args} should dispatch (not unknown-tool): {}",
+                    err.message
+                );
+            }
+        }
+    }
+
+    /// v2.2: the 7 tools folded into `maintain` must still dispatch, the new
+    /// actions must resolve, gc must default to dry_run, and restore must keep
+    /// path validation (a nonexistent path errors rather than silently no-op).
+    #[tokio::test]
+    async fn test_maintain_actions_and_safety() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        // Aliases + safe new actions must dispatch (not unknown-tool).
+        let dispatch_ok: Vec<(&str, serde_json::Value)> = vec![
+            ("consolidate", serde_json::json!({})),
+            ("backup", serde_json::json!({})),
+            ("dream", serde_json::json!({})),
+            ("maintain", serde_json::json!({"action": "consolidate"})),
+            ("maintain", serde_json::json!({"action": "gc"})),
+            ("maintain", serde_json::json!({"action": "backup"})),
+        ];
+        for (name, args) in dispatch_ok {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            if let Some(err) = response.error {
+                assert_ne!(err.code, -32602, "'{name}' {args} should dispatch: {}", err.message);
+            }
+        }
+
+        // gc via maintain defaults to dry_run=true (no deletion).
+        let gc_req = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "maintain", "arguments": {"action": "gc"} })),
+        );
+        let gc_resp = server.handle_request(gc_req).await.unwrap();
+        let text = gc_resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("\"dryRun\": true") || text.contains("\"dryRun\":true"),
+            "maintain action=gc must default to dry_run=true; got: {text}"
+        );
+
+        // restore keeps path validation: a missing file must error, not no-op.
+        let restore_req = make_request(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "maintain",
+                "arguments": {"action": "restore", "path": "/nonexistent/vestige-backup-xyz.json"}
+            })),
+        );
+        let restore_resp = server.handle_request(restore_req).await.unwrap();
+        // Either a JSON-RPC error or an error envelope is acceptable; a silent
+        // success is NOT (that would mean confinement/validation was bypassed).
+        let validated = restore_resp.error.is_some()
+            || restore_resp
+                .result
+                .map(|r| {
+                    r["content"][0]["text"]
+                        .as_str()
+                        .map(|t| t.to_lowercase().contains("not found") || t.to_lowercase().contains("error"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+        assert!(validated, "maintain action=restore must validate a missing path");
+    }
+
+    /// v2.2 HOT PATH: `recall` defaults to mode='lookup' (search), the folded
+    /// names still dispatch, and the reason/contradictions modes resolve.
+    #[tokio::test]
+    async fn test_recall_modes_and_aliases() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let calls: Vec<(&str, serde_json::Value)> = vec![
+            // Deprecated aliases must still dispatch.
+            ("search", serde_json::json!({"query": "x"})),
+            ("deep_reference", serde_json::json!({"query": "x"})),
+            ("cross_reference", serde_json::json!({"query": "x"})),
+            ("contradictions", serde_json::json!({})),
+            ("semantic_search", serde_json::json!({"query": "x"})),
+            // New unified modes.
+            ("recall", serde_json::json!({"query": "x"})), // default mode = lookup
+            ("recall", serde_json::json!({"mode": "lookup", "query": "x"})),
+            ("recall", serde_json::json!({"mode": "reason", "query": "x"})),
+            ("recall", serde_json::json!({"mode": "contradictions"})),
+        ];
+
+        for (name, args) in calls {
+            let request = make_request(
+                "tools/call",
+                Some(serde_json::json!({ "name": name, "arguments": args })),
+            );
+            let response = server.handle_request(request).await.unwrap();
+            assert!(
+                response.error.is_none(),
+                "'{name}' {args} should resolve, got error: {:?}",
+                response.error
+            );
+        }
+    }
+
+    /// v2.2: `recall` mode='lookup' (the default) must produce the same result
+    /// shape as the former standalone `search` — i.e. the no-mode default is a
+    /// faithful pass-through, not a reasoning call.
+    #[tokio::test]
+    async fn test_recall_lookup_matches_search_shape() {
+        let (mut server, _dir) = test_server().await;
+        let init_request = make_request("initialize", Some(init_params()));
+        server.handle_request(init_request).await;
+
+        let args = serde_json::json!({ "query": "anything" });
+        let via_recall = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "recall", "arguments": args })),
+        );
+        let via_search = make_request(
+            "tools/call",
+            Some(serde_json::json!({ "name": "search", "arguments": args })),
+        );
+        let r1 = server.handle_request(via_recall).await.unwrap();
+        let r2 = server.handle_request(via_search).await.unwrap();
+        assert!(r1.error.is_none() && r2.error.is_none());
+        // The unified-tool wrapper text (the search payload) must match.
+        assert_eq!(
+            r1.result.unwrap()["content"][0]["text"],
+            r2.result.unwrap()["content"][0]["text"],
+            "recall(mode=lookup) must equal search byte-for-byte"
+        );
     }
 
     #[tokio::test]
@@ -2325,10 +2503,17 @@ mod tests {
     /// (cargo-cult prevention).
     fn expected_max_result_size(name: &str) -> Option<u64> {
         match name {
-            "search" => Some(300_000),
-            "memory_timeline" => Some(200_000),
+            // v2.2: search folded into recall (mode='lookup'); annotation moved.
+            "recall" => Some(300_000),
+            // v2.2: memory_timeline folded into memory_status (view='timeline');
+            // the high-payload annotation moved with it.
+            "memory_status" => Some(200_000),
             "memory" => Some(100_000),
             "codebase" => Some(100_000),
+            // v2.2: dedup action='scan' returns clusters + candidates + policy.
+            "dedup" => Some(150_000),
+            // v2.2: graph memory_graph layout + bounty_mode pagination.
+            "graph" => Some(250_000),
             _ => None,
         }
     }
@@ -2344,7 +2529,7 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        for name in ["search", "memory_timeline", "memory", "codebase"] {
+        for name in ["recall", "memory_status", "memory", "codebase", "dedup", "graph"] {
             let tool = tools
                 .iter()
                 .find(|t| t["name"].as_str() == Some(name))
@@ -2432,365 +2617,20 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        let search_tool = tools
+        // v2.2: `recall` is the annotated retrieval tool (search folded in).
+        let recall_tool = tools
             .iter()
-            .find(|t| t["name"].as_str() == Some("search"))
-            .expect("'search' tool present");
+            .find(|t| t["name"].as_str() == Some("recall"))
+            .expect("'recall' tool present");
 
         // Wire-form: `_meta` must exist; `meta` (un-renamed) must NOT exist.
         assert!(
-            search_tool.get("_meta").is_some(),
-            "search tool missing `_meta` key (serde rename to _meta did not apply)"
+            recall_tool.get("_meta").is_some(),
+            "recall tool missing `_meta` key (serde rename to _meta did not apply)"
         );
         assert!(
-            search_tool.get("meta").is_none(),
-            "search tool has un-renamed `meta` key (regression — serde rename broke)"
-        );
-    }
-
-    // ========================================================================
-    // TRACE SPINE (Phase 0) — one runId, end to end
-    // ========================================================================
-
-    /// Every tools/call must stamp a runId + a trace pointer onto its output,
-    /// persist an `mcp.call` trace row under that same runId, and that runId
-    /// must resolve through the `vestige://trace/{runId}` resource. This is the
-    /// load-bearing correlation guarantee.
-    #[tokio::test]
-    async fn test_trace_spine_runid_end_to_end() {
-        let (mut server, _dir) = test_server().await;
-        server
-            .handle_request(make_request("initialize", Some(init_params())))
-            .await;
-
-        // A client-supplied runId must be honoured so a whole session
-        // correlates under one id.
-        let call = make_request(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": "memory_health",
-                "arguments": { "runId": "run_spine_test" }
-            })),
-        );
-        let response = server.handle_request(call).await.unwrap();
-        let result = response.result.expect("tools/call ok");
-
-        // 1. The tool output itself carries the runId + trace pointer.
-        let structured = &result["structuredContent"];
-        assert_eq!(
-            structured["runId"].as_str(),
-            Some("run_spine_test"),
-            "tool output must echo the runId (spine hop 1)"
-        );
-        assert_eq!(
-            structured["traceUri"].as_str(),
-            Some("vestige://trace/run_spine_test"),
-            "tool output must carry the trace resource pointer"
-        );
-
-        // 2. The same runId persisted a trace row (the mcp.call event).
-        let events = server.storage.get_trace("run_spine_test").unwrap();
-        assert!(
-            events.iter().any(|e| e.kind() == "mcp.call"),
-            "an mcp.call event must be persisted under the runId (spine hop 2)"
-        );
-
-        // 3. The run roll-up exists with the right entry tool.
-        let run = server
-            .storage
-            .get_agent_run("run_spine_test")
-            .unwrap()
-            .expect("run summary persisted");
-        assert_eq!(run.first_tool.as_deref(), Some("memory_health"));
-
-        // 4. The MCP resource resolves the same runId (spine hop 3).
-        let read = make_request(
-            "resources/read",
-            Some(serde_json::json!({ "uri": "vestige://trace/run_spine_test" })),
-        );
-        let read_resp = server.handle_request(read).await.unwrap();
-        let read_result = read_resp.result.expect("resource read ok");
-        let text = read_result["contents"][0]["text"]
-            .as_str()
-            .expect("resource text");
-        assert!(
-            text.contains("run_spine_test") && text.contains("mcp.call"),
-            "vestige://trace/{{runId}} must return the run's events"
-        );
-    }
-
-    /// Trace events must be broadcast to a live WebSocket subscriber, not just
-    /// persisted. This guards the spine hop from SQLite → WebSocket → pulse.
-    #[tokio::test]
-    async fn test_trace_event_is_broadcast_to_subscriber() {
-        let (storage, _dir) = test_storage().await;
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let (event_tx, mut event_rx) = broadcast::channel(64);
-        let mut server = McpServer::new_with_events(storage, cognitive, event_tx);
-        server
-            .handle_request(make_request("initialize", Some(init_params())))
-            .await;
-
-        let call = make_request(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": "memory_health",
-                "arguments": { "runId": "run_ws" }
-            })),
-        );
-        server.handle_request(call).await.unwrap();
-
-        // Drain the broadcast: at least one TraceEvent for run_ws must arrive.
-        let mut saw_trace = false;
-        while let Ok(ev) = event_rx.try_recv() {
-            if let VestigeEvent::TraceEvent { run_id, .. } = ev {
-                if run_id == "run_ws" {
-                    saw_trace = true;
-                }
-            }
-        }
-        assert!(
-            saw_trace,
-            "a TraceEvent for the run must be broadcast to subscribers (spine hop: WebSocket)"
-        );
-    }
-
-    /// Risk-gated Memory PRs default: an ordinary tool call opens no PR.
-    #[tokio::test]
-    async fn test_no_memory_pr_for_non_write_tool() {
-        let (mut server, _dir) = test_server().await;
-        server
-            .handle_request(make_request("initialize", Some(init_params())))
-            .await;
-        let call = make_request(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": "memory_health",
-                "arguments": { "runId": "run_no_pr" }
-            })),
-        );
-        server.handle_request(call).await.unwrap();
-        assert_eq!(
-            server.storage.count_pending_memory_prs().unwrap(),
-            0,
-            "a read-only tool must never open a Memory PR"
-        );
-    }
-
-    /// Destructive memory operations must be blocked before execution in the
-    /// default Risk-Gated mode. This is the real C2 regression test: a purge
-    /// request opens a Memory PR, but the row is still present until review.
-    #[tokio::test]
-    async fn test_memory_purge_is_pre_gated_before_delete() {
-        let (mut server, _dir) = test_server().await;
-        server
-            .handle_request(make_request("initialize", Some(init_params())))
-            .await;
-        let node = server
-            .storage
-            .ingest(vestige_core::IngestInput {
-                content: "A purge target containing auth token sk-live-DO-NOT-LEAK-123".to_string(),
-                node_type: "fact".to_string(),
-                ..Default::default()
-            })
-            .unwrap();
-
-        let call = make_request(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": "memory",
-                "arguments": {
-                    "action": "purge",
-                    "id": node.id,
-                    "confirm": true,
-                    "runId": "run_pre_gate_purge"
-                }
-            })),
-        );
-        let response = server.handle_request(call).await.unwrap();
-        let structured = response.result.unwrap()["structuredContent"].clone();
-
-        assert_eq!(structured["pendingReview"], serde_json::json!(true));
-        assert_eq!(structured["success"], serde_json::json!(false));
-        assert!(
-            server.storage.get_node(&node.id).unwrap().is_some(),
-            "purge must not delete before Memory PR review"
-        );
-        let prs = server
-            .storage
-            .list_memory_prs(Some(vestige_core::MemoryPrStatus::Pending), 10)
-            .unwrap();
-        assert_eq!(prs.len(), 1);
-        assert_eq!(prs[0].subject_id.as_deref(), Some(node.id.as_str()));
-        assert_eq!(prs[0].diff["pendingAction"], serde_json::json!("purge"));
-        let serialized = serde_json::to_string(&prs[0]).unwrap();
-        assert!(
-            !serialized.contains("DO-NOT-LEAK") && !serialized.contains("sk-live"),
-            "pending Memory PR must not expose raw sensitive content"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_direct_suppress_is_pre_gated_before_mutation() {
-        let (mut server, _dir) = test_server().await;
-        server
-            .handle_request(make_request("initialize", Some(init_params())))
-            .await;
-        let node = server
-            .storage
-            .ingest(vestige_core::IngestInput {
-                content: "A suppress target awaiting review.".to_string(),
-                node_type: "fact".to_string(),
-                ..Default::default()
-            })
-            .unwrap();
-
-        let call = make_request(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": "suppress",
-                "arguments": {
-                    "id": node.id,
-                    "reason": "test suppress",
-                    "runId": "run_pre_gate_suppress"
-                }
-            })),
-        );
-        let response = server.handle_request(call).await.unwrap();
-        let structured = response.result.unwrap()["structuredContent"].clone();
-
-        assert_eq!(structured["pendingReview"], serde_json::json!(true));
-        let current = server.storage.get_node(&node.id).unwrap().unwrap();
-        assert_eq!(
-            current.suppression_count, 0,
-            "suppress must not mutate retrieval influence before review"
-        );
-        let prs = server
-            .storage
-            .list_memory_prs(Some(vestige_core::MemoryPrStatus::Pending), 10)
-            .unwrap();
-        assert_eq!(prs[0].diff["pendingAction"], serde_json::json!("suppress"));
-    }
-
-    /// PROOF LOCK: the complete spine in one test. A single runId must cross
-    /// every hop, and the value must be byte-identical at each:
-    ///   MCP output → SQLite trace → WebSocket event → API response shape →
-    ///   MCP resource.
-    /// If any hop drops or rewrites the runId, this fails. This is the
-    /// "impossible to doubt" guarantee for the receipt chain.
-    #[tokio::test]
-    async fn test_full_spine_one_runid_crosses_every_hop() {
-        const RUN: &str = "run_full_spine";
-
-        let (storage, _dir) = test_storage().await;
-        let cognitive = Arc::new(Mutex::new(CognitiveEngine::new()));
-        let (event_tx, mut event_rx) = broadcast::channel(256);
-        let mut server = McpServer::new_with_events(storage, cognitive, event_tx);
-        server
-            .handle_request(make_request("initialize", Some(init_params())))
-            .await;
-
-        // ---- HOP 1: MCP tool output carries the runId + trace pointer ----
-        let call = make_request(
-            "tools/call",
-            Some(serde_json::json!({
-                "name": "memory_health",
-                "arguments": { "runId": RUN }
-            })),
-        );
-        let response = server.handle_request(call).await.unwrap();
-        let structured = response.result.expect("tools/call ok")["structuredContent"].clone();
-        assert_eq!(
-            structured["runId"].as_str(),
-            Some(RUN),
-            "HOP 1: tool output runId"
-        );
-        assert_eq!(
-            structured["traceUri"].as_str(),
-            Some(&format!("vestige://trace/{RUN}")[..]),
-            "HOP 1: tool output traceUri"
-        );
-
-        // ---- HOP 2: SQLite trace rows persisted under the same runId ----
-        let events = server.storage.get_trace(RUN).unwrap();
-        assert!(!events.is_empty(), "HOP 2: trace rows exist");
-        assert!(
-            events.iter().all(|e| e.run_id() == RUN),
-            "HOP 2: every persisted trace row carries the SAME runId"
-        );
-
-        // ---- HOP 3: WebSocket broadcast carries the same runId ----
-        let mut ws_run: Option<String> = None;
-        while let Ok(ev) = event_rx.try_recv() {
-            if let VestigeEvent::TraceEvent { run_id, .. } = ev {
-                ws_run = Some(run_id);
-                break;
-            }
-        }
-        assert_eq!(
-            ws_run.as_deref(),
-            Some(RUN),
-            "HOP 3: the broadcast TraceEvent carries the same runId"
-        );
-
-        // ---- HOP 4: API response shape (what the dashboard renders) ----
-        // Exercise the exact handler the dashboard /api/traces/:runId calls by
-        // going through storage the same way, and assert the render-critical
-        // shape: a summary roll-up + an ordered event list, all under runId.
-        let summary = server
-            .storage
-            .get_agent_run(RUN)
-            .unwrap()
-            .expect("HOP 4: run summary the list view renders");
-        assert_eq!(summary.run_id, RUN, "HOP 4: API run summary runId");
-        assert!(
-            summary.event_count >= 1,
-            "HOP 4: event_count rendered in the list"
-        );
-        // The detail view renders these events in sequence order.
-        let detail_events = server.storage.get_trace(RUN).unwrap();
-        assert_eq!(
-            detail_events.len() as i64,
-            summary.event_count,
-            "HOP 4: detail event count matches the roll-up the list shows"
-        );
-
-        // ---- HOP 5: MCP resource resolves the same runId ----
-        let read = make_request(
-            "resources/read",
-            Some(serde_json::json!({ "uri": format!("vestige://trace/{RUN}") })),
-        );
-        let read_resp = server.handle_request(read).await.unwrap();
-        let text = read_resp.result.expect("resource read ok")["contents"][0]["text"]
-            .as_str()
-            .expect("resource text")
-            .to_string();
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            parsed["runId"].as_str(),
-            Some(RUN),
-            "HOP 5: vestige://trace/{{runId}} resolves the same runId"
-        );
-        assert!(
-            parsed["events"]
-                .as_array()
-                .map(|a| !a.is_empty())
-                .unwrap_or(false),
-            "HOP 5: the resource returns the run's events"
-        );
-
-        // ---- INVARIANT: one id, every hop, byte-identical ----
-        // Collect the runId as seen at each hop and assert they are all equal.
-        let seen = [
-            structured["runId"].as_str().unwrap().to_string(), // hop 1
-            events[0].run_id().to_string(),                    // hop 2
-            ws_run.unwrap(),                                   // hop 3
-            summary.run_id,                                    // hop 4
-            parsed["runId"].as_str().unwrap().to_string(),     // hop 5
-        ];
-        assert!(
-            seen.iter().all(|r| r == RUN),
-            "the SAME runId must appear, unchanged, at every hop: {seen:?}"
+            recall_tool.get("meta").is_none(),
+            "recall tool has un-renamed `meta` key (regression — serde rename broke)"
         );
     }
 }
