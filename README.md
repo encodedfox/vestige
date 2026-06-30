@@ -37,12 +37,37 @@ It's one Rust binary. It runs entirely on your machine. It never phones home. An
 
 ## ⚡ Get it running in 60 seconds
 
+**Step 1 — install (one binary, no Docker, no API key, no signup):**
+
 ```bash
-npm install -g vestige-mcp-server@latest      # one binary, no Docker, no API key, no signup
-claude mcp add vestige vestige-mcp -s user    # connect it to Claude Code
+npm install -g vestige-mcp-server@latest
 ```
 
-That's the whole install. Now talk to your agent like it has a memory, because now it does:
+**Step 2 — connect it to your agent.** Vestige speaks [MCP](https://modelcontextprotocol.io), so it works with *any* AI agent. The universal config (works everywhere):
+
+```json
+{ "mcpServers": { "vestige": { "command": "vestige-mcp" } } }
+```
+
+Drop that into your agent's MCP config file. Or use the one-line shortcut for your agent:
+
+```bash
+# Cursor / Windsurf / VS Code      → add the JSON above to ~/.cursor/mcp.json (or the editor's MCP settings)
+# Claude Code                      → claude mcp add vestige vestige-mcp -s user
+# Codex                            → codex mcp add vestige -- vestige-mcp
+# Cline / Continue / Zed / Goose   → add the JSON above to that client's MCP config
+```
+
+**Step 3 — confirm it's working:**
+
+```bash
+vestige-mcp --version     # prints the installed version
+vestige stats             # prints your memory count (0 on a fresh install)
+```
+
+That's the whole install. Per-agent guides (Cursor, VS Code, Windsurf, JetBrains, Xcode, OpenCode, Codex, Claude Desktop) are [here ↓](#-works-with-every-ai-agent).
+
+Now talk to your agent like it has a memory, because now it does:
 
 ```
 You:  "Remember: we always disable SimSIMD on release builds, it breaks old x86 CPUs."
@@ -53,6 +78,14 @@ AI:   ⚠️ Hold on, this contradicts a decision you stored: you chose to DISAB
 ```
 
 That last line isn't me being cute. It's a real status the engine returns, called `claim_contradicts_memory`. Most memory tools would have happily handed you the wrong answer. Vestige tells you when you're about to walk back into a mistake you already learned from.
+
+And the headline feature, the one nothing else does, is one command:
+
+```bash
+vestige backfill --contrast
+```
+
+When a failure is in your memory, this reaches *backward through time* and finds the quiet earlier change that caused it (the one a vector search ranks poorly because it shares no words with the error). It shows you, side by side, what similarity search returns versus the real cause. [More on the backward reach ↓](#-the-thing-nothing-else-does-memory-with-hindsight)
 
 *(Works with Codex, Cursor, VS Code, Claude Desktop, Windsurf, JetBrains, Zed: anything that speaks MCP. [Full setup is here ↓](#-works-in-every-editor-you-use).)*
 
@@ -144,15 +177,23 @@ Built with SvelteKit 2 · Svelte 5 · Three.js · WebGL bloom · live WebSocket 
 
 ---
 
-## 🧩 Works in every editor you use
+## 🧩 Works with every AI agent
 
-Vestige speaks MCP, so any client that can register a stdio MCP server can use it.
+Vestige speaks MCP, so **any agent that can register an MCP server can use it.** Not a plugin for one tool, the memory layer underneath all of them. The universal config works everywhere:
 
-| Editor | One-liner |
+```json
+{ "mcpServers": { "vestige": { "command": "vestige-mcp" } } }
+```
+
+| Agent | Setup |
 |---|---|
+| **Cursor** | add the JSON above to `~/.cursor/mcp.json` · [guide →](docs/integrations/cursor.md) |
+| **Windsurf** | [guide →](docs/integrations/windsurf.md) |
+| **VS Code (Copilot)** | [guide →](docs/integrations/vscode.md) |
+| **Cline / Continue / Zed / Goose** | add the universal JSON to that client's MCP config |
 | **Claude Code** | `claude mcp add vestige vestige-mcp -s user` |
 | **Codex** | `codex mcp add vestige -- vestige-mcp` |
-| **Cursor / VS Code / Windsurf / JetBrains / Xcode / OpenCode** | [Integration guides →](docs/integrations/) |
+| **JetBrains · Xcode · OpenCode** | [integration guides →](docs/integrations/) |
 | **Claude Desktop** | [2-minute setup →](docs/CONFIGURATION.md#claude-desktop-macos) |
 
 <details>
